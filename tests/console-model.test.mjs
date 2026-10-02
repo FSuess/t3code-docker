@@ -693,3 +693,46 @@ test("a release out but still held back by mise says when it will be offered, an
   assert.equal(go.status.text, "Installed · 1.27.2 is out · mise offers it in 21 hours");
   assert.equal(go.menu.some((m) => m.cmd === "release.now"), false);
 });
+
+test("Antigravity reads as an agent T3 Code installs and signs in itself", () => {
+  const ag = (overrides = {}) => ({
+    id: "antigravity", name: "Antigravity", managedBy: "t3", available: true, reachable: true, installed: true, runnable: true,
+    version: "1.1.1", installedVersion: "1.1.1", latestVersion: "1.1.1", enabled: true, t3Status: "warning", signedIn: null,
+    canSignIn: true, canSetKey: false, downloadBytes: 656_572_786, managedVersions: ["1.1.1"], failed: false, failure: null, inProgress: false,
+    ...overrides,
+  });
+  const at = (h, extra) => row(statusWith({ harnesses: [harness("claude"), h] }), "antigravity", extra);
+  const missing = at(ag({ installed: false, version: null, installedVersion: null }));
+  assert.equal(missing.state, "missing");
+  assert.equal(missing.status.text, "Not installed · 657 MB, installed by T3 Code");
+  assert.equal(missing.action.cmd, "harness.install");
+  assert.equal(missing.mark, "antigravity");
+  const unchecked = at(ag());
+  assert.equal(unchecked.state, "unchecked");
+  assert.equal(unchecked.status.text, "Installed · Google sign-in not checked yet");
+  assert.equal(unchecked.action.cmd, "harness.signin");
+  assert.equal(unchecked.action.variant, undefined, "offered, not asked for");
+  assert.equal(unchecked.menu.some((m) => m.cmd === "harness.version"), false, "T3 installs the release it supports");
+  assert.equal(M.needsYou(statusWith({ harnesses: [harness("claude"), ag()] }), null, ui()).some((i) => i.id === "antigravity"), false);
+  const signedIn = at(ag({ signedIn: true, account: "dev@example.com", t3Status: "ready" }));
+  assert.equal(signedIn.status.text, "Signed in · dev@example.com");
+  assert.ok(signedIn.menu.some((m) => m.cmd === "harness.signin" && m.label === "Sign in again"));
+  const signedOut = at(ag({ signedIn: false }));
+  assert.equal(signedOut.state, "signin");
+  assert.equal(signedOut.action.variant, "primary");
+  const off = at(ag({ enabled: false }));
+  assert.equal(off.state, "off");
+  assert.equal(off.action.cmd, "harness.enable");
+  const update = at(ag({ latestVersion: "1.2.0", signedIn: true }));
+  assert.equal(update.state, "update");
+  assert.equal(update.status.text, "Signed in · 1.2.0 is available");
+  const error = at(ag({ t3Status: "error", t3Message: "Google requires an eligible Antigravity subscription for this account." }));
+  assert.equal(error.status.text, "Google requires an eligible Antigravity subscription for this account.");
+  const down = at(ag({ reachable: false, error: "T3 Code did not answer" }));
+  assert.equal(down.state, "unreachable");
+  assert.equal(down.action, null);
+  const downloading = at(ag({ installed: false, version: null, inProgress: true, operation: "install", progress: { phase: "downloading", done: 328_286_393, total: 656_572_786 } }));
+  assert.equal(downloading.state, "running");
+  assert.equal(downloading.progress.pct, 50, "T3's own download, even one started in its settings");
+  assert.equal(at(ag(), { signingIn: "antigravity" }).status.text, "Waiting for the Google sign-in");
+});

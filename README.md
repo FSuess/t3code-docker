@@ -200,16 +200,28 @@ controls live, and renders nothing when the console is not routed there.
 ### Signing agents in, and keeping them current, from the page
 
 The agents are not baked into the image; the first start installs them onto
-the volume. Each row on the **Agents** page shows the exact version installed
-and points T3 Code at that executable. When a newer release exists the version
-gets an arrow and the row an **Update** button; **Install a specific
-version…** and **Uninstall…** are in its menu. A download carries on in the
+the volume. Each row on the **Agents** page shows the agent's own mark and the
+exact version installed, and points T3 Code at that executable. When a newer
+release exists the version gets an arrow and the row an **Update** button;
+**Install a specific version…** and **Uninstall…** are in its menu. A specific
+version is picked from the agent's releases, newest first, each marked as
+newest, installed, on the volume or how recently it came out; typing a prefix
+such as `2.1` takes the newest release under it. A download carries on in the
 background with the row showing its progress and a **Cancel** button, so a slow
 connection or a tunnel's request timeout does not matter. Operations run one
 at a time: press Update on three rows, or **Update all**, and they queue. If an
 update fails, the previous version stays installed and working. Nothing
 installs or updates just because a poll ran; the newest releases are looked up
-in the background every few hours. From a shell:
+in the background every hour.
+
+mise offers a release as the newest only once it has been out for a day
+(`minimum_release_age`), in case it is pulled or compromised within hours of
+publishing. T3 Code's own settings ask npm instead and show an update the
+moment it ships, but leave agents installed through mise to this page, so that
+update has no button there. Here the row says the release is out and when mise
+will offer it ("2.1.288 is out · mise offers it in 21 hours"), and **Install
+2.1.288 now** in its menu installs it right away, since naming a release
+exactly skips the wait. From a shell:
 
 ```bash
 docker compose exec t3code t3-harness list
@@ -470,7 +482,8 @@ passes it the sandbox flags it needs — but it is the less tested path.
 Claude Code, Codex and OpenCode install on the first start, and Grok and
 Cursor when you press Install on the Agents page (or on the first start too,
 with `T3_PREINSTALL=all`). Each lands in `/home/t3/.local/share/mise`, at an
-exact recorded version, so it survives a recreate with the rest of the volume. Sign them in from the setup page — each
+exact recorded version, so it survives a recreate with the rest of the volume.
+Sign them in from the setup page — each
 one's own flow, a URL and a QR to approve on your phone, a field for the code
 where one comes back. The `t3-login` column is the shell equivalent — it exists
 because `docker exec` lands as root, and a harness signed in as root writes its
@@ -483,9 +496,20 @@ credentials somewhere the server never looks.
 | OpenCode | OpenCode | `t3-login opencode` |
 | Cursor | Cursor (executable `cursor-agent`) | `t3-login cursor` |
 | Grok Build | Grok Build | `t3-login grok` |
+| Antigravity | Antigravity (runtime installed by T3 Code) | — |
 
-Antigravity is not installed: it signs in through Google inside the desktop app
-and manages its own runtime.
+**Antigravity** is not a CLI mise installs. T3 Code runs Google's Antigravity
+runtime, which it downloads itself (about 650 MB), pinned to the release it
+supports and checked against its checksum, into its own data on the volume.
+The Agents page drives T3 Code's installer and sign-in rather than installing
+anything of its own: **Install** has T3 Code download the runtime and turns
+Antigravity on in T3 Code, with the row showing the download's progress;
+**Update** appears when a T3 Code release supports a newer runtime; and
+**Uninstall** has T3 Code remove it. **Sign in** opens Google's sign-in.
+Afterwards your browser lands on an `http://127.0.0.1` address that does not
+load; paste that address into the sheet and T3 Code finishes the sign-in. The
+console talks to T3 Code as a session of its own, which the Devices page does
+not list.
 
 **DeepSeek** has no T3 Code driver. Reach it through OpenCode — see
 [`examples/opencode/`](examples/opencode/) — or by pointing a provider instance's

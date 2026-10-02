@@ -111,6 +111,13 @@ check("t3-harness manages added tools too",
   has(CLI, "packages [--json]") && has(CLI, "manager.packages"),
   "the CLI must list and install added tools through the same manager");
 
+check("Antigravity is installed and signed in through T3 Code's own API",
+  has(path.join(ROOT, "docker/setup/antigravity.mjs"), '"provider.install.start"')
+    && has(path.join(ROOT, "docker/setup/antigravity.mjs"), '"provider.auth.start"')
+    && has(SERVER, "runT3Job") && has(SERVER, "startAntigravitySignin") && has(SERVER, "isConsoleSession")
+    && has(MODEL, "t3AgentRow") && has(APP, "flow === 'redirect'"),
+  "T3 owns Antigravity's runtime and sign-in: the console must drive T3's installer and flow, and keep its own session off the Devices page");
+
 // -- 3. styles for the lifecycle controls -------------------------------------
 check("lifecycle controls wrap without squeezing the row",
   has(CSS, ".tc-row-actions--wrap") && has(CSS, ".tc-input--sm"),

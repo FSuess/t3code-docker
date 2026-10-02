@@ -19,8 +19,10 @@ const T3Model = (() => {
     opencode: { name: 'OpenCode', mark: 'opencode', mono: 'OC', hue: '--id-opencode', how: 'API key, per provider', flow: 'key', command: null },
     grok: { name: 'Grok Build', mark: 'grok', mono: 'GB', hue: '--id-grok', how: 'device code', flow: 'device', command: 'grok login --device-auth' },
     cursor: { name: 'Cursor', mark: 'cursor', mono: 'CU', hue: '--id-cursor', how: 'browser sign-in', flow: 'browser', command: 'cursor-agent login' },
+    // Installed and signed in by T3 Code itself (managedBy: 't3').
+    antigravity: { name: 'Antigravity', mark: 'antigravity', mono: 'AG', hue: '--id-toolchain', how: 'Google sign-in', flow: 'redirect', command: null },
   };
-  const AGENT_ORDER = ['claude', 'codex', 'opencode', 'grok', 'cursor'];
+  const AGENT_ORDER = ['claude', 'codex', 'opencode', 'grok', 'cursor', 'antigravity'];
 
   const TOOLCHAINS = {
     go: { name: 'Go', mono: 'Go' },
@@ -259,7 +261,7 @@ const T3Model = (() => {
       row.state = 'running';
       row.kind = runningKind;
       row.badge = { tone: 'info', text: WORKING[runningKind] || 'Working', spinner: true };
-      row.progress = act.progress || { phase: null, pct: null };
+      row.progress = act.progress || progressOf(h.progress) || { phase: null, pct: null };
       row.cancellable = Boolean(act.ownOp);
       if (runningKind === 'update' && version && latest && latest !== version) row.versionTo = latest;
       row.status.text = runningKind === 'update' && version
@@ -282,12 +284,14 @@ const T3Model = (() => {
       row.state = 'signing';
       row.badge = { tone: 'info', text: 'Signing in', spinner: true };
       row.status.text = meta.flow === 'device' ? 'Waiting for approval on another device'
-        : meta.flow === 'code' ? 'Waiting for the code from the sign-in page' : 'Waiting for the browser sign-in';
+        : meta.flow === 'code' ? 'Waiting for the code from the sign-in page'
+          : meta.flow === 'redirect' ? 'Waiting for the Google sign-in' : 'Waiting for the browser sign-in';
       row.menu = [];
       return row;
     }
 
     const notice = ui && ui.notices ? ui.notices.get(act.key) : null;
+    if (h.managedBy === 't3') return t3AgentRow(row, h, meta, notice, updateAvailable, latest);
 
     if (!h.installed) {
       if (h.failed && h.failure) {
@@ -350,6 +354,69 @@ const T3Model = (() => {
     row.menu.push({ cmd: 'harness.version', label: 'Install a specific version…', icon: 'history' });
     if (h.canSetKey) row.menu.push({ cmd: 'harness.apikey', label: isKey ? 'Add a provider key…' : 'Use an API key…', icon: 'key-round' });
     if (h.canSignIn && h.runnable && row.state !== 'signin') row.menu.push({ cmd: 'harness.signin', label: 'Sign in again', icon: 'log-in' });
+    row.menu.push({ sep: true });
+    row.menu.push({ cmd: 'harness.uninstall', label: 'Uninstall…', icon: 'trash-2', danger: true });
+    return row;
+  };
+
+  /**
+   * An agent T3 Code installs and signs in itself (Antigravity): T3's
+   * installer and T3's Google sign-in, and no release to pick - T3 installs
+   * the one it supports, and an update is T3 supporting a newer one.
+   */
+  const t3AgentRow = (row, h, meta, notice, updateAvailable, latest) => {
+    if (h.reachable === false) {
+      row.state = 'unreachable';
+      row.status = { dot: 'warn', text: 'T3 Code did not answer' + (h.error ? ': ' + h.error : '') };
+      row.notice = distinctNotice(notice, row.status);
+      return row;
+    }
+    if (!h.installed) {
+      if (h.failed && h.failure) {
+        row.state = 'failed';
+        row.attention = true;
+        row.status = { dot: 'danger', text: 'Install failed: ' + h.failure };
+        row.action = { cmd: 'harness.install', label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
+      } else {
+        row.state = 'missing';
+        row.status.text = 'Not installed · ' + (h.downloadBytes ? formatBytes(h.downloadBytes) + ', ' : '') + 'installed by T3 Code';
+        row.action = { cmd: 'harness.install', label: 'Install', icon: 'download' };
+      }
+      row.notice = distinctNotice(notice, row.status);
+      return row;
+    }
+    const signIn = { cmd: 'harness.signin', label: 'Sign in', icon: 'log-in' };
+    if (h.enabled === false) {
+      row.state = 'off';
+      row.status.text = 'Installed · turned off in T3 Code';
+      row.action = { cmd: 'harness.enable', label: 'Turn on', icon: 'circle-check' };
+    } else if (h.t3Status === 'error') {
+      row.state = 'failed';
+      row.attention = true;
+      row.status = { dot: 'danger', text: h.t3Message || 'T3 Code reports a problem with ' + meta.name };
+      row.action = signIn;
+    } else if (h.signedIn === false) {
+      row.state = 'signin';
+      row.attention = true;
+      row.status = { dot: 'warn', text: 'Not signed in · ' + meta.how };
+      row.action = Object.assign({ variant: 'primary' }, signIn);
+    } else if (updateAvailable) {
+      row.state = 'update';
+      row.status.text = (h.signedIn ? 'Signed in' : 'Installed') + ' · ' + latest + ' is available';
+      row.action = { cmd: 'harness.update', label: 'Update' };
+    } else if (h.signedIn === true) {
+      row.state = 'ok';
+      row.status.text = 'Signed in · ' + (h.account || 'Google account');
+    } else {
+      // T3 checks the Google account when Antigravity is used, so "not
+      // checked" is not "signed out": offer the sign-in, do not ask for it.
+      row.state = 'unchecked';
+      row.status.text = 'Installed · Google sign-in not checked yet';
+      row.action = signIn;
+    }
+    row.notice = distinctNotice(notice, row.status);
+    if (updateAvailable) row.menu.push({ cmd: 'harness.update', label: 'Update to ' + latest, icon: 'circle-arrow-up' });
+    if (h.canSignIn && !(row.action && row.action.cmd === 'harness.signin')) row.menu.push({ cmd: 'harness.signin', label: h.signedIn ? 'Sign in again' : 'Sign in', icon: 'log-in' });
     row.menu.push({ sep: true });
     row.menu.push({ cmd: 'harness.uninstall', label: 'Uninstall…', icon: 'trash-2', danger: true });
     return row;

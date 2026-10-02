@@ -884,6 +884,23 @@ for src, code in blocks:
         sys.exit(1)
 PYEOF
 }
+# Antigravity is T3 Code's to install: it pins Google's runtime and owns the
+# sign-in, and the console drives both through T3's own API. Without pulling
+# the 650 MB runtime here, check the console reaches that API as a session of
+# its own, reads the release T3 would install, and keeps that session off the
+# Devices page.
+printf '\nAntigravity through T3 Code\n'
+antigravity_row_from_t3() {
+  status_json | jq -e '.harnesses[] | select(.id == "antigravity")
+    | .managedBy == "t3" and .reachable and .available and ((.latestVersion // "") | length > 0)' >/dev/null
+}
+check "Antigravity's row comes from T3 Code's own API" "retry 10 antigravity_row_from_t3"
+console_session_is_not_a_device() {
+  docker exec "$NAME" t3 auth session list --json 2>/dev/null | grep -q '"t3-setup-console"' &&
+  ! status_json | jq -e '.sessions[] | select(.subject == "t3-setup-console")' >/dev/null
+}
+check "the console's own T3 session is not listed as a device" console_session_is_not_a_device
+
 printf '\nPorts\n'
 
 # T3 Code fetches cloudflared at runtime when it is missing, which needs egress

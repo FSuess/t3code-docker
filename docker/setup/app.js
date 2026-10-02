@@ -279,6 +279,17 @@
         ],
         confirm: 'Uninstall',
       }
+      : facts && facts.managedBy === 't3'
+      ? {
+        title: 'Uninstall ' + name + '?',
+        body: 'T3 Code removes the ' + name + ' runtime it downloaded' + (version ? ' (' + version + ')' : '') + ' and turns ' + name + ' off. Anything running in ' + name + ' has to stop first.',
+        consequences: [
+          { icon: 'trash-2', text: 'Removed: the runtime, from T3 Code’s data on the volume' },
+          { icon: 'shield-check', text: 'Kept: T3 Code’s ' + name + ' profile and its Google sign-in' },
+          { icon: 'download', text: 'Install it again any time from here' },
+        ],
+        confirm: 'Uninstall',
+      }
       : target === 'harness'
       ? {
         title: 'Uninstall ' + name + '?',
@@ -533,7 +544,7 @@
     if (!events.length) return '';
     const ICONS = {
       'device.paired': 'smartphone', 'port.published': 'globe', 'port.stopped': 'circle-stop', 'harness.updated': 'circle-arrow-up',
-      'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'signin.ok': 'log-in', 'setup.finished': 'download',
+      'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'harness.enabled': 'circle-check', 'signin.ok': 'log-in', 'setup.finished': 'download',
       'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
       'package.installed': 'download', 'package.updated': 'circle-arrow-up', 'package.uninstalled': 'trash-2', 'package.failed': 'circle-alert',
     };
@@ -1164,13 +1175,30 @@
             <button class="tc-btn tc-btn--primary" type="submit"${submitted ? raw(' disabled') : ''}>${submitted ? html`<span class="tc-spinner" aria-hidden="true"></span>Checking` : 'Submit'}</button>
           </form>`)}
         ${submitted ? step(3, 'Signed in', 'active', waiting('Waiting for ' + meta.name + ' to accept the code…')) : step(3, 'Signed in', '', '')}`;
+    } else if (meta.flow === 'redirect') {
+      // T3's Google sign-in: Google sends the browser to a 127.0.0.1 address
+      // only the container could answer; that address, pasted here, finishes it.
+      const submitted = st.state === 'submitted' || signin.phase === 'submitting';
+      const left = st.expiresAt ? M.countdown(st.expiresAt - now()) : null;
+      body = html`
+        ${step(1, 'Sign in with Google', 'done', html`<div class="tc-stack tc-signin-fields">${openPage('Open Google sign-in')}<span class="tc-hint">Opens in a new tab. Choose the Google account ${meta.name} should use.</span></div>`)}
+        ${step(2, 'Paste the address Google sends you to', submitted ? 'done' : 'active', html`
+          <span class="tc-hint">After you approve, the tab goes to an address starting with <code>http://127.0.0.1</code> that does not load. That is expected: copy the whole address from the address bar and paste it here.</span>
+          <form class="tc-signin-code" data-sheet-form="code" novalidate>
+            <label class="tc-sr" for="signin-code">The address Google sent you to</label>
+            <input id="signin-code" name="code" type="url" class="tc-input tc-input--mono" placeholder="http://127.0.0.1:…/?code=…" autocomplete="off" autocapitalize="off" spellcheck="false"${submitted ? raw(' disabled') : ''}>
+            <button class="tc-btn tc-btn--primary" type="submit"${submitted ? raw(' disabled') : ''}>${submitted ? html`<span class="tc-spinner" aria-hidden="true"></span>Checking` : 'Submit'}</button>
+          </form>
+          ${signin.pasteError && !submitted ? html`<span class="tc-hint tc-hint--err" role="alert">${signin.pasteError}</span>` : ''}
+          ${left && !submitted ? html`<span class="tc-hint">This sign-in link works for ${left} more.</span>` : ''}`)}
+        ${submitted ? step(3, 'Signed in', 'active', waiting('Waiting for T3 Code to check it…')) : step(3, 'Signed in', '', '')}`;
     } else {
       body = html`
         ${step(1, 'Open the sign-in page', 'done', html`<div class="tc-signin-split"><div class="tc-stack tc-signin-fields">${openPage('Open sign-in page')}<span class="tc-hint">Sign in there with the account ${meta.name} should use.</span></div>${qr}</div>`)}
         ${step(2, 'Approve, then come back', 'active', waiting('Waiting for ' + meta.name + ' to report a session…'))}`;
     }
     return html`
-      <div class="tc-sheet-head">${tile(meta, 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
+      <div class="tc-sheet-head">${tile(meta, 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : meta.flow === 'redirect' ? html`<span class="tc-small tc-muted">T3 Code’s own Google sign-in</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
       <div class="tc-sheet-body" aria-live="polite">${body}</div>
       <div class="tc-sheet-foot">${signin.phase === 'failed'
         ? html`<button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Close</button><button class="tc-btn tc-btn--primary" type="button" data-sheet="retry">${icon('refresh-cw')}Try again</button>`
@@ -1251,7 +1279,7 @@
 
   const openSignin = (id, trigger) => {
     if (signin.layer) return;
-    Object.assign(signin, { agent: id, session: null, phase: 'starting', error: null, cancelled: false, startedAt: now() });
+    Object.assign(signin, { agent: id, session: null, phase: 'starting', error: null, pasteError: null, cancelled: false, startedAt: now() });
     ui.signingIn = id;
     render();
     signin.layer = Kit.open({
@@ -1287,9 +1315,15 @@
       const code = form.querySelector('input').value.trim();
       if (!code || !signin.session) { form.querySelector('input').focus(); return; }
       signin.phase = 'submitting';
+      signin.pasteError = null;
       signin.layer.render();
       const res = await api('/auth/code', { body: { id: signin.session.id, code } });
-      if (!res.ok) {
+      if (!res.ok && (M.AGENTS[signin.agent] || {}).flow === 'redirect') {
+        // T3 keeps the sign-in waiting after a wrong address: say why, and
+        // let the right one be pasted.
+        signin.phase = 'awaiting';
+        signin.pasteError = res.error;
+      } else if (!res.ok) {
         signin.phase = 'failed';
         signin.error = res.error;
       } else {
@@ -1298,7 +1332,9 @@
       if (signin.layer) signin.layer.render();
     });
     // The device code's countdown.
-    signin.tick = setInterval(() => { if (signin.layer && signin.session && signin.session.code) signin.layer.render(); }, 1000);
+    signin.tick = setInterval(() => {
+      if (signin.layer && signin.session && (signin.session.code || (M.AGENTS[signin.agent] || {}).flow === 'redirect')) signin.layer.render();
+    }, 1000);
     beginSignin();
   };
 
@@ -1997,6 +2033,12 @@
       });
     },
     'harness.install': (a) => callLifecycle('harness', 'install', a.id),
+    'harness.enable': async (a) => {
+      const res = await api('/harnesses/enable', { body: { id: a.id } });
+      if (res.ok) Kit.toast('Turned ' + nameOf('harness', a.id) + ' on in T3 Code');
+      else Kit.toast('Could not turn ' + nameOf('harness', a.id) + ' on', { tone: 'danger', detail: res.error });
+      loadStatus();
+    },
     // A release named in full installs even while mise still holds it back.
     'release.now': (a) => {
       if (a.target === 'harness') callLifecycle('harness', harness(a.id) && harness(a.id).installed ? 'update' : 'install', a.id, a.version);
