@@ -52,13 +52,17 @@ Usage: t3-harness <command> [options]
 
   list [--json]                 the five agents
   toolchains [--json]           Go, Rust, Bun, Deno, uv
+  packages [--json]             every other tool in the global mise config
   status [--json] [id]
   install <id> [--version <version>] [--json]
   update <id> [--version <version>] [--json]
   uninstall <id> [--json]
 
-  id is an agent (claude, codex, opencode, grok, cursor) or a toolchain
-  (go, rust, bun, deno, uv). --version applies to agents only.
+  id is an agent (claude, codex, opencode, grok, cursor), a toolchain
+  (go, rust, bun, deno, uv), or any other mise tool, which is managed as an
+  added tool: a registry name (ripgrep, kubectl) or a backend spec
+  (npm:prettier, github:owner/repo). --version applies to agents, and to
+  installing an added tool, where a prefix (3.12) takes the newest under it.
 
 Install resolves mise's latest to an exact version and records it; update is
 always explicit. Uninstalling an agent preserves its credentials. After a
@@ -96,28 +100,27 @@ done
 if [ ${#pos[@]} -gt 0 ]; then set -- "${pos[@]}"; else set --; fi
 
 case "$command" in
-  list|toolchains|status|install|update|uninstall) ;;
+  list|toolchains|packages|status|install|update|uninstall) ;;
   *) printf 't3-harness: unknown command %s\n\n' "$command" >&2; usage >&2; exit 2 ;;
 esac
 
-if { [ "$command" = "list" ] || [ "$command" = "toolchains" ]; } && [ $# -gt 0 ]; then
+if { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "packages" ]; } && [ $# -gt 0 ]; then
   printf 't3-harness: %s takes no id\n\n' "$command" >&2; usage >&2; exit 2
 fi
 if { [ "$command" = "install" ] || [ "$command" = "update" ] || [ "$command" = "uninstall" ]; } \
    && [ $# -ne 1 ]; then
-  printf 't3-harness: %s needs exactly one harness id\n\n' "$command" >&2
+  printf 't3-harness: %s needs exactly one id\n\n' "$command" >&2
   usage >&2; exit 2
 fi
 if [ "$command" = "status" ] && [ $# -gt 1 ]; then
   printf 't3-harness: status takes at most one harness id\n\n' >&2; usage >&2; exit 2
 fi
-if [ $# -eq 1 ]; then
-  case "$1" in
-    claude|codex|opencode|grok|cursor|go|rust|bun|deno|uv) ;;
-    *) printf 't3-harness: unknown agent or toolchain %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
-  esac
+# Any other id is an added tool; the manager validates it (it is an argv entry
+# for mise, so a leading dash is refused here too).
+if [ $# -eq 1 ] && [ "${1#-}" != "$1" ]; then
+  printf 't3-harness: %s is not a tool name\n\n' "$1" >&2; usage >&2; exit 2
 fi
-if [ -n "$version" ] && { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "status" ] || [ "$command" = "uninstall" ]; }; then
+if [ -n "$version" ] && { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "packages" ] || [ "$command" = "status" ] || [ "$command" = "uninstall" ]; }; then
   printf 't3-harness: --version only applies to install and update\n\n' >&2; usage >&2; exit 2
 fi
 
@@ -161,6 +164,10 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
   };
 
   const TOOLCHAIN_IDS = ["go", "rust", "bun", "deno", "uv"];
+  const AGENT_IDS = ["claude", "codex", "opencode", "grok", "cursor"];
+  const isPackage = (id) => Boolean(id) && !TOOLCHAIN_IDS.includes(id) && !AGENT_IDS.includes(id);
+  const packageRow = (p) => `${p.id}\t${p.version ?? "-"}\t${p.inProgress ? `${p.operation ?? "working"}…`
+    : p.failed ? `failed: ${p.failure ?? "unknown error"}` : p.installed ? (p.adopted ? "installed (added with mise use)" : "installed") : "not installed"}`;
   const toolRow = (t) => `${t.id}\t${t.version ?? "-"}\t${t.inProgress ? `${t.operation ?? "working"}…`
     : t.installed ? "installed" : t.failed ? `failed: ${t.failure ?? "unknown error"}` : "not installed"}`;
 
@@ -169,6 +176,32 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
       const { toolchains, degraded } = await manager.toolchains.status();
       if (wantJson) process.stdout.write(JSON.stringify({ toolchains, degraded }, null, 2) + "\n");
       else for (const t of toolchains) process.stdout.write(toolRow(t) + "\n");
+      return;
+    }
+    if (command === "packages") {
+      const { packages, degraded } = await manager.packages.status();
+      if (wantJson) process.stdout.write(JSON.stringify({ packages, degraded }, null, 2) + "\n");
+      else for (const p of packages) process.stdout.write(packageRow(p) + "\n");
+      return;
+    }
+    if (isPackage(arg)) {
+      if (command === "status") {
+        const normalized = await manager.packages.normalize(arg);
+        if (!normalized.ok) { process.stderr.write(`t3-harness: ${normalized.error}\n`); process.exit(2); }
+        const pkg = await manager.packages.resolve(normalized.id);
+        if (wantJson) process.stdout.write(JSON.stringify({ package: pkg }, null, 2) + "\n");
+        else process.stdout.write(packageRow(pkg) + "\n");
+        return;
+      }
+      if (version && command !== "install") {
+        process.stderr.write("t3-harness: --version applies to installing an added tool; update always takes the newest\n");
+        process.exit(2);
+      }
+      const result = await manager.packages[command](arg, version ? { version } : {});
+      if (wantJson) process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      else if (result?.ok) process.stdout.write(`${command} ${result.package?.id ?? arg}: ok${command !== "uninstall" && result.package?.version ? ` (${result.package.version})` : ""}\n`);
+      else process.stderr.write(`t3-harness: ${command} ${arg} failed [${result?.code ?? "failed"}]: ${result?.error ?? "unknown error"}\n`);
+      if (!result?.ok) process.exit(result?.code === "invalid-tool" || result?.code === "managed-elsewhere" ? 2 : 1);
       return;
     }
     if (TOOLCHAIN_IDS.includes(arg) && command !== "status") {
