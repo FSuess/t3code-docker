@@ -114,6 +114,8 @@ export async function readPreinstall({
       state: run?.current === key && state === "running" ? "installing" : entry.state ?? "pending",
       version: entry.version ?? null,
       error: entry.error ?? null,
+      // The phase the item being installed has reached ("installing", "verifying").
+      ...(run?.current === key && state === "running" && run.progress ? { progress: run.progress } : {}),
     };
   });
   return {
@@ -146,6 +148,13 @@ export async function runPreinstall({
   startTimeOf = processStartTime,
 } = {}) {
   const file = preinstallPath(stateDir);
+  // Every write of the record goes through one chain: a progress update fired
+  // without waiting must never land after a newer write and undo it.
+  let writes = Promise.resolve();
+  const persist = (record) => {
+    writes = writes.then(() => writeRecord(fs, file, record), () => writeRecord(fs, file, record));
+    return writes;
+  };
   const { items, unknown } = parsePreinstall(env.T3_PREINSTALL);
   if (unknown.length) log(`T3_PREINSTALL: ignoring unknown ${unknown.join(", ")}`);
 
@@ -155,7 +164,7 @@ export async function runPreinstall({
   const record = await readRecord(fs, file);
   if (!items.length) {
     record.run = { state: "off", plan: [], startedAt: null, finishedAt: null, current: null };
-    await writeRecord(fs, file, record);
+    await persist(record);
     log("preinstall is off (T3_PREINSTALL=none)");
     return { installed: [], adopted: [], failed: [], skipped: [] };
   }
@@ -195,7 +204,7 @@ export async function runPreinstall({
     finishedAt: null,
     current: null,
   };
-  await writeRecord(fs, file, record);
+  await persist(record);
   if (pending.length) {
     log(`installing ${pending.map((item) => item.name).join(", ")} in the background;`
       + " progress is on the setup page");
@@ -213,10 +222,15 @@ export async function runPreinstall({
     const key = keyOf(item);
     const ops = opsFor(item);
     record.run.current = key;
-    await writeRecord(fs, file, record);
+    record.run.progress = null;
+    await persist(record);
     log(`installing ${item.name}`);
 
-    let result = await ops.install(item.id);
+    const onProgress = (progress) => {
+      record.run.progress = progress;
+      void persist(record).catch(() => {});
+    };
+    let result = await ops.install(item.id, { onProgress });
     for (let attempt = 0; result?.code === "busy" && attempt < busyRetries; attempt += 1) {
       // Someone pressed Install on the page at the same moment. Wait for it.
       await sleep(busyRetryMs);
@@ -225,7 +239,7 @@ export async function runPreinstall({
         result = { ok: true, adopted: true, [item.kind === "agent" ? "harness" : "toolchain"]: again };
         break;
       }
-      result = await ops.install(item.id);
+      result = await ops.install(item.id, { onProgress });
     }
 
     const facts = result?.harness ?? result?.toolchain ?? null;
@@ -245,13 +259,14 @@ export async function runPreinstall({
       summary.failed.push(key);
       log(`could not install ${item.name}: ${error} (retried on the next start)`);
     }
-    await writeRecord(fs, file, record);
+    await persist(record);
   }
 
   record.run.state = "finished";
   record.run.current = null;
+  record.run.progress = null;
   record.run.finishedAt = now();
-  await writeRecord(fs, file, record);
+  await persist(record);
   if (summary.deferred?.length) {
     log(`stopped after three failures in a row (no network?); ${summary.deferred.length} more`
       + " will be tried on the next start");

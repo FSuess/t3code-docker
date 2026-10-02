@@ -883,3 +883,117 @@ test("breaking a stale lock never deletes one another process just took", async 
   assert.equal(holder.pid, 1);
   assert.equal([...fs.files.keys()].some((key) => key.includes(".stale.")), false, "nothing left aside");
 });
+
+test("an operation reports its phases as it reaches them", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const phases = [];
+  const result = await manager.install("claude", { onProgress: (p) => phases.push(p.phase) });
+  assert.equal(result.ok, true);
+  assert.deepEqual(phases, ["resolving", "installing", "verifying"]);
+
+  const explicit = [];
+  await manager.update("claude", { version: "2.1.280", onProgress: (p) => explicit.push(p.phase) });
+  assert.deepEqual(explicit, ["installing", "verifying"], "an exact version has nothing to resolve");
+
+  const removing = [];
+  await manager.toolchains.install("go");
+  await manager.toolchains.uninstall("go", { onProgress: (p) => removing.push(p.phase) });
+  assert.deepEqual(removing, ["removing"]);
+});
+
+test("a cancelled install is recorded as cancelled, not failed, and leaves nothing half-installed", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const controller = new AbortController();
+  const run = world.run;
+  // mise is stopped part way through `use`: the runner reports the cancel.
+  const manager = managerFor({
+    ...world,
+    run: async (argv, options) => {
+      if (argv[3] === "use") {
+        world.calls.push(argv.join(" "));
+        controller.abort();
+        assert.equal(options.signal, controller.signal, "the signal reaches the mise run");
+        return { code: null, signal: "SIGTERM", stdout: "", stderr: "", error: "cancelled", cancelled: true };
+      }
+      return run(argv, options);
+    },
+  });
+
+  const result = await manager.install("claude", { signal: controller.signal });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "cancelled");
+  assert.equal(result.harness.failed, false, "a cancel is not a failure to report");
+  assert.equal(result.harness.installed, false);
+  assert.ok(world.calls.includes("mise -C /home/t3 uninstall claude@2.1.273"), "the partial release is removed");
+
+  const saved = JSON.parse(await fs.readFile(path.join(STATE_DIR, "harness-state.json"), "utf8"));
+  assert.equal(saved.harnesses.claude.operation.state, "cancelled");
+  assert.equal(saved.harnesses.claude.operation.error, null);
+  assert.equal(await fs.exists(path.join(STATE_DIR, "harness.lock")), false, "the lock is released");
+});
+
+test("cancelling before the work starts never touches mise", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const controller = new AbortController();
+  controller.abort();
+  const result = await manager.toolchains.install("go", { signal: controller.signal });
+  assert.equal(result.code, "cancelled");
+  assert.equal(world.calls.some((call) => / (use|latest) /.test(call)), false);
+});
+
+test("a release that was already on the volume survives a cancelled switch back to it", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const plain = managerFor(world);
+  await plain.install("claude", { version: "2.1.270" });
+  await plain.update("claude", { version: "2.1.273" });
+  const controller = new AbortController();
+  const run = world.run;
+  const manager = managerFor({
+    ...world,
+    run: async (argv, options) => {
+      if (argv[3] === "use") { controller.abort(); return { code: null, signal: "SIGTERM", stdout: "", stderr: "", error: "cancelled", cancelled: true }; }
+      return run(argv, options);
+    },
+  });
+  world.calls.length = 0;
+  const result = await manager.update("claude", { version: "2.1.270", signal: controller.signal });
+  assert.equal(result.code, "cancelled");
+  assert.equal(world.calls.some((call) => call.includes("uninstall claude@2.1.270")), false, "a release this manager installed is kept");
+  assert.equal(result.harness.installedVersion, "2.1.273", "the selection did not move");
+});
+
+test("latest asks mise for the newest release without installing it", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  assert.equal(await manager.latest("claude"), "2.1.273");
+  assert.equal(await manager.toolchains.latest("rust"), "1.98.1");
+  assert.equal(world.calls.some((call) => / use /.test(call)), false);
+  await assert.rejects(manager.latest("nope"), /unknown harness/);
+});
+
+test("the runner stops a cancelled program and everything it started", async () => {
+  const { createRunner } = await import("../docker/harness/io.mjs");
+  const run = createRunner();
+  const controller = new AbortController();
+  const started = Date.now();
+  // The background sleep holds the output pipe: if only `sh` died, the run
+  // would not end until the sleep did, thirty seconds later.
+  const pending = run(["sh", "-c", "sleep 30 & sleep 30; wait"], { signal: controller.signal, timeoutMs: 60_000 });
+  setTimeout(() => controller.abort(), 100);
+  const result = await pending;
+  assert.equal(result.cancelled, true);
+  assert.equal(result.error, "cancelled");
+  assert.ok(Date.now() - started < 5000, `took ${Date.now() - started}ms`);
+
+  const already = new AbortController();
+  already.abort();
+  assert.equal((await run(["sh", "-c", "exit 0"], { signal: already.signal })).cancelled, true);
+  assert.equal((await run(["sh", "-c", "echo hi"])).stdout, "hi\n", "a run without a signal is unchanged");
+});

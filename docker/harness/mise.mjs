@@ -52,14 +52,16 @@ export async function listTools(ctx) {
  * floating selection is turned into an exact one; the result is recorded, not
  * kept as a moving target.
  */
-export async function latest(ctx, tool) {
+export async function latest(ctx, tool, { signal } = {}) {
   // Normally well under two seconds. A network that drops packets instead of
   // refusing them would otherwise hold the lock for the whole mise timeout.
   const result = await ctx.run(miseArgs(ctx, ["latest", tool]), {
     env: readEnv(ctx.env),
     cwd: ctx.home,
     timeoutMs: ctx.timeouts.latest ?? ctx.timeouts.mise,
+    ...(signal ? { signal } : {}),
   });
+  if (result.cancelled) throw cancelledError();
   if (result.error || result.code !== 0) {
     throw new Error(firstError(result) || `mise latest ${tool} failed`);
   }
@@ -78,13 +80,22 @@ export function toolSpec(tool, version, options = null) {
   return `${tool}${options ? `[${options}]` : ""}@${version}`;
 }
 
+/** The error a cancelled run throws; the manager records it as cancelled, not failed. */
+export function cancelledError() {
+  const error = new Error("cancelled");
+  error.code = "cancelled";
+  return error;
+}
+
 /** Install-and-select in one step; `mise use` records the exact requested pin. */
-export async function use(ctx, tool, version, options = null) {
+export async function use(ctx, tool, version, options = null, { signal } = {}) {
   const result = await ctx.run(miseArgs(ctx, ["use", "-g", toolSpec(tool, version, options)]), {
     env: writeEnv(ctx.env),
     cwd: ctx.home,
     timeoutMs: ctx.timeouts.install,
+    ...(signal ? { signal } : {}),
   });
+  if (result.cancelled) throw cancelledError();
   if (result.error || result.code !== 0) {
     throw new Error(firstError(result) || `mise use ${tool}@${version} failed`);
   }

@@ -204,3 +204,25 @@ test("an agent the user uninstalled stays uninstalled, even after a failed first
   assert.deepEqual(manager.calls, []);
   assert.deepEqual(summary.skipped, ["agent:claude"]);
 });
+
+test("the item being installed carries the phase it has reached", async () => {
+  const fs = memoryFs();
+  const manager = fakeManager();
+  const seen = [];
+  const install = manager.install;
+  manager.install = async (id, options) => {
+    options?.onProgress?.({ phase: "installing" });
+    // The progress write is not awaited by the install; let it land.
+    await new Promise((resolve) => setImmediate(resolve));
+    const shown = await readPreinstall({ stateDir: STATE_DIR, fs, isAlive: () => true, startTimeOf: () => "100" });
+    seen.push(shown.items.find((item) => item.id === id));
+    return install(id, options);
+  };
+  await run(manager, fs, { T3_PREINSTALL: "claude" });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].state, "installing");
+  assert.deepEqual(seen[0].progress, { phase: "installing" });
+
+  const after = await readPreinstall({ stateDir: STATE_DIR, fs });
+  assert.equal(after.items[0].progress, undefined, "a finished run carries no progress");
+});

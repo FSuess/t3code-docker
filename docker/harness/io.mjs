@@ -14,14 +14,22 @@ import { promises as fsp, readFileSync } from "node:fs";
  * same as any other failed operation instead of an unhandled exception.
  */
 export function createRunner() {
-  return (argv, { env, cwd, timeoutMs = 0, input = null } = {}) =>
+  return (argv, { env, cwd, timeoutMs = 0, input = null, signal: abort = null } = {}) =>
     new Promise((resolve) => {
+      if (abort?.aborted) {
+        resolve({ code: null, signal: null, stdout: "", stderr: "", error: "cancelled", cancelled: true });
+        return;
+      }
       let child;
       try {
         child = spawn(argv[0], argv.slice(1), {
           env,
           cwd,
           stdio: ["pipe", "pipe", "pipe"],
+          // A cancellable run leads its own process group, so cancelling it
+          // reaches what it started too (mise fetching through npm or curl),
+          // not just the mise process at the top.
+          detached: Boolean(abort),
         });
       } catch (error) {
         resolve({ code: null, signal: null, stdout: "", stderr: "", error: String(error?.message ?? error) });
@@ -32,17 +40,36 @@ export function createRunner() {
       let stderr = "";
       let settled = false;
       let timer = null;
+      let cancelled = false;
+
+      const kill = (sig) => {
+        try {
+          if (abort && child.pid) process.kill(-child.pid, sig);
+          else child.kill(sig);
+        } catch { /* already gone */ }
+      };
+      const onAbort = () => {
+        cancelled = true;
+        kill("SIGTERM");
+        // Wait for it to go rather than answering while it still runs: the
+        // caller releases the install lock as soon as this resolves.
+        const hard = setTimeout(() => kill("SIGKILL"), 3000);
+        hard.unref?.();
+      };
+      abort?.addEventListener("abort", onAbort, { once: true });
 
       const finish = (code, signal, error) => {
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
+        abort?.removeEventListener("abort", onAbort);
         resolve({
           code,
           signal: signal ?? null,
           stdout,
           stderr,
-          error: error ? String(error?.message ?? error) : null,
+          error: cancelled ? "cancelled" : error ? String(error?.message ?? error) : null,
+          ...(cancelled ? { cancelled: true } : {}),
         });
       };
 
@@ -56,7 +83,7 @@ export function createRunner() {
 
       if (timeoutMs > 0) {
         timer = setTimeout(() => {
-          try { child.kill("SIGKILL"); } catch { /* already gone */ }
+          kill("SIGKILL");
           finish(null, "SIGKILL", `timed out after ${timeoutMs}ms`);
         }, timeoutMs);
         timer.unref?.();
