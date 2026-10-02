@@ -831,6 +831,34 @@ test("mise failures report their cause, not the boilerplate around it", () => {
   assert.match(firstError(offline), /^Remote versions cannot be fetched/);
 });
 
+test("a step that only says it failed is reported by what the tool printed", () => {
+  // mise 2026.9.10 installing Go with GOROOT left at an older image's /usr/local/go.
+  const goroot = {
+    code: 1, error: null, stdout: "",
+    stderr: [
+      "mise by @jdx – installing 1 tool",
+      "  go@1.27.1  extracting  3.0s",
+      "mise go@1.27.1 go: cannot find GOROOT directory: /usr/local/go",
+      "mise ERROR ~/.local/share/mise/installs/go/1.27.1/bin/go failed",
+      "  go@1.27.1  go version  6.0s",
+      "mise ✗ go@1.27.1  6.4s · failed: ~/.local/share/mise/installs/go/1.27.1/bin/go exited with non-zero status: exit code 2",
+      "mise ERROR Failed to install core:go@1.27.1: ~/.local/share/mise/installs/go/1.27.1/bin/go exited with non-zero status: exit code 2",
+      "mise ERROR Version: 2026.9.10 linux-arm64 (2026-09-16)",
+      "mise ERROR Run with --verbose or MISE_VERBOSE=1 for more information",
+    ].join("\n"),
+  };
+  assert.equal(firstError(goroot), "go: cannot find GOROOT directory: /usr/local/go");
+  // A generic failure with nothing from the tool keeps mise's own line.
+  const bare = { code: 1, error: null, stdout: "", stderr: "mise ERROR ~/.local/share/mise/installs/go/1.27.1/bin/go failed" };
+  assert.equal(firstError(bare), "~/.local/share/mise/installs/go/1.27.1/bin/go failed");
+  // An ERROR that already says why is never second-guessed.
+  const rust = {
+    code: 1, error: null, stdout: "",
+    stderr: "mise rust@1.99.0 info: downloading installer\nmise ERROR Failed to install core:rust@1.99.0: failed create_dir_all: /usr/local/rustup: Permission denied (os error 13)",
+  };
+  assert.equal(firstError(rust), "Failed to install core:rust@1.99.0: failed create_dir_all: /usr/local/rustup: Permission denied (os error 13)");
+});
+
 test("Cursor gets a link on the t3 PATH exactly while it is installed", async () => {
   const fs = new MemoryFs();
   const world = createWorld(fs);

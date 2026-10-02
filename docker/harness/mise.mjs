@@ -149,11 +149,19 @@ const NOISE = [
   /^mise WARN\s+To update, run/i,
 ];
 
+// A line a tool printed itself, which mise echoes with the tool's name:
+// `mise go@1.27.1 go: cannot find GOROOT directory: /usr/local/go`.
+const TOOL_SAID = /^mise [\w.:/-]+@\S+ (.+)$/;
+// An ERROR that only says a step failed, not why.
+const GENERIC = /\s(failed|exited with non-zero status(: exit code \d+)?)$/;
+
 /**
  * The line that says why a mise run failed. mise reports the cause first
  * (`mise ERROR Failed to install http:grok@9.9.9: ... 404`) and then the same
  * two boilerplate lines every time, so take the first ERROR that is not
- * boilerplate, else the last line left.
+ * boilerplate, else the last line left. When that ERROR only says a step
+ * failed (`~/.local/share/mise/installs/go/1.27.1/bin/go failed`), what the
+ * tool printed just before it is the reason, so report that instead.
  */
 export function firstError(result) {
   if (result.error) return result.error;
@@ -162,6 +170,11 @@ export function firstError(result) {
     .map((line) => line.trim())
     .filter(Boolean)
     .filter((line) => !NOISE.some((pattern) => pattern.test(line)));
-  const pick = lines.find((line) => /\bERROR\b/.test(line)) ?? lines.pop();
+  const at = lines.findIndex((line) => /\bERROR\b/.test(line));
+  if (at !== -1 && GENERIC.test(lines[at])) {
+    const said = lines.slice(0, at).map((line) => TOOL_SAID.exec(line)?.[1]).filter(Boolean).pop();
+    if (said) return said;
+  }
+  const pick = at !== -1 ? lines[at] : lines.pop();
   return pick ? pick.replace(/^mise (ERROR|WARN)\s+/, "") : `mise exited with code ${result.code}`;
 }
