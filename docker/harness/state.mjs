@@ -1,6 +1,6 @@
-// The manager's own record: what exact version each harness (and toolchain)
-// was installed at, where its executable resolved, and how the last operation
-// ended.
+// The manager's own record: what exact version each harness, toolchain and
+// added package was installed at, where its executable resolved, and how the
+// last operation ended.
 //
 // mise is the source of truth for what is installed right now; this file adds
 // the facts mise cannot express - that an operation was interrupted, and which
@@ -15,7 +15,7 @@ export function statePath(stateDir) {
 }
 
 export function emptyState() {
-  return { schema: SCHEMA, harnesses: {}, toolchains: {} };
+  return { schema: SCHEMA, harnesses: {}, toolchains: {}, packages: {} };
 }
 
 const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
@@ -29,6 +29,7 @@ export async function readState(ctx) {
       schema: SCHEMA,
       harnesses: isObject(parsed.harnesses) ? parsed.harnesses : {},
       toolchains: isObject(parsed.toolchains) ? parsed.toolchains : {},
+      packages: isObject(parsed.packages) ? parsed.packages : {},
     };
   } catch {
     return emptyState();
@@ -43,7 +44,7 @@ export async function writeState(ctx, state) {
   await ctx.fs.rename(tmp, ctx.statePath);
 }
 
-/** Merge one entry of a section ("harnesses" or "toolchains") and persist it. */
+/** Merge one entry of a section ("harnesses", "toolchains", "packages") and persist it. */
 export async function updateEntry(ctx, section, id, patch) {
   const state = await readState(ctx);
   const previous = state[section][id] ?? {};
@@ -54,4 +55,12 @@ export async function updateEntry(ctx, section, id, patch) {
   state[section][id] = next;
   await writeState(ctx, state);
   return next;
+}
+
+/** Drop one entry of a section and persist it; a missing entry is fine. */
+export async function removeEntry(ctx, section, id) {
+  const state = await readState(ctx);
+  if (!(id in state[section])) return;
+  delete state[section][id];
+  await writeState(ctx, state);
 }

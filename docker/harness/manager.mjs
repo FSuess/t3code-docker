@@ -13,6 +13,10 @@ import { CATALOGUE, TOOLCHAINS, getHarness, getToolchain, normalizeArch, support
 import { createFs, createRunner, isExecutable, processAlive, processStartTime } from "./io.mjs";
 import * as lock from "./lock.mjs";
 import * as mise from "./mise.mjs";
+import {
+  canonicalTool, displayName, indexRegistry, isReservedTool, isVersionSpec, managedElsewhere,
+  parseRegistry, parseToolInfo, parseToolSpec, parseVersions,
+} from "./packages.mjs";
 import { credentialSurface, detectAuth, probeVersion } from "./probe.mjs";
 import * as state from "./state.mjs";
 import { meetsMinimum } from "./version.mjs";
@@ -25,6 +29,10 @@ const VERSION_SYNTAX = /^\d+\.[0-9A-Za-z._+-]{1,62}$/;
 
 // Steps report through this when nobody is listening and nothing can cancel.
 const NO_OP = Object.freeze({ signal: null, phase() {}, report() {} });
+
+// What an operation's work returns to have its record dropped rather than
+// updated: an uninstalled package leaves nothing behind to list.
+const REMOVE_RECORD = Symbol("remove-record");
 
 const DEFAULT_TIMEOUTS = Object.freeze({
   mise: 120_000,
@@ -257,10 +265,14 @@ export function createHarnessManager(options = {}) {
         operation: { kind, state: "in-progress", startedAt: ctx.now(), finishedAt: null, error: null },
       });
       const patch = await work(entry, previous, op) ?? {};
-      await state.updateEntry(ctx, section, id, {
-        ...patch,
-        operation: { kind, state: "ok", startedAt: null, finishedAt: ctx.now(), error: null },
-      });
+      if (patch === REMOVE_RECORD) {
+        await state.removeEntry(ctx, section, id);
+      } else {
+        await state.updateEntry(ctx, section, id, {
+          ...patch,
+          operation: { kind, state: "ok", startedAt: null, finishedAt: ctx.now(), error: null },
+        });
+      }
       outcome = { ok: true, code: "ok" };
     } catch (error) {
       // A cancelled operation is not a failed one: the row goes back to how
@@ -443,9 +455,17 @@ export function createHarnessManager(options = {}) {
     };
   }
 
+  /**
+   * The five toolchains, and every other tool in the global config (see
+   * packages below), from one `mise ls`: the console reads this on every poll.
+   */
   async function toolchainStatus() {
     const snap = await snapshot();
-    return { toolchains: TOOLCHAINS.map((entry) => toolchainFacts(entry, snap)), degraded: snap.degraded };
+    return {
+      toolchains: TOOLCHAINS.map((entry) => toolchainFacts(entry, snap)),
+      packages: packageIds(snap).map((id) => packageFacts(id, snap)),
+      degraded: snap.degraded,
+    };
   }
 
   async function resolveToolchain(id) {
@@ -517,6 +537,238 @@ export function createHarnessManager(options = {}) {
       }
       return { version: undefined, managedVersions: [] };
     }, options);
+  }
+
+  // --- packages -------------------------------------------------------------
+  //
+  // Any other tool in the user's global mise config: ripgrep, kubectl, python,
+  // `npm:prettier`. Managed like a toolchain - one at a time under the lock,
+  // installed at an exact version and proven installed before it is recorded -
+  // except that nothing is known about it in advance: its name comes from the
+  // person adding it (validated in packages.mjs), and "it works" means mise
+  // reports that exact version installed. Tools someone added with
+  // `mise use -g` are listed and managed too; they simply have no record yet.
+
+  let registryLoad = null;
+  /** mise's built-in registry, parsed once per process: it ships in the binary. */
+  function packageRegistry() {
+    registryLoad ??= mise.registry(ctx).then(parseRegistry, (error) => {
+      registryLoad = null;
+      throw error;
+    });
+    return registryLoad;
+  }
+  let registryIndexLoad = null;
+  function registryIndex() {
+    registryIndexLoad ??= packageRegistry().then(indexRegistry, (error) => {
+      registryIndexLoad = null;
+      throw error;
+    });
+    return registryIndexLoad;
+  }
+
+  /**
+   * A tool name as it should be configured, or the reason it cannot be: not a
+   * valid name, or one an agent or toolchain is managed under (in any spelling:
+   * claude-code, core:go). Aliases become their registry name (rg -> ripgrep),
+   * so a tool is never configured twice under two names.
+   */
+  async function normalizePackage(raw) {
+    const parsed = parseToolSpec(raw);
+    if (!parsed.ok) return { ok: false, code: "invalid-tool", error: parsed.error };
+    const index = await registryIndex().catch(() => null);
+    const owner = managedElsewhere(parsed.id, index);
+    if (owner) {
+      return {
+        ok: false,
+        code: "managed-elsewhere",
+        error: `${owner.name} is managed on the ${owner.kind === "agent" ? "Agents" : "Toolchains"} page, not as an added tool.`,
+      };
+    }
+    return { ok: true, id: canonicalTool(parsed.id, index) };
+  }
+
+  function isGlobal(candidate) {
+    return Boolean(candidate.source) && String(candidate.source.path ?? "").startsWith(ctx.configDir);
+  }
+
+  function packageIds(snap) {
+    const ids = new Set();
+    for (const [tool, entries] of Object.entries(snap.tools)) {
+      if (isReservedTool(tool) || (tool.startsWith("core:") && isReservedTool(tool.slice(5)))) continue;
+      if (entries.some(isGlobal)) ids.add(tool);
+    }
+    // A record without a config entry is a first install that failed (shown so
+    // it can be retried or dismissed) or one under way. One that finished with
+    // the tool gone was removed outside the console, and is not shown.
+    for (const [id, record] of Object.entries(snap.saved.packages)) {
+      const stateNow = record.operation?.state;
+      if (stateNow === "failed" || stateNow === "in-progress" || snap.live?.id === id) ids.add(id);
+    }
+    return [...ids].sort((a, b) => displayName(a).localeCompare(displayName(b)) || a.localeCompare(b));
+  }
+
+  function packageFacts(id, snap) {
+    const configured = (snap.tools[id] ?? []).filter(isGlobal);
+    const global = configured.find((candidate) => candidate.active) ?? configured[0] ?? null;
+    const record = snap.saved.packages[id] ?? {};
+    const operation = record.operation ?? null;
+    const liveForThis = Boolean(snap.live && snap.live.id === id);
+    const interrupted = operation?.state === "in-progress" && !liveForThis;
+    let failure = null;
+    if (interrupted) failure = "a previous operation was interrupted before it finished";
+    else if (operation?.state === "failed") failure = operation.error ?? "the last operation failed";
+    return {
+      id,
+      name: displayName(id),
+      configured: Boolean(global),
+      installed: Boolean(global?.installed),
+      version: global?.installed ? global.version ?? null : null,
+      // What the config asks for, when that is not an exact version: `latest`,
+      // `3`, `lts`. The console says so rather than implying a pin.
+      requestedVersion: global?.requested_version ?? null,
+      inProgress: liveForThis,
+      operation: operation?.kind ?? null,
+      operationState: operation?.state ?? null,
+      managedVersions: record.managedVersions ?? [],
+      // Added with `mise use -g` rather than through the manager.
+      adopted: Boolean(global) && !record.version,
+      failed: Boolean(failure),
+      failure,
+    };
+  }
+
+  async function resolvePackage(id) {
+    return packageFacts(id, await snapshot());
+  }
+
+  function runPackage(id, kind, work, { onStarted, onProgress, signal } = {}) {
+    return runLocked({
+      section: "packages",
+      id,
+      kind,
+      entry: { id, miseTool: id, name: displayName(id) },
+      work,
+      onStarted,
+      onProgress,
+      signal,
+      after: async () => ({ package: await resolvePackage(id) }),
+    });
+  }
+
+  /**
+   * The exact release to install: mise's newest, or the newest matching a
+   * prefix (3.12 -> 3.12.7), or the exact version asked for if it exists.
+   */
+  async function packageTarget(id, version, op) {
+    op.phase("resolving");
+    const target = await mise.latest(ctx, version ? `${id}@${version}` : id, { signal: op.signal });
+    if (!isVersionSpec(target)) throw operationError("invalid-version", `mise resolved ${displayName(id)} to "${target}", which is not a version`);
+    return target;
+  }
+
+  /** `mise use` the release, then prove mise reports it installed before recording it. */
+  async function selectPackage(id, previous, target, op) {
+    const entry = { id, miseTool: id, name: displayName(id) };
+    const version = await useVerified(entry, target, async () => {
+      const listing = await mise.listTools(ctx);
+      const configured = (listing.tools?.[id] ?? []).filter(isGlobal);
+      const selected = configured.find((candidate) => candidate.version === target && candidate.installed)
+        ?? configured.find((candidate) => candidate.active && candidate.installed);
+      if (!selected) throw operationError("not-installed", `mise did not report ${displayName(id)} ${target} as installed`);
+      return selected.version;
+    }, op, previous);
+    return {
+      version,
+      installedAt: previous.installedAt ?? ctx.now(),
+      updatedAt: ctx.now(),
+      managedVersions: union(previous.managedVersions, [version]),
+    };
+  }
+
+  function cleanVersion(version) {
+    const value = version === undefined || version === null ? "" : String(version).trim();
+    return value === "latest" ? "" : value;
+  }
+
+  /**
+   * Add a tool, or switch an added one to another release. Without a version
+   * it resolves mise's newest; a prefix (3.12) resolves to the newest under it.
+   */
+  async function installPackage(raw, options = {}) {
+    const normalized = await normalizePackage(raw);
+    if (!normalized.ok) return normalized;
+    const version = cleanVersion(options.version);
+    if (version && !isVersionSpec(version)) return { ok: false, code: "invalid-version", error: `invalid version: ${version}` };
+    const { id } = normalized;
+    return runPackage(id, "install", async (entry, previous, op) =>
+      selectPackage(id, previous, await packageTarget(id, version, op), op), options);
+  }
+
+  /** Move an added tool to mise's newest release. */
+  async function updatePackage(raw, options = {}) {
+    const normalized = await normalizePackage(raw);
+    if (!normalized.ok) return normalized;
+    const { id } = normalized;
+    const current = await resolvePackage(id);
+    if (!current.configured) {
+      return { ok: false, code: "not-installed", error: `${displayName(id)} is not installed`, package: current };
+    }
+    return runPackage(id, "update", async (entry, previous, op) =>
+      selectPackage(id, previous, await packageTarget(id, "", op), op), options);
+  }
+
+  /**
+   * Remove an added tool from the global config, with every release this
+   * manager installed and the one the config selected. A version only a
+   * project asks for is that project's to keep. A failed first install, which
+   * never reached the config, is simply dismissed.
+   */
+  async function uninstallPackage(raw, options = {}) {
+    const parsed = parseToolSpec(raw);
+    if (!parsed.ok) return { ok: false, code: "invalid-tool", error: parsed.error };
+    const index = await registryIndex().catch(() => null);
+    const id = canonicalTool(parsed.id, index);
+    if (managedElsewhere(id, index)) return normalizePackage(id);
+    return runPackage(id, "uninstall", async (entry, previous, op) => {
+      op.phase("removing");
+      const listing = await mise.listTools(ctx);
+      const selected = (listing.tools?.[id] ?? [])
+        .filter((candidate) => candidate.installed && isGlobal(candidate))
+        .map((candidate) => candidate.version);
+      const configured = (listing.tools?.[id] ?? []).some(isGlobal);
+      if (configured) {
+        try {
+          await mise.unuse(ctx, id);
+        } catch (error) {
+          if (!/not (found|present|installed)/i.test(String(error?.message ?? ""))) throw error;
+        }
+      }
+      for (const version of union(previous.managedVersions, selected)) {
+        await mise.uninstall(ctx, id, version);
+      }
+      return REMOVE_RECORD;
+    }, options);
+  }
+
+  async function latestPackage(raw) {
+    const parsed = parseToolSpec(raw);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return mise.latest(ctx, parsed.id);
+  }
+
+  /** Every release a tool's backend offers, newest first. Asks the network. */
+  async function packageVersions(raw) {
+    const parsed = parseToolSpec(raw);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parseVersions(await mise.lsRemote(ctx, parsed.id));
+  }
+
+  /** Where a tool comes from and how its downloads are verified. */
+  async function packageInfo(raw) {
+    const parsed = parseToolSpec(raw);
+    if (!parsed.ok) throw new Error(parsed.error);
+    return parseToolInfo(await mise.toolInfo(ctx, parsed.id));
   }
 
   /**
@@ -606,6 +858,21 @@ export function createHarnessManager(options = {}) {
       update: updateToolchain,
       uninstall: uninstallToolchain,
       latest: latestToolchain,
+    },
+    packages: {
+      async status() {
+        const { packages, degraded } = await toolchainStatus();
+        return { packages, degraded };
+      },
+      resolve: resolvePackage,
+      normalize: normalizePackage,
+      install: installPackage,
+      update: updatePackage,
+      uninstall: uninstallPackage,
+      latest: latestPackage,
+      versions: packageVersions,
+      info: packageInfo,
+      registry: packageRegistry,
     },
     paths: {
       home,

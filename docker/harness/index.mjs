@@ -8,6 +8,8 @@
 //   const result = await harness.uninstall("grok");
 //   const { toolchains } = await harness.toolchains.status();
 //   await harness.toolchains.install("rust");                 // latest, recorded exact
+//   const { packages } = await harness.packages.status();      // any other global mise tool
+//   await harness.packages.install("ripgrep");                 // or "npm:prettier", { version: "3.12" }
 //
 // `status`/`resolve` are read-only. `install`/`update`/`uninstall` run one at a
 // time under a lock and record the exact version they resolved.
@@ -23,4 +25,8 @@ export {
   supportsArch,
 } from "./catalogue.mjs";
 export { parsePreinstall, readPreinstall, runPreinstall } from "./preinstall.mjs";
+export {
+  canonicalTool, displayName, indexRegistry, isReservedTool, isVersionSpec, managedElsewhere,
+  parseRegistry, parseToolInfo, parseToolSpec, parseVersions,
+} from "./packages.mjs";
 export { compareVersions, meetsMinimum } from "./version.mjs";

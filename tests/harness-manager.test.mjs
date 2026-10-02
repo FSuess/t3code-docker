@@ -129,6 +129,22 @@ function createWorld(fs, { arch = "x64" } = {}) {
     runVersionOverride: {},
     useSpecs: [],
     failProbe: [],
+    // Everything else mise can install: versions oldest first, as ls-remote prints.
+    versions: {
+      jq: ["1.7", "1.7.1", "1.8.0", "1.8.1", "1.8.2"],
+      ripgrep: ["14.1.1", "15.0.0"],
+      python: ["3.11.9", "3.12.6", "3.12.7", "3.13.0"],
+      yq: ["4.44.1", "4.45.1"],
+      terraform: ["1.9.0", "1.10.2"],
+      "npm:prettier": ["3.3.3", "3.4.2"],
+    },
+    registry: [
+      { short: "jq", backends: ["aqua:jqlang/jq"], bins: ["jq"], description: "Command-line JSON processor" },
+      { short: "ripgrep", backends: ["aqua:BurntSushi/ripgrep", "cargo:ripgrep"], bins: ["rg"], description: "Searches directories", aliases: ["rg"] },
+      { short: "claude", backends: ["aqua:anthropics/claude-code", "http:claude"], bins: ["claude"], description: "Claude Code", aliases: ["claude-code"] },
+      { short: "go", backends: ["core:go"], bins: ["go"], description: "Go" },
+      { short: "python", backends: ["core:python"], bins: ["python"], description: "python language" },
+    ],
   };
 
   world.versionsOf = (tool) => (world.tools[tool] ?? []).map((entry) => entry.version);
@@ -161,7 +177,30 @@ function createWorld(fs, { arch = "x64" } = {}) {
       }
       return ok(`${JSON.stringify(ordered)}\n`);
     }
-    if (command === "latest") return ok(`${world.latest[tool]}\n`);
+    if (command === "latest") {
+      // `tool@prefix` resolves to the newest release under the prefix (or the
+      // exact one); a bare tool to its newest.
+      const at = tool.lastIndexOf("@");
+      if (at > 0 && tool[at - 1] !== ":") {
+        const name = tool.slice(0, at);
+        const prefix = tool.slice(at + 1);
+        const hit = (world.versions[name] ?? []).filter((v) => v === prefix || v.startsWith(`${prefix}.`)).pop();
+        return hit ? ok(`${hit}\n`) : fail(`mise ERROR no version of ${name} matches ${prefix}`);
+      }
+      const latest = world.latest[tool] ?? (world.versions[tool] ?? []).at(-1);
+      return latest ? ok(`${latest}\n`) : fail(`mise ERROR ${tool} not found in mise tool registry`);
+    }
+    if (command === "registry") return ok(`${JSON.stringify(world.registry)}\n`);
+    if (command === "ls-remote") {
+      const list = world.versions[tool];
+      return list ? ok(`${list.join("\n")}\n`) : fail(`mise ERROR ${tool} not found in mise tool registry`);
+    }
+    if (command === "tool") {
+      const name = argv[4];
+      const known = world.registry.find((entry) => entry.short === name);
+      return ok(`${JSON.stringify({ backend: known?.backends[0] ?? name, description: known?.description ?? null,
+        installed_versions: world.versionsOf(name), security: [{ type: "checksum", algorithm: "sha256" }] })}\n`);
+    }
     if (command === "which") {
       // Rust's binaries are cargo/rustc, not "rust".
       const selected = world.selected[tool === "cargo" ? "rust" : tool];
@@ -169,7 +208,10 @@ function createWorld(fs, { arch = "x64" } = {}) {
     }
     if (command === "use") {
       // `tool[options]@version`: options are mise's business, not the fake's.
-      const [spec, version] = String(tool).split("@");
+      // The last @ splits, so a scoped npm name keeps its own.
+      const at = String(tool).lastIndexOf("@");
+      const spec = String(tool).slice(0, at);
+      const version = String(tool).slice(at + 1);
       const name = spec.replace(/\[.*\]$/, "");
       world.useSpecs.push(String(tool));
       if (world.failUse) return fail(world.failUse);
@@ -196,7 +238,9 @@ function createWorld(fs, { arch = "x64" } = {}) {
       return ok("");
     }
     if (command === "uninstall") {
-      const [name, version] = String(tool).split("@");
+      const at = String(tool).lastIndexOf("@");
+      const name = String(tool).slice(0, at);
+      const version = String(tool).slice(at + 1);
       world.tools[name] = (world.tools[name] ?? []).filter((entry) => entry.version !== version);
       if (world.selected[name]?.includes(`/${version}/`)) delete world.selected[name];
       return ok("");
@@ -1024,4 +1068,181 @@ test("the runner stops a cancelled program and everything it started", async () 
   already.abort();
   assert.equal((await run(["sh", "-c", "exit 0"], { signal: already.signal })).cancelled, true);
   assert.equal((await run(["sh", "-c", "echo hi"])).stdout, "hi\n", "a run without a signal is unchanged");
+});
+
+// --- packages: any other mise tool -------------------------------------------
+
+const readPackages = async (fs) => {
+  if (!(await fs.exists(path.join(STATE_DIR, "harness-state.json")))) return {};
+  return JSON.parse(await fs.readFile(path.join(STATE_DIR, "harness-state.json"), "utf8")).packages ?? {};
+};
+
+test("any tool installs at an exact version, pinned in the global config, and is listed", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const phases = [];
+  const result = await manager.packages.install("jq", { onProgress: (p) => phases.push(p.phase) });
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.package.version, "1.8.2");
+  assert.equal(result.package.installed, true);
+  assert.deepEqual(world.useSpecs, ["jq@1.8.2"], "the exact version is what goes in the config");
+  assert.deepEqual(phases, ["resolving", "installing", "verifying"]);
+  const { packages, toolchains } = await manager.toolchains.status();
+  assert.deepEqual(packages.map((p) => [p.id, p.version, p.adopted]), [["jq", "1.8.2", false]]);
+  assert.equal(toolchains.length, 5, "the toolchains are still their own list");
+  assert.equal((await readPackages(fs)).jq.version, "1.8.2");
+});
+
+test("a version prefix resolves to the newest release under it, and an exact one is kept", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  assert.equal((await manager.packages.install("python", { version: "3.12" })).package.version, "3.12.7");
+  assert.equal((await manager.packages.install("python", { version: "3.11.9" })).package.version, "3.11.9");
+  assert.equal((await manager.packages.install("python", { version: "latest" })).package.version, "3.13.0");
+  const missing = await manager.packages.install("python", { version: "2.7" });
+  assert.equal(missing.ok, false);
+  assert.match(missing.error, /no version of python matches 2\.7/);
+});
+
+test("an alias is configured under its registry name, so a tool is never there twice", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const result = await manager.packages.install("rg");
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.package.id, "ripgrep");
+  assert.deepEqual(world.useSpecs, ["ripgrep@15.0.0"]);
+});
+
+test("agents and toolchains are refused as packages, in any spelling", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  for (const id of ["claude", "claude-code", "aqua:anthropics/claude-code", "cursor-agent", "cursor", "go", "core:go", "rust", "uv"]) {
+    const result = await manager.packages.install(id);
+    assert.equal(result.code, "managed-elsewhere", id);
+  }
+  assert.match((await manager.packages.install("claude-code")).error, /Claude Code is managed on the Agents page/);
+  assert.match((await manager.packages.install("core:go")).error, /Go is managed on the Toolchains page/);
+  assert.deepEqual(world.useSpecs, [], "nothing reached mise");
+});
+
+test("names that could be flags, paths or URLs never reach mise", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  for (const id of ["", "--help", "-v", "a b", "asdf:https://example.com/plugin", "../etc", "x/", "jq;rm"]) {
+    const result = await manager.packages.install(id);
+    assert.equal(result.code, "invalid-tool", JSON.stringify(id));
+  }
+  assert.equal((await manager.packages.install("jq", { version: "--force" })).code, "invalid-version");
+  assert.equal(world.calls.some((call) => / (use|latest|unuse|uninstall) /.test(call)), false);
+});
+
+test("update moves to the newest release; uninstall removes every release it installed and the record", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  await manager.packages.install("jq", { version: "1.7.1" });
+  const updated = await manager.packages.update("jq");
+  assert.equal(updated.package.version, "1.8.2");
+  assert.deepEqual((await readPackages(fs)).jq.managedVersions, ["1.7.1", "1.8.2"]);
+
+  world.calls.length = 0;
+  const removed = await manager.packages.uninstall("jq");
+  assert.equal(removed.ok, true, removed.error);
+  assert.ok(world.calls.includes("mise -C /home/t3 unuse -g jq"));
+  assert.ok(world.calls.includes("mise -C /home/t3 uninstall jq@1.7.1"));
+  assert.ok(world.calls.includes("mise -C /home/t3 uninstall jq@1.8.2"));
+  assert.deepEqual((await manager.packages.status()).packages, [], "nothing left to list");
+  assert.equal("jq" in await readPackages(fs), false, "and no record left behind");
+});
+
+test("update on a tool that is not installed answers without recording a failure", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const result = await manager.packages.update("terraform");
+  assert.equal(result.code, "not-installed");
+  assert.equal("terraform" in await readPackages(fs), false);
+});
+
+test("a tool someone added with `mise use -g` is listed, adopted, and managed like any other", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  world.tools.yq = [{
+    version: "4.44.1", requested_version: "latest", install_path: path.join(DATA_DIR, "installs/yq/4.44.1"),
+    source: { type: "mise.toml", path: path.join(HOME, ".config/mise/config.toml") }, installed: true, active: true,
+  }];
+  // ... and a tool only a project asks for is that project's, never listed.
+  world.tools.terraform = [{ version: "1.9.0", installed: true, active: false, source: { type: "mise.toml", path: "/workspace/app/mise.toml" } }];
+  const manager = managerFor(world);
+  const { packages } = await manager.packages.status();
+  assert.deepEqual(packages.map((p) => [p.id, p.version, p.requestedVersion, p.adopted]), [["yq", "4.44.1", "latest", true]]);
+  const updated = await manager.packages.update("yq");
+  assert.equal(updated.package.version, "4.45.1");
+  assert.equal(updated.package.adopted, false, "once the manager has installed it, it has a record");
+});
+
+test("a failed first install is listed with its reason, and can be dismissed", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  world.failUse = "mise ERROR Failed to install aqua:hashicorp/terraform@1.10.2: 404 Not Found";
+  const failed = await manager.packages.install("terraform");
+  assert.equal(failed.ok, false);
+  let [row] = (await manager.packages.status()).packages;
+  assert.deepEqual([row.id, row.installed, row.failed, row.operation], ["terraform", false, true, "install"]);
+  assert.match(row.failure, /404 Not Found/);
+
+  world.failUse = null;
+  world.calls.length = 0;
+  const dismissed = await manager.packages.uninstall("terraform");
+  assert.equal(dismissed.ok, true, dismissed.error);
+  assert.equal(world.calls.some((call) => / (unuse|uninstall) /.test(call)), false, "nothing to remove from mise");
+  assert.deepEqual((await manager.packages.status()).packages, []);
+  [row] = (await manager.packages.status()).packages;
+  assert.equal(row, undefined);
+});
+
+test("agents and toolchains installed through their own pages never appear as packages", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  await manager.install("claude");
+  await manager.toolchains.install("go");
+  await manager.packages.install("jq");
+  assert.deepEqual((await manager.packages.status()).packages.map((p) => p.id), ["jq"]);
+});
+
+test("the registry, a tool's versions and its details come from mise, read-only", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const registry = await manager.packages.registry();
+  assert.deepEqual(registry.map((entry) => entry.name), ["claude", "go", "jq", "python", "ripgrep"]);
+  assert.deepEqual(registry.find((entry) => entry.name === "ripgrep").kinds, ["aqua", "cargo"]);
+  await manager.packages.registry();
+  assert.equal(world.calls.filter((call) => call.endsWith("registry --json --hide-aliased")).length, 1, "parsed once per process");
+  assert.deepEqual(await manager.packages.versions("jq"), ["1.8.2", "1.8.1", "1.8.0", "1.7.1", "1.7"]);
+  const info = await manager.packages.info("ripgrep");
+  assert.equal(info.backend, "aqua:BurntSushi/ripgrep");
+  assert.deepEqual(info.security, ["checksum"]);
+  await assert.rejects(manager.packages.versions("--help"), /not a mise tool name/);
+  assert.equal(world.calls.some((call) => / use /.test(call)), false);
+});
+
+test("a package operation takes the same lock as everything else", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  fs.seedFile(
+    path.join(STATE_DIR, "harness.lock"),
+    JSON.stringify({ pid: 4242, startTime: "100", token: "other", id: "rust", operation: "install", startedAt: 1_700_000_000_000 }),
+  );
+  const busy = await manager.packages.install("jq");
+  assert.equal(busy.code, "busy");
+  assert.deepEqual(world.useSpecs, []);
 });

@@ -125,6 +125,43 @@ export async function uninstall(ctx, tool, version) {
   }
 }
 
+/**
+ * mise's built-in registry: every short name with its backends, binaries,
+ * aliases and description. Local to the binary, so it answers in milliseconds
+ * with no network; the caller parses it (packages.mjs).
+ */
+export async function registry(ctx) {
+  const result = await ctx.run(miseArgs(ctx, ["registry", "--json", "--hide-aliased"]), {
+    env: readEnv(ctx.env),
+    cwd: ctx.home,
+    timeoutMs: ctx.timeouts.mise,
+  });
+  if (result.error || result.code !== 0) throw new Error(firstError(result) || "mise registry failed");
+  return result.stdout;
+}
+
+/** The versions a tool's backend offers, as mise prints them (oldest first). Asks the network. */
+export async function lsRemote(ctx, tool) {
+  const result = await ctx.run(miseArgs(ctx, ["ls-remote", tool]), {
+    env: readEnv(ctx.env),
+    cwd: ctx.home,
+    timeoutMs: ctx.timeouts.latest ?? ctx.timeouts.mise,
+  });
+  if (result.error || result.code !== 0) throw new Error(firstError(result) || `mise ls-remote ${tool} failed`);
+  return result.stdout;
+}
+
+/** `mise tool <tool> --json`: the backend it resolves to and how downloads are verified. */
+export async function toolInfo(ctx, tool) {
+  const result = await ctx.run(miseArgs(ctx, ["tool", tool, "--json"]), {
+    env: readEnv(ctx.env),
+    cwd: ctx.home,
+    timeoutMs: ctx.timeouts.latest ?? ctx.timeouts.mise,
+  });
+  if (result.error || result.code !== 0) throw new Error(firstError(result) || `mise tool ${tool} failed`);
+  return result.stdout;
+}
+
 /** The concrete executable mise resolves for a tool, or null. */
 export async function which(ctx, tool) {
   const result = await ctx.run(miseArgs(ctx, ["which", tool]), {
