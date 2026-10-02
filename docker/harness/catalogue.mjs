@@ -21,12 +21,15 @@ export const CURSOR_EXECUTABLE = "cursor-agent";
  * `executable` is the path relative to the mise install directory. `versionArgs`
  * is the bounded probe the manager runs to turn "a file exists" into "this
  * exact version runs". `miseOptions` are mise tool options passed with every
- * `mise use`, so an update keeps them.
+ * `mise use`, so an update keeps them. `firstStart` marks the agents a fresh
+ * volume installs unasked (T3_PREINSTALL's default); the rest are one press on
+ * the Agents page.
  */
 export const CATALOGUE = Object.freeze([
   {
     id: "claude",
     name: "Claude Code",
+    firstStart: true,
     miseTool: "claude",
     executable: "claude",
     versionArgs: ["--version"],
@@ -43,6 +46,7 @@ export const CATALOGUE = Object.freeze([
   {
     id: "codex",
     name: "Codex",
+    firstStart: true,
     miseTool: "codex",
     executable: "bin/codex",
     versionArgs: ["--version"],
@@ -58,6 +62,7 @@ export const CATALOGUE = Object.freeze([
   {
     id: "opencode",
     name: "OpenCode",
+    firstStart: true,
     miseTool: "opencode",
     executable: "opencode",
     versionArgs: ["--version"],
@@ -73,6 +78,7 @@ export const CATALOGUE = Object.freeze([
   {
     id: "grok",
     name: "Grok Build",
+    firstStart: false,
     miseTool: "grok",
     executable: "grok",
     versionArgs: ["--version"],
@@ -88,6 +94,7 @@ export const CATALOGUE = Object.freeze([
   {
     id: "cursor",
     name: "Cursor",
+    firstStart: false,
     miseTool: CURSOR_EXECUTABLE,
     executable: `dist-package/${CURSOR_EXECUTABLE}`,
     // Cursor's package is a whole runtime: dist-package holds its own `node`,

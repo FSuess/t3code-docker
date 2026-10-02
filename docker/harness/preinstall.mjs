@@ -3,9 +3,11 @@
 // The image ships no agent CLI and no language toolchain; they install into the
 // persistent home instead. Left at that, a fresh container - or one upgraded
 // from the old `full` image - would come up with nothing to run until someone
-// clicked Install five times. So on start, everything T3_PREINSTALL names that
-// is not there yet is installed in the background, one at a time, through the
-// same manager the setup page and `t3-harness` use.
+// clicked Install a dozen times. So on start, everything T3_PREINSTALL names
+// that is not there yet is installed in the background, one at a time, through
+// the same manager the setup page and `t3-harness` use. By default that is the
+// agents most people start with (the catalogue's `firstStart`) and the
+// toolchains; the other agents are one press on the Agents page.
 //
 // Each item is installed at most once per home volume. An item that succeeded
 // (or was already there) is recorded as done and never touched again, so
@@ -15,7 +17,8 @@
 // state-only mount that loses the tools on recreate loses the record with them,
 // and the next start installs them again.
 //
-//   T3_PREINSTALL=all            the default: every agent and every toolchain
+//   T3_PREINSTALL=default        Claude Code, Codex, OpenCode and every toolchain
+//   T3_PREINSTALL=all            every agent and every toolchain
 //   T3_PREINSTALL=agents         just the five agent CLIs
 //   T3_PREINSTALL=claude,go      any mix of ids and the groups above
 //   T3_PREINSTALL=none           nothing (also: off, 0, false)
@@ -27,10 +30,13 @@ import { createFs, processAlive, processStartTime } from "./io.mjs";
 
 const SCHEMA = 1;
 const OFF = new Set(["none", "off", "0", "false", "no"]);
-const ALL = new Set(["", "all", "default", "1", "true", "yes"]);
+const DEFAULT = new Set(["", "default"]);
+const ALL = new Set(["all", "1", "true", "yes"]);
 
 const AGENTS = CATALOGUE.map((entry) => ({ kind: "agent", id: entry.id, name: entry.name }));
 const TOOLS = TOOLCHAINS.map((entry) => ({ kind: "toolchain", id: entry.id, name: entry.name }));
+const FIRST_START = new Set(CATALOGUE.filter((entry) => entry.firstStart).map((entry) => entry.id));
+const DEFAULT_ITEMS = [...AGENTS.filter((item) => FIRST_START.has(item.id)), ...TOOLS];
 
 export const keyOf = (item) => `${item.kind}:${item.id}`;
 
@@ -42,12 +48,14 @@ export const keyOf = (item) => `${item.kind}:${item.id}`;
 export function parsePreinstall(value) {
   const raw = String(value ?? "").trim().toLowerCase();
   if (OFF.has(raw)) return { items: [], unknown: [] };
+  if (DEFAULT.has(raw)) return { items: DEFAULT_ITEMS, unknown: [] };
   if (ALL.has(raw)) return { items: [...AGENTS, ...TOOLS], unknown: [] };
 
   const wanted = new Set();
   const unknown = [];
   for (const token of raw.split(/[\s,]+/).filter(Boolean)) {
     if (token === "all") [...AGENTS, ...TOOLS].forEach((item) => wanted.add(keyOf(item)));
+    else if (token === "default") DEFAULT_ITEMS.forEach((item) => wanted.add(keyOf(item)));
     else if (token === "agents") AGENTS.forEach((item) => wanted.add(keyOf(item)));
     else if (token === "toolchains") TOOLS.forEach((item) => wanted.add(keyOf(item)));
     else {

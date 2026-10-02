@@ -478,12 +478,29 @@ sys.exit(0 if img.get('version') and img.get('variant') == '$want' else 1)"
 check "the image build is stamped and reported ($VARIANT)" version_is_stamped
 
 # The image ships no agent CLI and no language runtime. The first start puts
-# them back: everything T3_PREINSTALL names (all of it, by default) installs in
-# the background onto the volume. This container runs the default, so what
-# follows is what someone pulling `latest` gets.
+# them back: everything T3_PREINSTALL names (by default Claude Code, Codex,
+# OpenCode and the toolchains) installs in the background onto the volume. This
+# container runs the default, so what follows is what someone pulling `latest`
+# gets.
 printf '\nFirst-start setup (T3_PREINSTALL default)\n'
 status_json() { docker exec "${1:-$NAME}" sh -c \
   "curl -sS --max-time 25 -b ${2:-/tmp/jar} http://127.0.0.1:3774/status"; }
+# The page's lifecycle buttons, driven the way the page drives them. An install
+# answers as soon as it holds the lock (202) and finishes in the background, so
+# a slow download cannot outlive the request behind a tunnel; the page learns
+# the result from /status.
+lifecycle_post() {
+  docker exec "$NAME" sh -c "curl -sS -o /tmp/lifecycle.json -w '%{http_code}' -b /tmp/jar \
+    -H 'content-type: application/json' -d '{\"id\":\"$2\"}' http://127.0.0.1:3774/harnesses/$1"
+}
+operation_result() {
+  local state=""
+  for _ in $(seq 1 150); do
+    state="$(status_json | jq -r ".operations[\"harness:$1\"].state // \"\"")"
+    case "$state" in running|queued|"") sleep 2 ;; *) break ;; esac
+  done
+  [ "$state" = ok ]
+}
 
 setup_state=""
 for _ in $(seq 1 150); do
@@ -498,19 +515,32 @@ else
   docker logs "$NAME" 2>&1 | grep preinstall | tail -20
 fi
 
-setup_installed_everything() {
+setup_installed_defaults() {
   status_json | python3 -c '
 import json, sys
-s = json.load(sys.stdin)
-items = s["setup"]["items"]
-want = {"agent:" + i for i in ("claude", "codex", "opencode", "grok", "cursor")} \
+items = json.load(sys.stdin)["setup"]["items"]
+want = {"agent:" + i for i in ("claude", "codex", "opencode")} \
      | {"toolchain:" + i for i in ("go", "rust", "bun", "deno", "uv")}
-got = {i["kind"] + ":" + i["id"] for i in items if i["state"] == "done"}
-missing = want - got
-if missing: print("not installed:", sorted(missing))
-sys.exit(0 if not missing else 1)'
+planned = {i["kind"] + ":" + i["id"] for i in items}
+done = {i["kind"] + ":" + i["id"] for i in items if i["state"] == "done"}
+if want - done: print("not installed:", sorted(want - done))
+if planned - want: print("installed unasked:", sorted(planned - want))
+sys.exit(0 if want <= done and planned <= want else 1)'
 }
-check "every agent and toolchain is installed on first start" setup_installed_everything
+check "the first start installs Claude Code, Codex, OpenCode and the toolchains, nothing else" setup_installed_defaults
+
+# Grok and Cursor wait for someone to ask. Ask the way the Agents page does,
+# one after the other, and everything below sees all five.
+optional_agents_install() {
+  local id code
+  for id in grok cursor; do
+    status_json | jq -e ".harnesses[] | select(.id == \"$id\") | .installed == false" >/dev/null || return 1
+    code="$(lifecycle_post install "$id")"
+    case "$code" in 200|202) ;; *) return 1 ;; esac
+    operation_result "$id" || return 1
+  done
+}
+check "Grok and Cursor are not installed unasked, and install from the page" optional_agents_install
 
 agents_runnable() {
   status_json | python3 -c '
@@ -763,24 +793,7 @@ sys.exit(0 if ok and all(rx.match(i) for i in ids) else 1)'
 }
 check "the provider picker offers a catalog the server accepts" provider_catalog
 
-# The page's lifecycle buttons, driven the way the page drives them. An install
-# answers as soon as it holds the lock (202) and finishes in the background, so
-# a slow download cannot outlive the request behind a tunnel; the page learns
-# the result from /status.
 printf '\nAgent lifecycle from the page\n'
-lifecycle_post() {
-  docker exec "$NAME" sh -c "curl -sS -o /tmp/lifecycle.json -w '%{http_code}' -b /tmp/jar \
-    -H 'content-type: application/json' -d '{\"id\":\"$2\"}' http://127.0.0.1:3774/harnesses/$1"
-}
-operation_result() {
-  local state=""
-  for _ in $(seq 1 90); do
-    state="$(status_json | jq -r ".operations[\"harness:$1\"].state // \"\"")"
-    [ "$state" = running ] || [ -z "$state" ] || break
-    sleep 2
-  done
-  [ "$state" = ok ]
-}
 grok_binary_path() {
   docker exec -u t3 "$NAME" cat /home/t3/.t3/userdata/settings.json | jq -r '.providers.grok.binaryPath // ""'
 }

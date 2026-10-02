@@ -30,7 +30,7 @@ T3_HOME=/home/t3
 : "${T3_SETUP_ENABLED:=1}"
 : "${T3_SETUP_PORT:=3774}"
 : "${T3_PERSIST_AGENT_CREDENTIALS:=1}"
-: "${T3_PREINSTALL:=all}"
+: "${T3_PREINSTALL:=default}"
 # The image's own runtimes. T3 runs as the root-owned platform binary; setup
 # and repository JavaScript helpers run under the image Node. Neither resolves
 # `node` or `t3` through PATH. Overridable for tests.
@@ -346,8 +346,8 @@ sync_managed_providers() {
 sync_managed_providers
 
 # Put back what the image used to bake. Everything T3_PREINSTALL names (by
-# default all five agents and Go, Rust, Bun, Deno and uv) that is not on the
-# volume yet installs in the background, once: progress is on the setup page,
+# default Claude Code, Codex, OpenCode and Go, Rust, Bun, Deno and uv) that is
+# not on the volume yet installs in the background, once: progress is on the setup page,
 # each agent is handed to T3 as soon as it lands, and a failure is retried on
 # the next start. Nothing here blocks the server from coming up.
 start_preinstall() {

@@ -75,36 +75,50 @@ const run = (manager, fs, env = {}, extra = {}) => runPreinstall({
 
 test("T3_PREINSTALL parses groups, ids, and off switches", () => {
   const ids = (value) => parsePreinstall(value).items.map((item) => `${item.kind}:${item.id}`);
-  assert.deepEqual(ids(undefined), [
-    "agent:claude", "agent:codex", "agent:opencode", "agent:grok", "agent:cursor",
-    "toolchain:go", "toolchain:rust", "toolchain:bun", "toolchain:deno", "toolchain:uv",
+  const toolchains = ["toolchain:go", "toolchain:rust", "toolchain:bun", "toolchain:deno", "toolchain:uv"];
+  // Unset: the agents most people start with, and every toolchain. Grok and
+  // Cursor wait for someone to ask for them.
+  assert.deepEqual(ids(undefined), ["agent:claude", "agent:codex", "agent:opencode", ...toolchains]);
+  assert.deepEqual(ids("default"), ids(undefined));
+  assert.deepEqual(ids("all"), [
+    "agent:claude", "agent:codex", "agent:opencode", "agent:grok", "agent:cursor", ...toolchains,
   ]);
-  assert.deepEqual(ids("all"), ids(""));
-  assert.deepEqual(ids("agents"), ids("").slice(0, 5));
-  assert.deepEqual(ids("toolchains"), ids("").slice(5));
+  for (const all of ["1", "true", "yes"]) assert.deepEqual(ids(all), ids("all"), all);
+  assert.deepEqual(ids("agents"), ids("all").slice(0, 5));
+  assert.deepEqual(ids("toolchains"), toolchains);
+  assert.deepEqual(ids("default,grok"), ["agent:claude", "agent:codex", "agent:opencode", "agent:grok", ...toolchains]);
+  assert.deepEqual(Object.keys(parsePreinstall("").items[0]).sort(), ["id", "kind", "name"], "items carry no catalogue flags");
   for (const off of ["none", "off", "0", "false", " NONE "]) assert.deepEqual(ids(off), [], off);
   // Order follows the catalogue, not the variable, and duplicates collapse.
   assert.deepEqual(ids("go, claude rust claude"), ["agent:claude", "toolchain:go", "toolchain:rust"]);
   assert.deepEqual(parsePreinstall("claude,python,java").unknown, ["python", "java"]);
 });
 
-test("a first start installs everything, agents first, and syncs each agent", async () => {
+test("a first start installs the default set, agents first, and syncs each agent", async () => {
   const fs = memoryFs();
   const manager = fakeManager();
   let syncs = 0;
   const summary = await run(manager, fs, {}, { sync: async () => { syncs += 1; } });
   assert.deepEqual(manager.calls, [
-    "agent:claude", "agent:codex", "agent:opencode", "agent:grok", "agent:cursor",
+    "agent:claude", "agent:codex", "agent:opencode",
     "toolchain:go", "toolchain:rust", "toolchain:bun", "toolchain:deno", "toolchain:uv",
   ]);
-  assert.equal(summary.installed.length, 10);
-  assert.equal(syncs, 5, "one sync per agent, none for toolchains");
+  assert.equal(summary.installed.length, 8);
+  assert.equal(syncs, 3, "one sync per agent, none for toolchains");
 
   const shown = await readPreinstall({ stateDir: STATE_DIR, fs });
   assert.equal(shown.state, "finished");
-  assert.equal(shown.items.length, 10);
+  assert.equal(shown.items.length, 8);
   assert.equal(shown.items.every((item) => item.state === "done"), true);
   assert.equal(shown.items[0].version, "9.9.9");
+});
+
+test("T3_PREINSTALL=all still installs every agent", async () => {
+  const fs = memoryFs();
+  const manager = fakeManager();
+  await run(manager, fs, { T3_PREINSTALL: "all" });
+  assert.deepEqual(manager.calls.filter((call) => call.startsWith("agent:")),
+    ["agent:claude", "agent:codex", "agent:opencode", "agent:grok", "agent:cursor"]);
 });
 
 test("what is already there is adopted, not reinstalled", async () => {

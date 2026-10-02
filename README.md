@@ -119,7 +119,8 @@ docker compose exec -it t3code t3-login claude   # if you prefer a shell to the 
 | T3 Code server + web app | ✅ | ✅ |
 | git, git-lfs, gh, ssh, Node, Python | ✅ | ✅ |
 | clang/CMake/GDB, ffmpeg, ImageMagick, psql, redis-cli | ✅ | ✅ |
-| Claude Code, Codex, OpenCode, Grok, Cursor CLIs | first start | first start |
+| Claude Code, Codex, OpenCode CLIs | first start | first start |
+| Grok, Cursor CLIs | one click | one click |
 | Go, Rust, Bun, Deno, uv | first start | first start |
 | mise, for per-project versions | ✅ | ✅ |
 | Headless Chromium + browser MCP servers | ✅ | — |
@@ -128,9 +129,11 @@ docker compose exec -it t3code t3-login claude   # if you prefer a shell to the 
 
 "First start" means the container installs them onto the `/home/t3` volume the
 first time it runs, in the background, and never again: about 2.5 GB that lives
-on the volume you already keep rather than in every pull. `T3_PREINSTALL`
-narrows it (`agents`, `toolchains`, a list like `claude,codex,go`) or turns it
-off (`none`); anything you leave out is one click away on the setup page.
+on the volume you already keep rather than in every pull. "One click" means
+the setup page installs it when you ask. `T3_PREINSTALL` changes the set
+(`all` for every agent too, `agents`, `toolchains`, a list like
+`claude,codex,go`) or turns it off (`none`); anything you leave out is one
+click away on the setup page.
 
 Neither image contains credentials or model access. You bring harnesses you have
 already paid for and sign them in yourself.
@@ -464,9 +467,10 @@ passes it the sandbox flags it needs — but it is the less tested path.
 
 ## Harnesses
 
-All five install on the first start (unless `T3_PREINSTALL` says otherwise)
-into `/home/t3/.local/share/mise`, at an exact recorded version, so they survive
-a recreate with the rest of the volume. Sign them in from the setup page — each
+Claude Code, Codex and OpenCode install on the first start, and Grok and
+Cursor when you press Install on the Agents page (or on the first start too,
+with `T3_PREINSTALL=all`). Each lands in `/home/t3/.local/share/mise`, at an
+exact recorded version, so it survives a recreate with the rest of the volume. Sign them in from the setup page — each
 one's own flow, a URL and a QR to approve on your phone, a field for the code
 where one comes back. The `t3-login` column is the shell equivalent — it exists
 because `docker exec` lands as root, and a harness signed in as root writes its
@@ -604,7 +608,7 @@ Environment variables (all optional except where noted):
 | `T3_WORKSPACE` | `/workspace` | Scanned for projects |
 | `T3_AUTO_ADD_PROJECTS` | `1` | Register each git checkout under the workspace |
 | `T3_PRINT_PAIRING_ON_START` | `0` | Mint and log a pairing link on boot |
-| `T3_PREINSTALL` | `all` | What the first start installs onto the volume: `all`, `agents`, `toolchains`, ids like `claude,go`, or `none` |
+| `T3_PREINSTALL` | `default` | What the first start installs onto the volume: `default` (Claude Code, Codex, OpenCode and the toolchains), `all`, `agents`, `toolchains`, ids like `claude,go`, or `none` |
 | `T3_PAIR_TTL` | `30d` | How long links from `t3-pair` stay redeemable |
 | `T3_SETUP_ENABLED` | `1` | Run the setup UI |
 | `T3_SETUP_KEY` | *(generated)* | Password for the setup UI. Set it to keep it stable. |
