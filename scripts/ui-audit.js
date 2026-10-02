@@ -55,8 +55,11 @@ const audit = () => {
   };
 
   // -- 1. content clipped by its own box -----------------------------------
+  // The empty state's icon fans two cards out behind it (pseudo-elements
+  // drawn outside its box by design), which reads as overflow here.
+  const DRAWN_OUTSIDE = ".tc-empty-icon";
   for (const el of document.querySelectorAll("body *")) {
-    if (!visible(el)) continue;
+    if (!visible(el) || el.matches(DRAWN_OUTSIDE)) continue;
     const style = getComputedStyle(el);
     if (style.overflowX !== "visible" && style.overflowX !== "clip") continue;
     if (el.scrollWidth - el.clientWidth > 1 && el.clientWidth > 0) {

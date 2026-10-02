@@ -870,7 +870,7 @@
       ${pageNotices('environment')}
       ${section('ev-server', 'Server', html`<div class="tc-group"><div class="tc-readouts">
         ${readout('T3 Code', server.ok ? html`${dot('ok')}Running ${server.version || ''}` : html`${dot('danger')}Not answering`)}
-        ${readout('Image', image.version ? image.version + (image.variant ? ' · ' + image.variant : '') : 'unversioned', true)}
+        ${readout('Image', html`<span class="tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || 'unversioned'}</span>`, true)}
         ${s.platform ? readout('Platform', s.platform, true) : ''}
         ${Number.isFinite(server.uptimeSeconds) ? readout('Uptime', M.duration(server.uptimeSeconds)) : ''}
       </div></div>`)}
@@ -910,13 +910,13 @@
     return html`
       ${section('pm-title', 'More', html`<div class="tc-group">
         <a class="tc-linkrow" href="#toolchains">${icon('wrench')}Toolchains<span class="tc-linkrow-aside">${failedTools ? M.plural(failedTools, 'needs', 'need') + ' you' : tools + ' installed'}</span>${icon('chevron-right')}</a>
-        <a class="tc-linkrow" href="#environment">${icon('settings-2')}Environment<span class="tc-linkrow-aside">${image.version || ''}</span>${icon('chevron-right')}</a>
+        <a class="tc-linkrow" href="#environment">${icon('settings-2')}Environment<span class="tc-linkrow-aside tc-truncate">${M.imageLabel(image).version || ''}</span>${icon('chevron-right')}</a>
       </div>`, { level: 'h1' })}
       ${section('pm-app', 'Appearance', html`<div class="tc-group"><div class="tc-linkrow">Theme${themeSeg()}</div></div>`)}
       ${section('pm-srv', 'This server', html`<div class="tc-group">
         <div class="tc-readouts tc-readouts--two">
           <div class="tc-readout"><span class="tc-readout-label">T3 Code</span><span class="tc-readout-value">${dot(server.ok ? 'ok' : 'danger')}${server.ok ? server.version || 'Running' : 'Down'}</span></div>
-          <div class="tc-readout"><span class="tc-readout-label">Image</span><span class="tc-readout-value tc-mono tc-mono--body">${image.version ? image.version + (image.variant ? ' · ' + image.variant : '') : '—'}</span></div>
+          <div class="tc-readout"><span class="tc-readout-label">Image</span><span class="tc-readout-value tc-mono tc-mono--body"><span class="tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || '—'}</span></span></div>
         </div>
         <a class="tc-linkrow tc-linkrow--top" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code${icon('chevron-right')}</a>
         <button class="tc-linkrow tc-linkrow--danger" type="button" data-cmd="lock">${icon('lock')}Lock console</button>
@@ -955,7 +955,7 @@
     const image = s.image || {};
     patch($('server-card'), html`
       <div class="tc-server-row">${dot(server.ok ? 'ok' : 'danger', server.ok && 'tc-dot--live')}<strong>${server.ok ? 'Running' : 'Not answering'}</strong>${server.version ? html`<span class="tc-mono">${server.version}</span>` : ''}</div>
-      <div class="tc-server-row"><span class="tc-mono">${image.version ? image.version + (image.variant ? ' · ' + image.variant : '') : 'unversioned build'}</span></div>`);
+      <div class="tc-server-row"><span class="tc-mono tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || 'unversioned build'}</span></div>`);
     patch($('phone-status'), html`${dot(server.ok ? 'ok' : 'danger', server.ok && 'tc-dot--live')}${server.ok ? 'Running' : 'Down'}`);
     for (const link of document.querySelectorAll('[data-open-t3]')) if (link.getAttribute('href') !== t3Url()) link.setAttribute('href', t3Url());
 

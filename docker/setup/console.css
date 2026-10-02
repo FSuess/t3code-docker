@@ -194,7 +194,14 @@ html.tc-locked { overflow: hidden; }
 .tc-row--key { min-height: 44px; padding-block: var(--space-2); }
 .tc-row-actions-inline { display: inline-flex; align-items: center; gap: var(--space-2); }
 .tc-btn--pressed { background: var(--hover); }
-.tc-readouts--two { grid-template-columns: 1fr 1fr; }
+.tc-readouts--two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+/* A value in a readout, the server card or a link row may be a build stamp or
+   a hostname with no break in it: it truncates or wraps, never widens the page. */
+.tc-readout-value { overflow-wrap: anywhere; }
+.tc-readout-value > .tc-truncate, .tc-server-row > .tc-truncate { min-width: 0; }
+.tc-server-row { min-width: 0; }
+.tc-linkrow { min-width: 0; }
+.tc-linkrow-aside.tc-truncate { min-width: 0; flex: 0 1 auto; }
 
 /* Colour helpers for icons and spinners that carry a state. */
 .tc-ok { color: var(--ok); }

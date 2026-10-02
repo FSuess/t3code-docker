@@ -448,3 +448,12 @@ test("a query finds items by the words people use, in any order", () => {
   assert.equal(top("login grok"), "Sign in Grok Build");
   assert.equal(top("toolch"), "Toolchains", "the group with the best match leads");
 });
+
+test("a build stamp is named short enough for a sidebar, and in full for a tooltip", () => {
+  assert.deepEqual(plain(M.imageLabel({ version: "v0.5.0", variant: "browser" })),
+    { text: "v0.5.0 · browser", version: "v0.5.0", full: "v0.5.0 · browser" });
+  const branch = M.imageLabel({ version: "main@1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d", variant: "core" });
+  assert.equal(branch.text, "main@1a2b3c4 · core");
+  assert.equal(branch.full, "main@1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d · core");
+  assert.equal(M.imageLabel({}).text, null);
+});

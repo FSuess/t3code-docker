@@ -127,6 +127,20 @@ const T3Model = (() => {
     while (n >= 1000 && i < units.length - 1) { n /= 1000; i += 1; }
     return (n >= 100 || i < 1 ? Math.round(n) : Math.round(n * 10) / 10) + ' ' + units[i];
   };
+  /**
+   * The build a container runs, as the page names it: "v0.5.0 · browser". A
+   * branch build is stamped ref@sha with the whole commit hash, which no
+   * sidebar has room for, so the hash is cut to the seven characters git
+   * itself shows; `full` keeps everything for a tooltip.
+   */
+  const imageLabel = (image) => {
+    const i = image || {};
+    if (!i.version) return { text: null, full: null };
+    const variant = i.variant ? ' · ' + i.variant : '';
+    const short = String(i.version).replace(/@([0-9a-f]{12,64})$/i, (_, sha) => '@' + sha.slice(0, 7));
+    return { text: short + variant, version: short, full: i.version + variant };
+  };
+
   /** "Grok Build and Cursor", "A, B and C". */
   const listOf = (names) => names.length <= 1 ? (names[0] || '')
     : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
@@ -859,7 +873,7 @@ const T3Model = (() => {
   return {
     AGENTS, TOOLCHAINS, DONE, WORKING, FAILED,
     compareVersions, isNewer,
-    relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs,
+    relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs, imageLabel,
     progressOf, progressText,
     agentRow, agentRows, toolchainRow, toolchainRows, portRows, looksLikeDatabase,
     deviceRows, linkRows, deviceKind,
