@@ -88,7 +88,7 @@ export function createHarnessManager(options = {}) {
     // stale lock with a fresh state. Read both again before calling anything
     // interrupted; a real interruption still reads the same way twice.
     const running = (section) => Object.values(saved[section]).some((record) => record.operation?.state === "in-progress");
-    if (!live && (running("harnesses") || running("toolchains"))) {
+    if (!live && (running("harnesses") || running("toolchains") || running("packages"))) {
       live = await lock.liveHolder(ctx);
       saved = await state.readState(ctx);
     }

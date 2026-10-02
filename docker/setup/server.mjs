@@ -582,6 +582,11 @@ const status = async () => {
   // refresh against a local fallback, and the `t3 auth` lists are local
   // SQLite reads with a backstop for a locked database.
   const degraded = [];
+  // Taken before the facts below are read, never after: an operation that ends
+  // while they are read then shows as still running beside the newer facts,
+  // rather than finished beside the older ones (a toast saying "Installed"
+  // over a row that still says Installing).
+  const operationsSeen = Object.fromEntries([...operations].map(([key, { token: _token, controller: _controller, ...op }]) => [key, op]));
   const attempt = async (what, work, fallback) => {
     try {
       return await work();
@@ -679,7 +684,7 @@ const status = async () => {
     setup,
     // How the operations this page started ended, so a click that returned
     // 202 can still end in a toast or an error on the row.
-    operations: Object.fromEntries([...operations].map(([key, { token: _token, controller: _controller, ...op }]) => [key, op])),
+    operations: operationsSeen,
     pairings,
     sessions: sessions ?? [],
     events,

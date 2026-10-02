@@ -124,7 +124,8 @@
     || pendingOps.size > 0
     || Object.values(s.operations || {}).some((op) => op.state === 'running' || op.state === 'queued')
     || (s.harnesses || []).some((h) => h.inProgress)
-    || (s.toolchains || []).some((t) => t.inProgress)));
+    || (s.toolchains || []).some((t) => t.inProgress)
+    || (s.packages || []).some((p) => p.inProgress)));
 
   const loadStatus = () => {
     if (statusLoading) return statusLoading;
@@ -195,11 +196,13 @@
   const settleOperations = (s) => {
     for (const [key, pending] of pendingOps) {
       const op = (s.operations || {})[key];
-      const [target, id] = key.split(':');
+      // The id may hold colons of its own: package:npm:prettier.
+      const target = key.slice(0, key.indexOf(':'));
+      const id = key.slice(target.length + 1);
       if (!op) {
         // The setup service restarted and forgot it. Once nothing is running
         // for this row any more, stop waiting: the row shows where it ended.
-        const facts = target === 'harness' ? harness(id) : toolchain(id);
+        const facts = target === 'harness' ? harness(id) : target === 'package' ? addedTool(id) : toolchain(id);
         if (now() - pending.at > 10000 && !(facts && facts.inProgress)) {
           pendingOps.delete(key);
           notices.set(key, { tone: 'warn', text: 'The setup service restarted during this ' + pending.kind + '; the row shows where it ended up.' });

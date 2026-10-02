@@ -1246,3 +1246,30 @@ test("a package operation takes the same lock as everything else", async () => {
   assert.equal(busy.code, "busy");
   assert.deepEqual(world.useSpecs, []);
 });
+
+test("a status read that straddles a package install starting does not call it interrupted", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const statePath = path.join(STATE_DIR, "harness-state.json");
+  fs.seedFile(statePath, JSON.stringify({
+    schema: 1,
+    packages: { jq: { operation: { kind: "install", state: "in-progress", startedAt: 1, finishedAt: null, error: null } } },
+  }));
+  // The lock read found nobody; by the state read, the install had taken the
+  // lock and recorded itself. Paired as read, that looks interrupted.
+  const readFile = fs.readFile.bind(fs);
+  let stateReads = 0;
+  fs.readFile = async (filePath) => {
+    const content = await readFile(filePath);
+    if (filePath === statePath && ++stateReads === 1) {
+      fs.seedFile(path.join(STATE_DIR, "harness.lock"),
+        JSON.stringify({ pid: 4242, startTime: "100", token: "other", id: "jq", operation: "install", startedAt: 1_700_000_000_000 }));
+    }
+    return content;
+  };
+  const [row] = (await manager.packages.status()).packages;
+  assert.equal(row.id, "jq");
+  assert.equal(row.failed, false, row.failure);
+  assert.equal(row.inProgress, true);
+});
