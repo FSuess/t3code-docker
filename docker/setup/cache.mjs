@@ -177,6 +177,7 @@ export function createHarnessCache({
   budgetMs = 4000,
   refreshIntervalMs = 15_000,
   liveTtlMs = 30_000,
+  cheapReserveMs = 1000,
   now = Date.now,
 } = {}) {
   let warm = null; // { harnesses, degraded, at, generation }
@@ -216,8 +217,8 @@ export function createHarnessCache({
 
   const withFailure = (degraded) => (lastFailure ? [...degraded, lastFailure] : degraded);
 
-  const cheapAnswer = async () => {
-    const raced = await withTimeout(Promise.resolve().then(cheap), budgetMs);
+  const cheapAnswer = async (ms = budgetMs) => {
+    const raced = await withTimeout(Promise.resolve().then(cheap), ms);
     if (raced.ok) {
       return {
         harnesses: raced.value?.harnesses ?? [],
@@ -240,9 +241,15 @@ export function createHarnessCache({
     };
   };
 
+  // One poll answers within `budgetMs` overall: the refresh race keeps
+  // `cheapReserveMs` back, and the cheap fallback gets only what is left,
+  // rather than each stage spending the whole budget in turn.
   const snapshot = async () => {
+    const started = now();
+    const refreshBudget = Math.max(250, budgetMs - cheapReserveMs);
+    const remaining = () => Math.max(250, budgetMs - (now() - started));
     if (due()) {
-      const raced = await withTimeout(startRefresh(), budgetMs);
+      const raced = await withTimeout(startRefresh(), refreshBudget);
       if (raced.ok && raced.value && raced.value.at !== null && current(raced.value)) {
         return {
           harnesses: raced.value.harnesses,
@@ -258,7 +265,7 @@ export function createHarnessCache({
       // refresh keeps running and warms the next poll.
       if (raced.ok && raced.value && !current(raced.value)) lastRefreshStart = 0;
     } else if (coalescer.pending) {
-      const raced = await withTimeout(coalescer.run(() => null), budgetMs);
+      const raced = await withTimeout(coalescer.run(() => null), refreshBudget);
       if (raced.ok && raced.value && raced.value.at !== null && current(raced.value)) {
         const fresh = !isStale(raced.value.at, now(), liveTtlMs);
         return {
@@ -285,7 +292,7 @@ export function createHarnessCache({
         refreshing: coalescer.pending,
       };
     }
-    return cheapAnswer();
+    return cheapAnswer(remaining());
   };
 
   const snapshotCheap = async () => {

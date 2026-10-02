@@ -389,3 +389,21 @@ test("invalidate does not reuse a refresh that began before the write", async ()
   assert.equal(after.harnesses[0].signedIn, true, "the next poll must see the write");
   assert.deepEqual(calls, [false, true], "a refresh started after the write");
 });
+
+test("one poll answers within its budget even when the refresh never lands", async () => {
+  const cache = createHarnessCache({
+    full: () => new Promise(() => {}), // a probe that hangs for ever
+    cheap: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return { harnesses: [{ id: "claude" }], degraded: [] };
+    },
+    budgetMs: 400,
+    cheapReserveMs: 150,
+  });
+  const started = Date.now();
+  const snap = await cache.snapshot();
+  const took = Date.now() - started;
+  assert.equal(snap.source, "cheap");
+  assert.deepEqual(snap.harnesses, [{ id: "claude" }]);
+  assert.ok(took < 520, `answered in ${took}ms, budget 400ms`);
+});
