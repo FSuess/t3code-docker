@@ -22,7 +22,7 @@ Each of these is a bug in the handoff, not a restyle. Keep them when syncing.
    `--sidebar` as the sidebar's colour in each theme block and again as the
    256px layout width in `:root`. With `data-theme` on `<html>` both selectors
    match the same element with equal specificity, so the width won and the
-   sidebar lost its ground in both themes. The width is now `--sidebar-w`, in
+   sidebar lost its background in both themes. The width is now `--sidebar-w`, in
    `tokens.css` and in `.tc-app`'s grid in `components.css`. (The handoff's
    mockups set `data-theme` on an inner element, which hid the collision.)
 2. **Copy did nothing over plain HTTP.** `navigator.clipboard` only exists in a

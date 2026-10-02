@@ -1,8 +1,8 @@
 # DeepSeek through OpenCode
 
-T3 Code has no DeepSeek driver — its providers are Claude, Codex, Cursor, Grok,
-OpenCode and Antigravity. OpenCode is the way in: it speaks any
-OpenAI-compatible endpoint, and T3 Code drives OpenCode.
+T3 Code has no DeepSeek driver. Its providers are Claude, Codex, Cursor, Grok,
+OpenCode and Antigravity. OpenCode can use any OpenAI-compatible endpoint, and
+T3 Code can drive OpenCode, so DeepSeek works through OpenCode.
 
 ## Install
 
@@ -12,8 +12,8 @@ docker compose exec -u t3 t3code sh -c \
    cp /opt/examples/opencode/opencode.deepseek.json ~/.config/opencode/opencode.json'
 ```
 
-or, if you already have an `opencode.json`, merge the `provider.deepseek` block
-into it. Then set the key and restart:
+If you already have an `opencode.json`, merge the `provider.deepseek` block into
+it instead. Then set the key and restart:
 
 ```bash
 # in .env
@@ -24,26 +24,25 @@ DEEPSEEK_API_KEY=sk-...
 docker compose up -d
 ```
 
-In T3 Code, enable the OpenCode provider under **Settings → Providers**, then
-pick a DeepSeek model in the composer. `opencode` itself lists what it resolved:
+In T3 Code, turn the OpenCode provider on under **Settings → Providers**, then
+pick a DeepSeek model in the composer. To see which models OpenCode found:
 
 ```bash
 docker compose exec -u t3 t3code opencode models | grep -i deepseek
 ```
 
-## Model IDs move
+## Model IDs change
 
-The IDs above are DeepSeek's stable aliases. DeepSeek ships new generations
-faster than this repo updates — check
-<https://api-docs.deepseek.com/quick_start/pricing> for what your key can reach
-today and add entries under `models` accordingly. An unknown ID fails at request
-time, not at startup, so a wrong name looks like a broken thread rather than a
+The IDs in the example config are DeepSeek's stable aliases. DeepSeek releases
+new models more often than this repository is updated, so check
+<https://api-docs.deepseek.com/quick_start/pricing> for the models your key can
+use and add them under `models`. An unknown ID fails when a request is made,
+not at startup, so a wrong name shows up as a failing thread rather than a
 config error.
 
-## The other route
+## Without OpenCode
 
-T3 Code lets each provider *instance* carry its own environment variables. A
+In T3 Code, each provider instance can have its own environment variables. A
 second Claude or Codex instance pointed at a DeepSeek-compatible base URL works
-without touching OpenCode at all — set the instance's env in
-**Settings → Providers → (instance) → Environment variables** rather than in
-**Launch arguments**.
+without OpenCode. Set the variables under **Settings → Providers → (instance) →
+Environment variables**, not under **Launch arguments**.
