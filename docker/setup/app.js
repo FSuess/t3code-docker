@@ -1701,6 +1701,16 @@
       <span class="${cx('tc-hint', hint.err && 'tc-hint--err')}">${hint.text}</span>`;
   };
 
+  /**
+   * The release to highlight: the one a typed version installs, or with
+   * nothing typed, the newest mise offers - never one it is still holding back.
+   */
+  const activeRelease = (query) => {
+    const q = String(query || '').trim();
+    if (q) return M.releaseIndex(M.matchReleases(toolSheet.releases, q), q);
+    return Math.max(0, (toolSheet.releases || []).findIndex((r) => r.version === toolSheet.offered));
+  };
+
   /** A typed release or prefix that none of the listed releases starts with. */
   const noSuchRelease = (version) => Boolean(toolSheet.releases && version && !M.resolveRelease(toolSheet.releases, version));
 
@@ -1793,7 +1803,7 @@
       if (res.ok) {
         toolSheet.releases = res.data.releases || [];
         toolSheet.offered = res.data.latest || null;
-        toolSheet.versionActive = M.releaseIndex(M.matchReleases(toolSheet.releases, toolSheet.versionQuery), toolSheet.versionQuery);
+        toolSheet.versionActive = activeRelease(toolSheet.versionQuery);
       } else {
         toolSheet.versionsError = res.error || 'mise could not list its releases';
       }
@@ -1915,7 +1925,7 @@
         // A typed draft for an agent survives closing the sheet and polls.
         if (toolSheet.target === 'harness') versionDrafts.set(toolSheet.tool.id, e.target.value);
         // Highlight the release this would install, wherever it sits.
-        toolSheet.versionActive = M.releaseIndex(M.matchReleases(toolSheet.releases, e.target.value), e.target.value);
+        toolSheet.versionActive = activeRelease(e.target.value);
         toolSheet.error = null;
         renderToolSheet();
         const el = panel.querySelector('#ver-opt-' + toolSheet.versionActive);
