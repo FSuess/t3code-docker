@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Manage the five supported agent harnesses through the shared manager.
+#
+# The setup console's Agents card and this CLI are thin surfaces over one
+# module (docker/harness/, baked as /opt/t3-harness/index.mjs), so they report
+# identical selections and errors - no PATH workaround, no second installer.
+# After every Install/Update/Uninstall this notifies T3 through a single
+# provider-integration sync() so a running server picks up the new binaryPath
+# without a restart.
+#
+#   t3-harness list [--json]
+#   t3-harness toolchains [--json]
+#   t3-harness status [--json] [id]
+#   t3-harness install <id> [--version <v>] [--json]
+#   t3-harness update <id> [--version <v>] [--json]
+#   t3-harness uninstall <id> [--json]
+#
+# Agent ids: claude, codex, opencode, grok, cursor. Toolchain ids: go, rust,
+# bun, deno, uv. Install defaults to mise's latest and records that exact
+# version; update is always explicit. Uninstalling an agent removes the managed
+# selection and executables but preserves credentials.
+#
+# Exit codes: 0 ok; 1 the lifecycle operation failed (see the JSON error);
+# 2 usage (bad args, unknown harness); 4 the manager module could not load.
+set -euo pipefail
+
+: "${T3_INFRA_NODE:=/usr/local/bin/node}"
+: "${T3_HARNESS_MODULE:=/opt/t3-harness/index.mjs}"
+: "${T3_PROVIDER_MODULE:=/opt/t3-provider/index.mjs}"
+
+# `docker exec` lands as root (the image sets no USER so the entrypoint can
+# remap uids). Step down so installs land in the user's persistent home and
+# nothing here leaves root-owned files in the state directory.
+if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec gosu t3 "$0" "$@"
+fi
+
+# Managed harnesses live in the persistent user tool environment. Source it so
+# the manager inside sees the same MISE_* paths the setup server does.
+# shellcheck source=/dev/null
+[ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
+
+usage() {
+  cat <<'USAGE'
+Usage: t3-harness <command> [options]
+
+  list [--json]                 the five agents
+  toolchains [--json]           Go, Rust, Bun, Deno, uv
+  status [--json] [id]
+  install <id> [--version <version>] [--json]
+  update <id> [--version <version>] [--json]
+  uninstall <id> [--json]
+
+  id is an agent (claude, codex, opencode, grok, cursor) or a toolchain
+  (go, rust, bun, deno, uv). --version applies to agents only.
+
+Install resolves mise's latest to an exact version and records it; update is
+always explicit. Uninstalling an agent preserves its credentials. After a
+successful agent change the new selection is synced into T3's provider
+settings so a running server picks it up.
+
+Exit codes: 0 ok; 1 the operation failed; 2 usage; 4 no manager module.
+USAGE
+}
+
+command="${1:-}"
+[ -n "$command" ] || { usage >&2; exit 2; }
+case "$command" in
+  -h|--help) usage; exit 0 ;;
+esac
+shift || true
+
+json=0
+version=""
+pos=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) json=1; shift ;;
+    --version)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        printf 't3-harness: --version needs a value\n\n' >&2; usage >&2; exit 2
+      fi
+      version="$2"; shift 2 ;;
+    --version=*) version="${1#--version=}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --*) printf 't3-harness: unknown option %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac
+done
+if [ ${#pos[@]} -gt 0 ]; then set -- "${pos[@]}"; else set --; fi
+
+case "$command" in
+  list|toolchains|status|install|update|uninstall) ;;
+  *) printf 't3-harness: unknown command %s\n\n' "$command" >&2; usage >&2; exit 2 ;;
+esac
+
+if { [ "$command" = "list" ] || [ "$command" = "toolchains" ]; } && [ $# -gt 0 ]; then
+  printf 't3-harness: %s takes no id\n\n' "$command" >&2; usage >&2; exit 2
+fi
+if { [ "$command" = "install" ] || [ "$command" = "update" ] || [ "$command" = "uninstall" ]; } \
+   && [ $# -ne 1 ]; then
+  printf 't3-harness: %s needs exactly one harness id\n\n' "$command" >&2
+  usage >&2; exit 2
+fi
+if [ "$command" = "status" ] && [ $# -gt 1 ]; then
+  printf 't3-harness: status takes at most one harness id\n\n' >&2; usage >&2; exit 2
+fi
+if [ $# -eq 1 ]; then
+  case "$1" in
+    claude|codex|opencode|grok|cursor|go|rust|bun|deno|uv) ;;
+    *) printf 't3-harness: unknown agent or toolchain %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+fi
+if [ -n "$version" ] && { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "status" ] || [ "$command" = "uninstall" ]; }; then
+  printf 't3-harness: --version only applies to install and update\n\n' >&2; usage >&2; exit 2
+fi
+
+# The driver is the contract: the same manager the setup server imports, the
+# same read-only status for list/status, the same install/update/uninstall
+# plus a single provider sync. JSON goes to stdout; human text goes to stdout
+# too, diagnostics to stderr.
+export T3_HARNESS_MODULE T3_PROVIDER_MODULE T3_HARNESS_JSON="$json" \
+  T3_HARNESS_VERSION="$version"
+export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
+
+"$T3_INFRA_NODE" -e '
+(async () => {
+  const command = process.env.T3_HARNESS_COMMAND;
+  const arg = process.env.T3_HARNESS_ARG || "";
+  const wantJson = process.env.T3_HARNESS_JSON === "1";
+  const version = process.env.T3_HARNESS_VERSION || "";
+  const modulePath = process.env.T3_HARNESS_MODULE || "/opt/t3-harness/index.mjs";
+  const providerPath = process.env.T3_PROVIDER_MODULE || "/opt/t3-provider/index.mjs";
+
+  let manager;
+  try {
+    manager = (await import(modulePath)).createHarnessManager();
+  } catch (error) {
+    process.stderr.write(`t3-harness: cannot load the harness manager (${modulePath}): ${error?.message ?? error}\n`);
+    process.exit(4);
+  }
+
+  const fmtAuth = (value) => value === true ? "signed in" : value === false ? "not signed in" : "unknown";
+  const humanRow = (h) => {
+    const version = h.installedVersion ?? h.recordedVersion ?? "-";
+    // A failed update leaves the previous release running, so runnable wins
+    // and the failure rides along as a note.
+    const state = h.inProgress ? `${h.operation ?? "working"}…`
+      : h.runnable ? `runnable (${fmtAuth(h.authenticated)})`
+        + (h.failed ? `; last ${h.operation ?? "operation"} failed: ${h.failure ?? "unknown error"}` : "")
+      : h.failed ? `failed: ${h.failure ?? "unknown error"}`
+      : h.installed ? "installed (not runnable)"
+      : "not installed";
+    return `${h.id}\t${version}\t${state}`;
+  };
+
+  const TOOLCHAIN_IDS = ["go", "rust", "bun", "deno", "uv"];
+  const toolRow = (t) => `${t.id}\t${t.version ?? "-"}\t${t.inProgress ? `${t.operation ?? "working"}…`
+    : t.installed ? "installed" : t.failed ? `failed: ${t.failure ?? "unknown error"}` : "not installed"}`;
+
+  try {
+    if (command === "toolchains") {
+      const { toolchains, degraded } = await manager.toolchains.status();
+      if (wantJson) process.stdout.write(JSON.stringify({ toolchains, degraded }, null, 2) + "\n");
+      else for (const t of toolchains) process.stdout.write(toolRow(t) + "\n");
+      return;
+    }
+    if (TOOLCHAIN_IDS.includes(arg) && command !== "status") {
+      if (version) {
+        process.stderr.write("t3-harness: toolchains always install the latest release; --version applies to agents\n");
+        process.exit(2);
+      }
+      const result = await manager.toolchains[command](arg);
+      if (wantJson) process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      else if (result?.ok) process.stdout.write(`${command} ${arg}: ok${result.toolchain?.version ? ` (${result.toolchain.version})` : ""}\n`);
+      else process.stderr.write(`t3-harness: ${command} ${arg} failed [${result?.code ?? "failed"}]: ${result?.error ?? "unknown error"}\n`);
+      if (!result?.ok) process.exit(1);
+      return;
+    }
+    if (command === "list") {
+      const { harnesses } = await manager.status({ authenticate: false });
+      if (wantJson) process.stdout.write(JSON.stringify({ harnesses }, null, 2) + "\n");
+      else for (const h of harnesses) process.stdout.write(humanRow(h) + "\n");
+      return;
+    }
+    if (command === "status") {
+      if (TOOLCHAIN_IDS.includes(arg)) {
+        const toolchain = await manager.toolchains.resolve(arg);
+        if (wantJson) process.stdout.write(JSON.stringify({ toolchain }, null, 2) + "\n");
+        else process.stdout.write(toolRow(toolchain) + "\n");
+        return;
+      }
+      if (arg) {
+        const harness = await manager.resolve(arg, { authenticate: false }).catch(() => null);
+        if (!harness) {
+          process.stderr.write(`t3-harness: unknown harness ${arg}\n`);
+          process.exit(2);
+        }
+        if (wantJson) process.stdout.write(JSON.stringify({ harness }, null, 2) + "\n");
+        else process.stdout.write(humanRow(harness) + "\n");
+        return;
+      }
+      const { harnesses, degraded } = await manager.status({ authenticate: false });
+      if (wantJson) process.stdout.write(JSON.stringify({ harnesses, degraded }, null, 2) + "\n");
+      else for (const h of harnesses) process.stdout.write(humanRow(h) + "\n");
+      return;
+    }
+
+    const options = version ? { version } : {};
+    const result = command === "install" ? await manager.install(arg, options)
+      : command === "update" ? await manager.update(arg, options)
+      : await manager.uninstall(arg);
+    let sync = null;
+    if (result?.ok) {
+      try {
+        const { createProviderIntegration } = await import(providerPath);
+        sync = await createProviderIntegration({ harness: manager }).sync();
+      } catch (error) {
+        sync = { ok: false, error: String(error?.message ?? error).slice(0, 200) };
+      }
+    }
+    const body = { ...result, ...(sync ? { sync } : {}) };
+    if (wantJson) process.stdout.write(JSON.stringify(body, null, 2) + "\n");
+    else if (result?.ok) {
+      const h = result.harness;
+      const where = h?.executable ?? "no executable";
+      process.stdout.write(`${command} ${arg}: ok${h?.installedVersion ? ` (${h.installedVersion})` : ""} -> ${where}\n`);
+      if (sync && sync.ok === false) process.stderr.write(`t3-harness: provider sync failed: ${sync.error}\n`);
+    } else {
+      process.stderr.write(`t3-harness: ${command} ${arg} failed [${result?.code ?? "failed"}]: ${result?.error ?? "unknown error"}\n`);
+    }
+    if (!result?.ok) process.exit(1);
+  } catch (error) {
+    process.stderr.write(`t3-harness: ${command} failed: ${error?.message ?? error}\n`);
+    process.exit(1);
+  }
+})();
+'

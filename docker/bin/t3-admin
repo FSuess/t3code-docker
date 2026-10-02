@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Run T3 Code through the image's own immutable infrastructure.
+#
+# T3 must always execute the root-owned platform binary under $T3_INFRA_PREFIX
+# - never through a project toolchain, a mise shim, or the npm launcher's
+# `#!/usr/bin/env node` shim. Every administrative call in this
+# image (the entrypoint, setup console, t3-pair, t3-login, t3-doctor) goes
+# through here, and `/usr/local/bin/t3` is a symlink to it, so there is exactly
+# one resolution rule. The single seam is also what keeps a shadowed `node` or
+# `t3` on PATH from silently reintroducing a user-controlled runtime.
+#
+# The locations can be overridden for tests.
+set -euo pipefail
+
+prefix="${T3_INFRA_PREFIX:-/opt/t3}"
+binary="${T3_INFRA_BINARY:-${prefix}/t3}"
+
+if [ ! -x "$binary" ]; then
+  printf 't3-admin: T3 platform binary not found at %s\n' "$binary" >&2
+  exit 127
+fi
+
+exec "$binary" "$@"

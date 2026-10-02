@@ -79,6 +79,7 @@
   --id-opencode: oklch(0.64 0.062 175);
   --id-cursor: oklch(0.62 0.062 300);
   --id-grok: oklch(0.6 0.045 230);
+  --id-toolchain: oklch(0.6 0.02 120);
 
   /* ---- type — no display serif in this brand (see brand-spec.md §2) */
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -148,6 +149,7 @@
   --id-opencode: oklch(0.7 0.06 175);
   --id-cursor: oklch(0.7 0.06 300);
   --id-grok: oklch(0.68 0.045 230);
+  --id-toolchain: oklch(0.68 0.02 120);
 
   --shadow-raised: 0 1px 2px oklch(0 0 0 / 0.3);
   --shadow-pop: 0 8px 28px -8px oklch(0 0 0 / 0.65), 0 1px 2px oklch(0 0 0 / 0.3);
@@ -278,6 +280,13 @@ textarea {
   align-items: start;
 }
 
+/* Page-level notices (an unreadable status, first-start setup) sit above the
+   deck with the deck's own gap, instead of touching the first card. */
+#degraded > .tc-notice,
+#setup-progress > .tc-notice {
+  margin-bottom: 16px;
+}
+
 .tc-deck-col {
   display: flex;
   flex-direction: column;
@@ -395,6 +404,8 @@ textarea {
   align-items: center;
   gap: 10px;
   min-width: 0;
+  /* The identity of the page never gives way; the build stamp beside it does. */
+  flex: none;
 }
 
 .tc-mark {
@@ -1113,6 +1124,27 @@ a.tc-btn:hover {
   margin-left: auto;
 }
 
+/* The Agents card carries lifecycle controls beside sign-in: a version field
+   plus Install, or version plus Update/Uninstall, plus sign-in. They wrap
+   under the row on narrow cards rather than squeezing the name column. */
+.tc-row-actions--wrap {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  max-width: 100%;
+}
+
+.tc-input--sm {
+  height: 28px;
+  font-size: 12px;
+  padding-inline: 8px;
+}
+
+@media (max-width: 720px) {
+  .tc-input--sm {
+    height: 32px;
+  }
+}
+
 .tc-row-panel {
   flex: 1 0 100%;
 }
@@ -1700,7 +1732,20 @@ a.tc-btn:hover {
 
 .console-top { position: sticky; top: 0; z-index: 40; }
 .console-top .tc-chrome { position: static; }
-@media (max-width: 560px) { #build { display: none; } }
+
+/* The build stamp on a CI image is the branch and a full commit hash. It is
+   information, not identity, so when the chrome runs out of width the stamp
+   truncates instead of squeezing the brand beside it. The tag is normally a
+   flex box; as a text-only block it can ellipsize its own line. */
+.tc-tag--build {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 22px;
+}
+
+@media (max-width: 560px) { .tc-tag--build { display: none; } }
 
 /* A URL rendered as machine data is still a URL: make it behave like one,
    without losing the mono voice the data column is set in. */

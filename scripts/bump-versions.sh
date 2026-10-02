@@ -22,12 +22,11 @@ drift=0
 changed=0
 
 # ARG name : npm package. The Dockerfile holds each as `ARG <name>=<version>`.
+# Agent harnesses are deliberately absent: they are installed at runtime
+# through mise, which resolves and records an exact version on explicit install
+# rather than baking one into the image.
 PINS="
 T3_VERSION:t3
-CLAUDE_CODE_VERSION:@anthropic-ai/claude-code
-CODEX_VERSION:@openai/codex
-OPENCODE_VERSION:opencode-ai
-GROK_VERSION:@xai-official/grok
 CHROME_DEVTOOLS_MCP_VERSION:chrome-devtools-mcp
 PLAYWRIGHT_MCP_VERSION:@playwright/mcp
 "
@@ -72,6 +71,21 @@ gh_floor="$(grep -m1 '^ARG GH_MIN_VERSION=' Dockerfile | cut -d= -f2)"
 printf '\n%sgh%s is unpinned (tracks GitHub'"'"'s apt repo); asserted floor is %s%s%s\n' \
   "$DIM" "$RESET" "$BOLD" "$gh_floor" "$RESET"
 echo "${DIM}T3 Code's own declared minimum is checked by the smoke test.${RESET}"
+
+# mise installs every agent and toolchain at runtime, so it matters, but it
+# ships several releases a week and a pin a few days old is not a defect.
+# Reported, never counted as drift and never bumped here: a new release also
+# needs its checksums and the idiomatic allowlist regenerated.
+mise_pin="$(grep -m1 '^ARG MISE_VERSION=' Dockerfile | cut -d= -f2)"
+mise_latest="$(curl -fsS --max-time 30 https://api.github.com/repos/jdx/mise/releases/latest 2>/dev/null \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["tag_name"].lstrip("v"))' 2>/dev/null || echo "?")"
+if [ "$mise_pin" = "$mise_latest" ]; then
+  printf '%smise%s %s is current\n' "$DIM" "$RESET" "$mise_pin"
+else
+  printf '%smise%s pinned at %s%s%s, latest %s - to move it, set MISE_VERSION and run\n' \
+    "$DIM" "$RESET" "$BOLD" "$mise_pin" "$RESET" "$mise_latest"
+  echo "${DIM}  scripts/generate-mise-idiomatic.sh (checksums and allowlist) before rebuilding.${RESET}"
+fi
 
 echo
 if [ "$drift" -eq 0 ]; then

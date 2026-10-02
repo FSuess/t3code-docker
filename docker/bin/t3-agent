@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# The agent CLIs by name, for `docker exec` and anything else that does not
+# have the t3 user's shell environment.
+#
+# The agents install into the t3 user's persistent home, and that directory is
+# deliberately not on the image-wide PATH: root must never resolve a command
+# the t3 user can write. So claude, codex, opencode, grok and cursor-agent in
+# /usr/local/lib/t3-agents (last on the image PATH) are links to this
+# root-owned script. It steps down to t3 (where a sign-in has to land anyway),
+# asks the harness manager which exact executable is installed, and runs that.
+# It answers where the t3 user's shell setup is absent: root, and a bare
+# `docker exec -u t3`. T3 itself never sees it: the entrypoint drops the
+# directory from the server's PATH, and login shells never add it.
+set -euo pipefail
+
+name="$(basename "$0")"
+case "$name" in
+  claude|codex|opencode|grok) harness="$name" ;;
+  cursor-agent) harness=cursor ;;
+  *) echo "t3-agent: run this as claude, codex, opencode, grok or cursor-agent" >&2; exit 2 ;;
+esac
+
+if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec gosu t3 "$0" "$@"
+fi
+
+: "${T3_INFRA_NODE:=/usr/local/bin/node}"
+: "${T3_PROVIDER_CLI:=/opt/t3-provider/cli.mjs}"
+# shellcheck source=/dev/null
+[ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
+
+executable="$("$T3_INFRA_NODE" "$T3_PROVIDER_CLI" resolve "$harness" 2>/dev/null || true)"
+if [ -z "$executable" ] || [ ! -x "$executable" ]; then
+  printf '%s is not installed yet. The first start installs it in the background\n' "$name" >&2
+  printf '(progress is on the setup page); to install it now: t3-harness install %s\n' "$harness" >&2
+  exit 127
+fi
+exec "$executable" "$@"

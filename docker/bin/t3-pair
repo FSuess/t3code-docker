@@ -8,6 +8,9 @@
 # URL you actually serve on.
 set -euo pipefail
 
+# T3 runs through the immutable image infrastructure, never a PATH resolution.
+: "${T3_INFRA_LAUNCHER:=/usr/local/bin/t3-admin}"
+
 # `docker exec` lands as root (the image sets no USER so the entrypoint can
 # remap uids). Step down so nothing here leaves root-owned files in the
 # state directory.
@@ -63,7 +66,7 @@ args=(auth pairing create --base-url "$base_url" --ttl "$ttl" --json)
 [ -n "$label" ] && args+=(--label "$label")
 
 # `t3 auth` logs migration chatter on stderr; keep stdout clean for the JSON.
-response="$(t3 "${args[@]}" 2>/dev/null | sed -n '/^{/,$p')"
+response="$("$T3_INFRA_LAUNCHER" "${args[@]}" 2>/dev/null | sed -n '/^{/,$p')"
 
 if [ -z "$response" ]; then
   echo "t3-pair: failed to mint a pairing token" >&2

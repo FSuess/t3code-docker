@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Build the image. Defaults to the `full` target for the local platform.
+# Build the image. Defaults to the `browser` target (what `latest` publishes)
+# for the local platform.
 #
-#   scripts/build.sh                       # t3code:full
-#   scripts/build.sh --target slim         # t3code:slim
+#   scripts/build.sh                      # t3code:browser
+#   scripts/build.sh --target core        # t3code:core
 #   scripts/build.sh --platform linux/amd64,linux/arm64 --push --tag ghcr.io/you/t3code
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-target=full
+target=browser
 tag=""
 platform=""
 push=0
@@ -18,10 +19,14 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/build.sh [options] [-- extra docker build args]
 
-  --target NAME     slim | full            (default: full)
+  --target NAME     browser | core                (default: browser)
   --tag NAME        image tag              (default: t3code:<target>)
   --platform LIST   e.g. linux/amd64,linux/arm64 (implies buildx)
   --push            push instead of loading locally
+
+  Capability profiles:
+    browser  default; core + Chromium/fonts/MCP servers
+    core     the same without Chromium and the browser MCP servers
 
 Behind a TLS-intercepting proxy, drop the CA in ca-certs/ and add:
   --  --network host --build-arg APT_HTTPS=true \
@@ -41,7 +46,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-case "$target" in slim|full) ;; *) echo "build.sh: target must be slim or full" >&2; exit 2 ;; esac
+case "$target" in
+  core|browser) ;;
+  # The old names, kept working: same images.
+  full) target=browser ;;
+  slim) target=core ;;
+  *) echo "build.sh: target must be browser or core (full and slim are aliases)" >&2; exit 2 ;;
+esac
 [ -n "$tag" ] || tag="t3code:${target}"
 
 args=(build --target "$target" -t "$tag")

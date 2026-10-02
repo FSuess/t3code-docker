@@ -13,7 +13,7 @@
  *
  * Exits non-zero when it finds something.
  */
-// Runs from a checkout with playwright installed, or inside the full image,
+// Runs from a checkout with playwright installed, or inside the browser image,
 // which already carries playwright-core and a chromium for the browser MCP.
 let chromium;
 try {
@@ -185,8 +185,27 @@ const audit = () => {
     if (hs.size > 1) {
       add("uneven-buttons", `heights ${[...hs].join(", ")} in one group`, group);
     }
-    const tops = new Set(btns.map((b) => Math.round(box(b).top)));
-    if (tops.size > 1) add("unaligned-buttons", `tops ${[...tops].join(", ")}`, group);
+    // Groups that opt into wrapping (the Agents card says so in its class, and
+    // its comment says wrapping beats squeezing the name column) are measured
+    // per visual line: buttons that share a line must share a top, and a
+    // button on the next line is the intended layout rather than a defect.
+    // Every other group must still stay on one line.
+    if (group.classList.contains("tc-row-actions--wrap")) {
+      const lines = [];
+      for (const b of btns) {
+        const top = box(b).top;
+        const line = lines.find((l) => Math.abs(l.top - top) <= 2);
+        if (line) line.btns.push(b);
+        else lines.push({ top, btns: [b] });
+      }
+      for (const line of lines) {
+        const tops = new Set(line.btns.map((b) => Math.round(box(b).top)));
+        if (tops.size > 1) add("unaligned-buttons", `tops ${[...tops].join(", ")} in one line`, group);
+      }
+    } else {
+      const tops = new Set(btns.map((b) => Math.round(box(b).top)));
+      if (tops.size > 1) add("unaligned-buttons", `tops ${[...tops].join(", ")}`, group);
+    }
   }
 
   // -- 6. a row's text baseline vs its chip ---------------------------------
@@ -215,7 +234,15 @@ const audit = () => {
   let total = 0;
 
   for (const [width, height] of VIEWPORTS) {
-    const ctx = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 2 });
+    // Measure a settled page: reduced motion disables the transitions and
+    // animations the stylesheet already gates behind that preference, so a
+    // background poll cannot repaint a row mid-measurement and leave
+    // half-updated geometry behind.
+    const ctx = await browser.newContext({
+      viewport: { width, height },
+      deviceScaleFactor: 2,
+      reducedMotion: "reduce",
+    });
     const page = await ctx.newPage();
     await page.goto(URL, { waitUntil: "domcontentloaded" });
     await page.fill("input[type=password]", KEY);
@@ -227,6 +254,13 @@ const audit = () => {
     // The pairing panel is where the tracker lives, so open it.
     await page.click("#mint");
     await page.waitForSelector("#out .tc-steps", { timeout: 30000 });
+    // Text metrics decide the boxes this audit compares, so wait for fonts
+    // before measuring, then let the browser render two frames of the settled
+    // layout.
+    await page.evaluate(() => document.fonts.ready);
+    await page.evaluate(() => new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
     await page.waitForTimeout(400);
 
     const findings = await page.evaluate(audit);

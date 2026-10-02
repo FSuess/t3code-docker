@@ -5,6 +5,9 @@
 # them - a web or desktop client actually hosts the browser. With just a phone
 # connected there is no host, so the agent cannot see anything it builds. This
 # gives the agent a browser that lives in the container instead.
+#
+# Registration runs through the managed harness (the same executable T3
+# launches), so install the agents first - the first start does by default.
 set -euo pipefail
 
 # `docker exec` lands as root (the image sets no USER so the entrypoint can
@@ -13,6 +16,14 @@ set -euo pipefail
 if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
   exec gosu t3 "$0" "$@"
 fi
+
+# Managed harnesses live in the persistent user tool environment, and the MCP
+# config paths hang off the same HOME the managed harness reads. Source it
+# before resolving anything.
+# shellcheck source=/dev/null
+[ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
+: "${T3_INFRA_NODE:=/usr/local/bin/node}"
+: "${T3_PROVIDER_CLI:=/opt/t3-provider/cli.mjs}"
 
 server="playwright"
 harnesses="claude,codex,opencode"
@@ -33,6 +44,8 @@ Notes:
   * Chromium is sandboxed by the container already, so --no-sandbox is passed.
   * chrome-devtools-mcp officially supports Google Chrome rather than Debian's
     Chromium; it does work here, but playwright is the tested default.
+  * Each harness is registered through its managed executable. Install the
+    harness (setup page or `t3-harness install`) before registering MCP with it.
 USAGE
 }
 
@@ -70,29 +83,45 @@ if [ "$print_only" -eq 1 ]; then
 fi
 
 if [ "$action" = "add" ] && ! command -v "$cmd" >/dev/null 2>&1; then
-  echo "t3-browser-mcp: $cmd is not installed (it ships in the 'full' image)" >&2
+  echo "t3-browser-mcp: $cmd is not installed (it ships in the 'browser' image)" >&2
   exit 1
 fi
+
+# The managed executable for a harness when one is runnable, else empty. PATH
+# is not consulted: the names there are t3-agent, which resolves the same way.
+harness_exec() { # id
+  local managed=""
+  if [ -r "$T3_PROVIDER_CLI" ] && [ -x "$T3_INFRA_NODE" ]; then
+    managed="$("$T3_INFRA_NODE" "$T3_PROVIDER_CLI" resolve "$1" 2>/dev/null || true)"
+  fi
+  if [ -n "$managed" ] && [ -x "$managed" ]; then
+    printf '%s' "$managed"
+  fi
+}
 
 json_args="$(printf '%s\n' "${args[@]}" | jq -R . | jq -s .)"
 
 register_claude() {
-  command -v claude >/dev/null 2>&1 || { echo "  claude: not installed"; return; }
+  local bin
+  bin="$(harness_exec claude)"
+  [ -n "$bin" ] || { echo "  claude: not installed"; return; }
   if [ "$action" = "remove" ]; then
-    claude mcp remove --scope user "$name" >/dev/null 2>&1 || true
-    echo "  claude: removed $name"
+    "$bin" mcp remove --scope user "$name" >/dev/null 2>&1 || true
+    echo "  claude: removed $name (via $bin)"
   else
-    claude mcp remove --scope user "$name" >/dev/null 2>&1 || true
-    if claude mcp add --scope user "$name" -- "$cmd" "${args[@]}" >/dev/null 2>&1; then
-      echo "  claude: registered $name"
+    "$bin" mcp remove --scope user "$name" >/dev/null 2>&1 || true
+    if "$bin" mcp add --scope user "$name" -- "$cmd" "${args[@]}" >/dev/null 2>&1; then
+      echo "  claude: registered $name (via $bin)"
     else
-      echo "  claude: FAILED to register $name" >&2
+      echo "  claude: FAILED to register $name (via $bin)" >&2
     fi
   fi
 }
 
 register_codex() {
-  command -v codex >/dev/null 2>&1 || { echo "  codex: not installed"; return; }
+  local bin
+  bin="$(harness_exec codex)"
+  [ -n "$bin" ] || { echo "  codex: not installed"; return; }
   local config="${CODEX_HOME:-$HOME/.codex}/config.toml"
   mkdir -p "$(dirname "$config")"
   touch "$config"
@@ -119,11 +148,13 @@ register_codex() {
     printf 'args = %s\n' "$(printf '%s' "$json_args" | jq -c .)"
     printf '# <<< t3-browser-mcp:%s <<<\n' "$name"
   } >> "$config"
-  echo "  codex: registered $name in $config"
+  echo "  codex: registered $name in $config (via $bin)"
 }
 
 register_opencode() {
-  command -v opencode >/dev/null 2>&1 || { echo "  opencode: not installed"; return; }
+  local bin
+  bin="$(harness_exec opencode)"
+  [ -n "$bin" ] || { echo "  opencode: not installed"; return; }
   local config="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json"
   mkdir -p "$(dirname "$config")"
   [ -s "$config" ] || echo '{"$schema":"https://opencode.ai/config.json"}' > "$config"
@@ -140,7 +171,7 @@ register_opencode() {
      '.mcp[$n] = {type: "local", command: ([$c] + $a), enabled: true}' \
      "$config" > "$tmp"
   mv "$tmp" "$config"
-  echo "  opencode: registered $name in $config"
+  echo "  opencode: registered $name in $config (via $bin)"
 }
 
 printf '%s %s (%s)\n' \

@@ -23,10 +23,14 @@ jobs:
       - name: Shell scripts parse and pass shellcheck
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          for f in docker/entrypoint.sh docker/bin/* scripts/*.sh; do
+          for f in docker/entrypoint.sh docker/bin/* scripts/*.sh scripts/lib/*.sh tests/*.test.sh; do
             bash -n "$f"
             shellcheck -S warning "$f"
           done
+          bash tests/image-profile.test.sh
+          node --test tests/*.test.mjs
+          node scripts/harness-ui-audit.js
+          scripts/generate-mise-idiomatic.sh --check
       - name: Compose file is valid
         run: docker compose config >/dev/null
 
@@ -39,7 +43,9 @@ jobs:
       - name: Pinned versions are current
         id: check
         continue-on-error: true
-        run: ./scripts/bump-versions.sh --check | tee /tmp/versions.txt
+        run: |
+          set -o pipefail
+          ./scripts/bump-versions.sh --check | tee /tmp/versions.txt
       - name: Summarise
         run: |
           {
@@ -54,69 +60,24 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Both architectures build and smoke-test on their own native runner. ARM
-  # runners are free for public repositories; emulating this under QEMU would
-  # mean a rustup toolchain install and a node-pty compile through translation.
+  # Every target builds and smoke-tests on its own native runner, so a change
+  # that only works on amd64 is caught before it ships. The slower E2E runs on
+  # amd64 for every build, so a release is never its first run; the size
+  # measurement runs on release only. On a release tag both targets push by
+  # digest and `merge` stitches the tested digests into the release tags, so
+  # nothing is rebuilt between test and publish.
   build:
+    name: ${{ matrix.target }} (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     needs: lint
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [slim, full]
-        platform: [amd64, arm64]
-        include:
-          - platform: amd64
-            runner: ubuntu-latest
-          - platform: arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-
-      # The full image is several GB; the default runner does not have room
-      # for it alongside the preinstalled toolchains.
-      - name: Reclaim disk
-        if: matrix.target == 'full'
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
-          df -h /
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build ${{ matrix.target }} (${{ matrix.platform }})
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: ${{ matrix.target }}
-          platforms: linux/${{ matrix.platform }}
-          load: true
-          tags: t3code:${{ matrix.target }}
-          # The tag on a release build, the branch otherwise; the setup page
-          # shows it so a pull can be confirmed at a glance.
-          build-args: |
-            IMAGE_VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('{0}@{1}', github.ref_name, github.sha) }}
-            IMAGE_VARIANT=${{ matrix.target }}
-          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.platform }}
-          cache-to: type=gha,mode=min,scope=${{ matrix.target }}-${{ matrix.platform }}
-
-      - name: Smoke test
-        run: scripts/smoke-test.sh t3code:${{ matrix.target }}
-
-  # Push one image per architecture by digest, then stitch them into a single
-  # manifest list in `merge`. Pulling ghcr.io/<repo>:full then resolves to
-  # whichever architecture the host actually is.
-  publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    runs-on: ${{ matrix.runner }}
-    needs: build
+    timeout-minutes: 180
     permissions:
       contents: read
       packages: write
     strategy:
       fail-fast: false
       matrix:
-        target: [slim, full]
+        target: [core, browser]
         platform: [amd64, arm64]
         include:
           - platform: amd64
@@ -126,14 +87,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Reclaim disk
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+      - name: Lowercase the image path
+        id: image
+        run: echo "slug=$(printf '%s' '${{ env.IMAGE }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
+      - name: Log in to the registry
+        if: github.ref_type == 'tag'
+        uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -142,7 +104,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.slug }}
 
       - id: build
         uses: docker/build-push-action@v6
@@ -150,41 +112,158 @@ jobs:
           context: .
           target: ${{ matrix.target }}
           platforms: linux/${{ matrix.platform }}
+          # Tag pushes go to the registry by digest so the checks below pull the
+          # exact artifact that would be released; everything else stays local.
+          load: ${{ github.ref_type != 'tag' }}
+          outputs: ${{ github.ref_type == 'tag' && format('type=image,name={0}/{1},push-by-digest=true,name-canonical=true,push=true', env.REGISTRY, steps.image.outputs.slug) || '' }}
+          tags: ${{ github.ref_type != 'tag' && format('t3code:{0}', matrix.target) || '' }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The setup page shows this, so a pull can be confirmed at a glance.
           build-args: |
-            IMAGE_VERSION=${{ github.ref_name }}
+            IMAGE_VERSION=${{ github.ref_type == 'tag' && github.ref_name || format('{0}@{1}', github.ref_name, github.sha) }}
             IMAGE_VARIANT=${{ matrix.target }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.target }}-${{ matrix.platform }}
 
-      - name: Export digest
+      # buildx pushes an index when it attaches provenance, so the digest above
+      # refers to that index. Its platform member is the artifact the checks and
+      # the promoted manifest must agree on.
+      - name: Resolve the platform digest
+        id: platform
+        if: github.ref_type == 'tag'
+        env:
+          INDEX_DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.platform }}
         run: |
-          mkdir -p /tmp/digests
-          digest='${{ steps.build.outputs.digest }}'
-          touch "/tmp/digests/${digest#sha256:}"
+          set -euo pipefail
+          raw="$(docker buildx imagetools inspect --raw \
+            "${REGISTRY}/${{ steps.image.outputs.slug }}@${INDEX_DIGEST}")"
+          digest="$(printf '%s' "$raw" | jq -r --arg arch "$ARCH" \
+            '.manifests[] | select((.platform.os // "") == "linux" and (.platform.architecture // "") == $arch) | .digest' | head -1)"
+          [ -n "$digest" ] && [ "$digest" != "null" ] \
+            || { echo "no linux/$ARCH member in $INDEX_DIGEST" >&2; exit 1; }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke test
+        env:
+          VARIANT: ${{ matrix.target }}
+          PLATFORM_DIGEST: ${{ steps.platform.outputs.digest }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            scripts/smoke-test.sh --variant "$VARIANT" \
+              "${REGISTRY}/${{ steps.image.outputs.slug }}@${PLATFORM_DIGEST}"
+          else
+            scripts/smoke-test.sh --variant "$VARIANT" "t3code:${VARIANT}"
+          fi
+
+      # The assembled product: install and launch all five managed harnesses
+      # through T3, survive recreation (including offline), and on `browser`
+      # drive real pages through the managed MCP registration. It installs
+      # mise's latest of each, so it runs on every build rather than first
+      # meeting a new upstream release on the day of a tag.
+      - name: Harness lifecycle E2E (native amd64)
+        if: matrix.platform == 'amd64'
+        env:
+          VARIANT: ${{ matrix.target }}
+          PLATFORM_DIGEST: ${{ steps.platform.outputs.digest }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            scripts/test-toolchain-e2e.sh --variant "$VARIANT" \
+              "${REGISTRY}/${{ steps.image.outputs.slug }}@${PLATFORM_DIGEST}"
+          else
+            scripts/test-toolchain-e2e.sh --variant "$VARIANT" "t3code:${VARIANT}"
+          fi
+
+      - name: Measure the tested artifact (native amd64, release only)
+        if: github.ref_type == 'tag' && matrix.platform == 'amd64'
+        env:
+          VARIANT: ${{ matrix.target }}
+          PLATFORM_DIGEST: ${{ steps.platform.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/evidence
+          docker pull "${REGISTRY}/${{ steps.image.outputs.slug }}@${PLATFORM_DIGEST}" >/dev/null
+          docker tag "${REGISTRY}/${{ steps.image.outputs.slug }}@${PLATFORM_DIGEST}" "t3code:${VARIANT}"
+          scripts/measure-image.sh --no-build --json "$VARIANT" \
+            > "/tmp/evidence/measure-${VARIANT}.json"
+
+      - name: Report artifact size
+        if: github.ref_type == 'tag' && matrix.platform == 'amd64'
+        env:
+          VARIANT: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          jq -r '
+            .[0] |
+            "### Size: `\(.target)`\n\n" +
+            "| Artifact | Compressed | Unpacked | Startup |\n| --- | ---: | ---: | ---: |\n" +
+            "| `\(.target)` | \(.compressed_bytes) B | \(.unpacked_bytes) B | \(.startup_seconds) s |"' \
+            "/tmp/evidence/measure-${VARIANT}.json" >> "$GITHUB_STEP_SUMMARY"
+
+      # Written only after the checks above passed, so a failed run leaves
+      # nothing for `merge` to promote.
+      - name: Record the tested digest
+        if: github.ref_type == 'tag'
+        env:
+          VARIANT: ${{ matrix.target }}
+          PLATFORM: linux/${{ matrix.platform }}
+          INDEX_DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM_DIGEST: ${{ steps.platform.outputs.digest }}
+          # Both architectures are smoke-tested on their own native runner. The
+          # measurement is amd64-only, so only that record carries a size.
+          TESTED: "true"
+          MEASURED: ${{ matrix.platform == 'amd64' }}
+        run: |
+          mkdir -p /tmp/evidence
+          size="$(cat "/tmp/evidence/measure-${VARIANT}.json" 2>/dev/null || echo null)"
+          [ "$MEASURED" = "true" ] && size="$(printf '%s' "$size" | jq -c '.[0] // null' 2>/dev/null || echo null)" || size=null
+          jq -cn \
+            --arg target "$VARIANT" --arg platform "$PLATFORM" \
+            --arg digest "$PLATFORM_DIGEST" --arg indexDigest "$INDEX_DIGEST" \
+            --arg sourceSha "$GITHUB_SHA" \
+            --arg ref "${REGISTRY}/${{ steps.image.outputs.slug }}@${PLATFORM_DIGEST}" \
+            --arg indexRef "${REGISTRY}/${{ steps.image.outputs.slug }}@${INDEX_DIGEST}" \
+            --arg runUrl "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --argjson tested "$TESTED" \
+            --argjson size "$size" \
+            '{target:$target, platform:$platform, digest:$digest, indexDigest:$indexDigest,
+              ref:$ref, indexRef:$indexRef, tested:$tested, size:$size,
+              sourceSha:$sourceSha, runUrl:$runUrl}' \
+            > "/tmp/evidence/build-${VARIANT}-${{ matrix.platform }}.json"
 
       - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
         with:
-          name: digests-${{ matrix.target }}-${{ matrix.platform }}
-          path: /tmp/digests/*
+          name: build-evidence-${{ matrix.target }}-${{ matrix.platform }}
+          path: /tmp/evidence/build-*.json
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
+  # Promote the tested digests into the release tags. No image is rebuilt: the
+  # manifest list is assembled from the digests the build jobs pushed, and
+  # `verify-promoted-manifest.sh` asserts each release tag maps exactly those.
   merge:
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
-    needs: publish
+    needs: build
     permissions:
       contents: read
       packages: write
     strategy:
+      fail-fast: false
       matrix:
-        target: [slim, full]
+        target: [core, browser]
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Lowercase the image path
+        id: image
+        run: echo "slug=$(printf '%s' '${{ env.IMAGE }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v4
         with:
-          path: /tmp/digests
-          pattern: digests-${{ matrix.target }}-*
+          path: /tmp/evidence
+          pattern: build-evidence-${{ matrix.target }}-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
@@ -198,31 +277,64 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
-          # `flavor: suffix` would apply to every tag, turning the bare `slim`
-          # tag into `slim-slim`. Spell each one out instead.
-          #   full -> :full :latest :1.2.3 :1.2 :1.2.3-full :1.2-full
-          #   slim -> :slim :1.2.3-slim :1.2-slim
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.slug }}
+          # `flavor: suffix` would apply to every tag, turning the bare `core`
+          # tag into `core-core`. Spell each one out instead. `browser` is the
+          # successor to `full` and `core` to `slim`, so the old names keep
+          # pulling current images: an upgraded container reinstalls its
+          # agents and toolchains on first start instead of losing them.
+          #   browser -> :browser :full :latest :1.2.3 :1.2
+          #              :1.2.3-browser :1.2-browser :1.2.3-full :1.2-full
+          #   core    -> :core :slim :1.2.3-core :1.2-core :1.2.3-slim :1.2-slim
           flavor: latest=false
           tags: |
             type=raw,value=${{ matrix.target }}
             type=semver,pattern={{version}},suffix=-${{ matrix.target }}
             type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.target }}
-            type=raw,value=latest,enable=${{ matrix.target == 'full' }}
-            type=semver,pattern={{version}},enable=${{ matrix.target == 'full' }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.target == 'full' }}
+            type=raw,value=${{ matrix.target == 'browser' && 'full' || 'slim' }}
+            type=semver,pattern={{version}},suffix=-${{ matrix.target == 'browser' && 'full' || 'slim' }}
+            type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.target == 'browser' && 'full' || 'slim' }}
+            type=raw,value=latest,enable=${{ matrix.target == 'browser' }}
+            type=semver,pattern={{version}},enable=${{ matrix.target == 'browser' }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.target == 'browser' }}
 
-      - name: Create the manifest list
-        working-directory: /tmp/digests
+      - name: Promote the tested digests
+        env:
+          SLUG: ${{ steps.image.outputs.slug }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE }}@sha256:%s ' *)
-
-      - name: Verify both architectures are present
-        run: |
-          tag="$(jq -cr '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
-          docker buildx imagetools inspect "$tag" | tee /tmp/inspect.txt
-          for want in linux/amd64 linux/arm64; do
-            grep -q "$want" /tmp/inspect.txt || { echo "missing $want in $tag" >&2; exit 1; }
+          set -euo pipefail
+          refs=(); expects=(); amd64=0; arm64=0
+          for f in /tmp/evidence/build-*.json; do
+            platform="$(jq -r .platform "$f")"
+            digest="$(jq -r .digest "$f")"
+            index="$(jq -r .indexDigest "$f")"
+            case "$platform" in
+              linux/amd64) amd64=$((amd64 + 1)) ;;
+              linux/arm64) arm64=$((arm64 + 1)) ;;
+              *) echo "unexpected platform '$platform' in $f" >&2; exit 1 ;;
+            esac
+            # Every member is smoke-tested on its own native runner, so a digest
+            # that is not marked tested must never reach a release tag.
+            [ "$(jq -r .tested "$f")" = "true" ] \
+              || { echo "the $platform digest is not marked as tested" >&2; exit 1; }
+            # Promote the pushed index so provenance stays attached.
+            refs+=("${REGISTRY}/${SLUG}@${index}")
+            expects+=(--expect "${platform}=${digest}")
           done
+          [ "${#refs[@]}" -eq 2 ] \
+            || { echo "expected two platform digests, found ${#refs[@]}" >&2; exit 1; }
+          [ "$amd64" -eq 1 ] || { echo "missing the amd64 digest" >&2; exit 1; }
+          [ "$arm64" -eq 1 ] || { echo "missing the arm64 digest" >&2; exit 1; }
+          mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          args=(); for tag in "${tags[@]}"; do args+=(-t "$tag"); done
+          docker buildx imagetools create "${args[@]}" "${refs[@]}"
+          scripts/verify-promoted-manifest.sh "${expects[@]}" "${tags[0]}"
+          {
+            echo "### Promoted \`${{ matrix.target }}\`"
+            echo
+            echo '| Platform | Member digest | Tested | Index digest |'
+            echo '| --- | --- | --- | --- |'
+            jq -r '"| \(.platform) | `\(.digest)` | \(.tested) | `\(.indexDigest)` |"' /tmp/evidence/build-*.json
+            echo
+            echo "Tags: $(printf "\`%s\` " "${tags[@]}")"
+          } >> "$GITHUB_STEP_SUMMARY"

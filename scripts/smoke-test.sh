@@ -1,10 +1,49 @@
 #!/usr/bin/env bash
 # Boot the image and assert the things a user would notice if they broke.
 #
-#   scripts/smoke-test.sh [image]      (default: t3code:full)
+#   scripts/smoke-test.sh [--variant NAME] [image]      (default: t3code:browser)
+#
+# Capability profiles:
+#   browser  default (`latest`): core + Chromium/fonts/MCP servers
+#   core     installer + mise, no browser; agents and toolchains install on
+#            first start, in both
+#
+# The variant selects which capabilities are asserted; it is never inferred
+# from the presence of Chromium. When omitted it is inferred from the image
+# tag (t3code:<variant>); digest references (image@sha256:...) require an
+# explicit --variant because the tag carries no variant.
+#
 set -euo pipefail
 
-IMAGE="${1:-t3code:full}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/image-profile.sh
+. "$SCRIPT_DIR/lib/image-profile.sh"
+
+VARIANT=""
+IMAGE=""
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/smoke-test.sh [--variant NAME] [image]
+
+  --variant NAME   core | browser
+                   (default: inferred from the image tag; required for digest refs)
+  image            image tag or digest reference (default: t3code:browser)
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --variant) VARIANT="${2:?--variant needs a value}"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; [ $# -gt 0 ] && IMAGE="$1" && shift; break ;;
+    -*) echo "smoke-test.sh: unknown option $1" >&2; usage >&2; exit 2 ;;
+    *) IMAGE="$1"; shift ;;
+  esac
+done
+[ -n "$IMAGE" ] || IMAGE="t3code:browser"
+
+t3_image_profile_resolve "smoke-test.sh" "$IMAGE" "$VARIANT"
 NAME="t3code-smoke-$$"
 PORT="${SMOKE_PORT:-13773}"
 PUBLIC_URL="https://smoke.example.test"
@@ -24,16 +63,24 @@ retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do
 STATE_MOUNT=""
 PAGE_HTML=""
 CLIENT_JS_COPY=""
+# The layout audit runs with its output discarded, so record it here and print
+# it with the failure summary.
+UI_AUDIT_LOG="${UI_AUDIT_LOG:-}"
+if [ -z "$UI_AUDIT_LOG" ]; then
+  UI_AUDIT_LOG="$(mktemp "${TMPDIR:-/tmp}/t3-ui-audit.XXXXXX")"
+  UI_AUDIT_LOG_CREATED=1
+fi
 cleanup() {
   docker rm -f "$NAME" "${NAME}-mount" "${NAME}-boot" "${NAME}-anon" "${NAME}-env" >/dev/null 2>&1 || true
   rm -f "$PAGE_HTML" "$CLIENT_JS_COPY" 2>/dev/null || true
+  [ "${UI_AUDIT_LOG_CREATED:-0}" = 1 ] && rm -f "$UI_AUDIT_LOG" 2>/dev/null || true
   if [ -n "$STATE_MOUNT" ]; then
     sudo rm -rf "$STATE_MOUNT" 2>/dev/null || rm -rf "$STATE_MOUNT" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
-printf '\nSmoke-testing %s\n\n' "$IMAGE"
+printf '\nSmoke-testing %s (variant %s)\n\n' "$IMAGE" "$VARIANT"
 
 docker run -d --name "$NAME" \
   -p "127.0.0.1:${PORT}:3773" \
@@ -69,27 +116,51 @@ done
   && ok "docker healthcheck reports healthy" \
   || no "docker healthcheck reports $health_status"
 
-printf '\nHarnesses\n'
-for bin in t3 claude codex opencode grok cursor-agent; do
-  check "$bin runs" "docker exec $NAME $bin --version"
-done
+printf '\nHarnesses (variant %s)\n' "$VARIANT"
+check "t3 runs" "docker exec $NAME t3 --version"
+# The image ships the installer, never the executables: a baked harness would
+# let a stale copy masquerade as a managed install. The agent names on root's
+# PATH are all the root-owned dispatcher, which runs the managed install.
+only_the_dispatcher_is_baked() {
+  docker exec "$NAME" sh -c '
+    for agent in claude codex opencode grok cursor-agent; do
+      [ "$(command -v "$agent")" = "/usr/local/lib/t3-agents/$agent" ] || exit 1
+      [ "$(readlink -f "/usr/local/lib/t3-agents/$agent")" = /usr/local/bin/t3-agent ] || exit 1
+    done
+    [ "$(stat -c %U /usr/local/bin/t3-agent /usr/local/lib/t3-agents | sort -u)" = root ]'
+}
+check "no harness executable is baked, only the root-owned dispatcher" only_the_dispatcher_is_baked
+check "mise ships" "docker exec $NAME mise --version"
+check "harness installer ships" "docker exec $NAME t3-harness --help"
+check "provider integration ships" "docker exec $NAME test -r /opt/t3-provider/cli.mjs"
 
-# T3 Code states the versions it needs in its own bundle, and it enforces them
-# at runtime: too old a `gh` and it reports "GitHub CLI is too old to report
-# sign-in status", too old an OpenCode and it refuses the server outright.
-# Debian's gh (2.46) sat below that floor for a while and made the CLI useless
-# inside T3 Code without anything here noticing, so read the floor back out of
-# the bundle and hold the image to it. If upstream raises a minimum, this fails
-# on the next build rather than in someone's session.
-# T3 0.0.41 replaced the Node bundle with a launcher plus a platform binary,
-# and the floors moved into that binary. npm nests the platform package under
-# t3 on a global install but hoists it on a local one, so check both. The
-# greps read it with -a because it is an executable.
-T3_BUNDLE="$(docker exec "$NAME" sh -c \
-  'ls /opt/npm-global/lib/node_modules/@t3code/t3-*/t3 \
-      /opt/npm-global/lib/node_modules/t3/node_modules/@t3code/t3-*/t3 \
-      2>/dev/null | head -1')"
-[ -n "$T3_BUNDLE" ] || T3_BUNDLE=/opt/npm-global/lib/node_modules/t3/dist/bin.mjs
+# T3 Code enforces a minimum `gh` at runtime: too old and it reports "GitHub
+# CLI is too old to report sign-in status". Debian's gh (2.46) sat below that
+# floor and made the CLI useless, so the Dockerfile pin is the source of truth.
+T3_PREFIX="$(docker exec "$NAME" printenv T3_INFRA_PREFIX 2>/dev/null || true)"
+[ -n "$T3_PREFIX" ] || T3_PREFIX=/opt/t3
+T3_BINARY="$(docker exec "$NAME" printenv T3_INFRA_BINARY 2>/dev/null || true)"
+[ -n "$T3_BINARY" ] || T3_BINARY="${T3_PREFIX}/t3"
+check "the immutable T3 platform binary is where the image says it is" \
+  "docker exec $NAME test -x $T3_BINARY"
+check "the T3 client shell is available for the setup pill" \
+  "docker exec $NAME test -f $T3_PREFIX/client/index.html"
+check "T3 is not installed in the mutable npm prefix" \
+  "docker exec $NAME test ! -e /opt/npm-global/lib/node_modules/t3"
+# Root resolves gosu, id and bash by name before stepping down. A directory on
+# its PATH that t3 can write would let an agent plant any of them and get root
+# on the next restart or `docker exec`.
+check "root's PATH holds no directory the t3 user can write" \
+  "docker exec $NAME sh -c 'IFS=:; for d in \$PATH; do [ -d \"\$d\" ] || continue; gosu t3 test -w \"\$d\" && { echo \"\$d\"; exit 1; }; done; exit 0'"
+check "the t3 user still gets its own npm prefix" \
+  "docker exec -u t3 $NAME bash -lc 'case :\$PATH: in *:/opt/npm-global/bin:*) true ;; *) false ;; esac'"
+
+# T3 states the versions it needs inside its own platform binary, and enforces
+# them at runtime: too old a `gh` and it reports "GitHub CLI is too old to
+# report sign-in status", too old an OpenCode and it refuses the server. Read
+# the floors back out of the binary (with -a: it is an executable) and hold the
+# image to them, so an upstream bump fails here rather than in a session.
+T3_BUNDLE="$T3_BINARY"
 
 # Compares with sort -V: passes when installed >= required.
 version_at_least() {
@@ -114,27 +185,10 @@ else
   no "gh ${GH_INSTALLED:-?} is below the ${GH_DECLARED:-?} T3 Code requires"
 fi
 
-opencode_meets_t3_minimum() {
-  local declared installed
-  declared="$(docker exec "$NAME" sh -c \
-    "grep -a -o 'MINIMUM_OPENCODE_VERSION *= *\"[0-9][0-9.]*\"' $T3_BUNDLE | head -1" 2>/dev/null \
-    | grep -o '[0-9][0-9.]*' | head -1)"
-  [ -n "$declared" ] || return 0   # nothing declared upstream, nothing to hold to
-  installed="$(docker exec "$NAME" opencode --version 2>/dev/null | tr -d '\r' | head -1)"
-  [ -n "$installed" ] || return 1
-  OC_DECLARED="$declared"; OC_INSTALLED="$installed"
-  version_at_least "$installed" "$declared"
-}
-if opencode_meets_t3_minimum; then
-  ok "opencode ${OC_INSTALLED:-?} meets the ${OC_DECLARED:-?} T3 Code requires"
-else
-  no "opencode ${OC_INSTALLED:-?} is below the ${OC_DECLARED:-?} T3 Code requires"
-fi
-
 # A freshly built image that immediately asks you to upgrade an agent is a bug
 # in this repo, not in the agent. The pins are what go stale, so assert they
 # were current when the image was built.
-check "the pinned agent versions were current at build time" \
+check "the image's pinned versions were current at build time" \
   "./scripts/bump-versions.sh --check"
 
 printf '\nPairing\n'
@@ -150,16 +204,28 @@ check "minted token is registered server-side" \
 
 have() { docker exec "$NAME" sh -c "command -v $1" >/dev/null 2>&1; }
 
-printf '\nRuntimes\n'
+printf '\nRuntimes (variant %s)\n' "$VARIANT"
 for bin in node python3 git gh; do
   check "$bin present" "have $bin"
 done
+check "mise present" "have mise"
 
-if have chromium; then
-  printf '\nToolchains and browser (full image)\n'
-  for bin in go rustc cargo bun deno uv ffmpeg cmake clang; do
-    check "$bin present" "have $bin"
-  done
+printf '\nNon-browser toolchain packages (core union)\n'
+for bin in clang cmake ffmpeg; do
+  check "$bin present" "have $bin"
+done
+check "postgresql client present" "have psql"
+check "gdb present" "have gdb"
+
+printf '\nProject runtimes (installed through mise, not baked)\n'
+# Root has no mise shims on PATH by design, so a bare lookup as root only
+# finds a baked runtime.
+check "no language runtime is baked" \
+  "! docker exec $NAME sh -c 'command -v go || command -v rustc || command -v cargo || command -v bun || command -v deno || command -v uv' >/dev/null 2>&1"
+
+if [ "$HAS_BROWSER" -eq 1 ]; then
+  printf '\nBrowser (variant %s)\n' "$VARIANT"
+  check "chromium present" "have chromium"
 
   # about:blank would pass even with a broken renderer; render real markup and
   # look for it in the DOM, then prove the raster path produces a real image.
@@ -177,16 +243,25 @@ if have chromium; then
   check "chrome-devtools-mcp present" "have chrome-devtools-mcp"
 
   # "installed" and "an agent can see a page" are different claims.
-  docker cp "$(dirname "$0")/browser-probe.py" "$NAME:/tmp/browser-probe.py" >/dev/null
+  docker cp "$SCRIPT_DIR/browser-probe.py" "$NAME:/tmp/browser-probe.py" >/dev/null
   check "browser MCP drives a real page (playwright)" \
     "docker exec -u t3 $NAME python3 /tmp/browser-probe.py"
   check "browser MCP drives a real page (chrome-devtools)" \
     "docker exec -u t3 $NAME python3 /tmp/browser-probe.py \
        \$(docker exec $NAME t3-browser-mcp --server chrome-devtools --print)"
-  check "t3-browser-mcp registers with opencode" \
+  check "t3-browser-mcp prints playwright server" \
+    "docker exec $NAME t3-browser-mcp --server playwright --print | grep -q playwright-mcp"
+  check "t3-browser-mcp prints chrome-devtools server" \
+    "docker exec $NAME t3-browser-mcp --server chrome-devtools --print | grep -q chrome-devtools-mcp"
+  # No baked harness to register with, so just prove the helper does not fail
+  # without one; the managed registration path is covered by the E2E.
+  check "t3-browser-mcp runs with no baked harness" \
     "docker exec $NAME t3-browser-mcp --harness opencode"
-  check "opencode config records the mcp server" \
-    "docker exec -u t3 $NAME jq -e '.mcp.playwright.enabled' /home/t3/.config/opencode/opencode.json"
+else
+  printf '\nBrowser (none expected in %s)\n' "$VARIANT"
+  check "no chromium" "! docker exec $NAME sh -c 'command -v chromium' >/dev/null 2>&1"
+  check "no playwright-mcp" "! docker exec $NAME sh -c 'command -v playwright-mcp' >/dev/null 2>&1"
+  check "no chrome-devtools-mcp" "! docker exec $NAME sh -c 'command -v chrome-devtools-mcp' >/dev/null 2>&1"
 fi
 
 printf '\nOwnership\n'
@@ -200,7 +275,7 @@ check "root exec does not leave root-owned state" \
 # server dies on `mkdir userdata` with nothing but an EACCES stack trace.
 STATE_MOUNT="$(mktemp -d)"
 sudo chown 0:0 "$STATE_MOUNT" 2>/dev/null || chown 0:0 "$STATE_MOUNT" 2>/dev/null || true
-docker run -d --name "${NAME}-mount" -v "$STATE_MOUNT:/home/t3/.t3" "$IMAGE" >/dev/null
+docker run -d --name "${NAME}-mount" -e T3_PREINSTALL=none -v "$STATE_MOUNT:/home/t3/.t3" "$IMAGE" >/dev/null
 mounted_ok=0
 for _ in $(seq 1 40); do
   if docker exec "${NAME}-mount" curl -fsS --max-time 3 \
@@ -229,7 +304,7 @@ check "a written credential lands on the state volume" \
 # The Dockerfile declares VOLUME, so an unmounted deployment still looks mounted
 # from inside; only the mount source distinguishes a throwaway anonymous volume.
 docker rm -f "${NAME}-anon" >/dev/null 2>&1 || true
-docker run -d --name "${NAME}-anon" -e T3_SETUP_KEY=x "$IMAGE" >/dev/null
+docker run -d --name "${NAME}-anon" -e T3_SETUP_KEY=x -e T3_PREINSTALL=none "$IMAGE" >/dev/null
 # The entrypoint always prints exactly one persistence verdict, so wait for any
 # of them rather than only the one we want. A wrong verdict then fails at once
 # with the line it printed, and a container that died fails with its exit code,
@@ -289,24 +364,127 @@ check "the T3 client links to the setup console" \
 # Pulling a new image should be confirmable from the page itself rather than by
 # guessing, so the build is stamped in at the end of the Dockerfile and shown in
 # the top bar. Assert the stamp survives into the running container and names
-# the variant that was actually built.
+# the variant that was actually built. The expected variant is the explicit
+# --variant (never parsed from the image reference), so digest references work.
 version_is_stamped() {
-  local want="${IMAGE##*:}"
+  local want="$VARIANT"
   docker exec "$NAME" sh -c \
     "curl -sS --max-time 25 -b /tmp/jar http://127.0.0.1:3774/status" | python3 -c "
 import json, sys
 img = json.load(sys.stdin).get('image') or {}
 sys.exit(0 if img.get('version') and img.get('variant') == '$want' else 1)"
 }
-check "the image build is stamped and reported" version_is_stamped
+check "the image build is stamped and reported ($VARIANT)" version_is_stamped
 
-# Agent authentication, driven the way the page drives it.
-printf '\nAgent authentication\n'
+# The image ships no agent CLI and no language runtime. The first start puts
+# them back: everything T3_PREINSTALL names (all of it, by default) installs in
+# the background onto the volume. This container runs the default, so what
+# follows is what someone pulling `latest` gets.
+printf '\nFirst-start setup (T3_PREINSTALL default)\n'
+status_json() { docker exec "${1:-$NAME}" sh -c \
+  "curl -sS --max-time 25 -b ${2:-/tmp/jar} http://127.0.0.1:3774/status"; }
+
+setup_state=""
+for _ in $(seq 1 150); do
+  setup_state="$(status_json 2>/dev/null | jq -r '.setup.state // "none"' 2>/dev/null || true)"
+  [ "$setup_state" = finished ] && break
+  sleep 4
+done
+if [ "$setup_state" = finished ]; then
+  ok "first-start setup finished"
+else
+  no "first-start setup finished (state: ${setup_state:-unreadable})"
+  docker logs "$NAME" 2>&1 | grep preinstall | tail -20
+fi
+
+setup_installed_everything() {
+  status_json | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+items = s["setup"]["items"]
+want = {"agent:" + i for i in ("claude", "codex", "opencode", "grok", "cursor")} \
+     | {"toolchain:" + i for i in ("go", "rust", "bun", "deno", "uv")}
+got = {i["kind"] + ":" + i["id"] for i in items if i["state"] == "done"}
+missing = want - got
+if missing: print("not installed:", sorted(missing))
+sys.exit(0 if not missing else 1)'
+}
+check "every agent and toolchain is installed on first start" setup_installed_everything
+
+agents_runnable() {
+  status_json | python3 -c '
+import json, sys
+h = {a["id"]: a for a in json.load(sys.stdin)["harnesses"]}
+sys.exit(0 if all(h[i]["runnable"] and h[i]["version"] for i in ("claude", "codex", "opencode", "grok", "cursor")) else 1)'
+}
+# Retried: the card's facts refresh on the poll after the last install lands.
+check "every agent is runnable at a recorded version" "retry 10 agents_runnable"
+
+# T3 learns about each agent through its settings file, as soon as the agent
+# lands. Read it the way T3 does.
+t3_points_at_managed_agents() {
+  docker exec -u t3 "$NAME" cat /home/t3/.t3/userdata/settings.json | python3 -c '
+import json, sys
+p = json.load(sys.stdin).get("providers", {})
+drivers = ("claudeAgent", "codex", "opencode", "grok", "cursor")
+sys.exit(0 if all(p.get(d, {}).get("binaryPath", "").startswith("/home/t3/.local/share/mise/installs/") for d in drivers) else 1)'
+}
+check "T3 is pointed at every managed agent" t3_points_at_managed_agents
+
+# Cursor's package carries its own node and rg. Installed through mise's
+# registry as-is, they shadowed the image's for every agent and terminal.
+image_node_wins() {
+  docker exec -u t3 "$NAME" bash -lc 'cd /tmp &&
+    [ "$(command -v node)" = /usr/local/bin/node ] &&
+    case "$(command -v rg || echo none)" in *mise*) false ;; *) true ;; esac'
+}
+check "Cursor's bundled node does not shadow the image's" image_node_wins
+# `docker exec` has none of the t3 user's shell setup; the dispatcher still
+# runs the managed install, as t3 even when called as root - Cursor included,
+# which has no shim at all.
+agents_by_name_from_exec() {
+  local want got
+  want="$(status_json | jq -r '.harnesses[] | select(.id == "claude") | .version')"
+  got="$(docker exec "$NAME" claude --version 2>/dev/null | head -1)"
+  case "$got" in *"$want"*) ;; *) return 1 ;; esac
+  docker exec -u t3 "$NAME" opencode --version >/dev/null 2>&1 &&
+  docker exec -u t3 "$NAME" cursor-agent --version >/dev/null 2>&1 &&
+  [ "$(docker exec "$NAME" sh -c 'stat -c %U /home/t3/.claude.json 2>/dev/null || echo t3')" = t3 ]
+}
+check "agents run by name from docker exec, as the t3 user" agents_by_name_from_exec
+# T3 reads its PATH from `$SHELL -ilc` and calls an agent installed when its
+# name is found there. The dispatcher answers to every name, so it must never
+# be on that PATH, or an uninstalled agent reads as installed.
+check "T3's login-shell PATH does not include the agent dispatcher" \
+  "! docker exec -u t3 $NAME bash -ilc 'echo \"\$PATH\"' 2>/dev/null | grep -q t3-agents"
+check "toolchains run from any directory, as the t3 user" \
+  "docker exec -u t3 $NAME bash -lc 'cd /tmp && go version && cargo --version && cargo clippy --version && rustfmt --version && bun --version && deno --version && uv --version'"
+
+# T3 refuses an OpenCode below the floor its own binary declares, and the
+# manager refuses to select one. Both read the same number, or a T3 bump that
+# raises it slips through until someone's session fails.
+opencode_floor_matches_t3() {
+  local declared catalogue installed
+  declared="$(docker exec "$NAME" sh -c \
+    "grep -a -o 'MINIMUM_OPENCODE_VERSION *= *\"[0-9][0-9.]*\"' $T3_BUNDLE | head -1" 2>/dev/null \
+    | grep -o '[0-9][0-9.]*' | head -1)"
+  catalogue="$(docker exec "$NAME" sh -c \
+    "grep -o 'MINIMUM_OPENCODE_VERSION = \"[0-9.]*\"' /opt/t3-harness/catalogue.mjs" \
+    | grep -o '[0-9][0-9.]*')"
+  installed="$(status_json | jq -r '.harnesses[] | select(.id == "opencode") | .version')"
+  [ -n "$declared" ] && [ "$declared" = "$catalogue" ] && version_at_least "$installed" "$declared"
+}
+check "the OpenCode floor matches T3's, and the install meets it" opencode_floor_matches_t3
+
+# Agent authentication, driven the way the page drives it, against the agents
+# the first start installed.
+printf '\nAgent authentication (variant %s)\n' "$VARIANT"
 auth_post() { docker exec "$NAME" sh -c "curl -sS -b /tmp/jar -H 'content-type: application/json' -d '$1' http://127.0.0.1:3774$2"; }
+as_t3() { docker exec -u t3 "$NAME" bash -lc "$1"; }
 
 codex_key_stored() {
   auth_post '{"agent":"codex","key":"sk-smoke-test-key"}' /auth/apikey | grep -q '"ok":true' &&
-  docker exec -u t3 "$NAME" codex login status 2>&1 | grep -q "API key"
+  as_t3 'codex login status' 2>&1 | grep -q "API key"
 }
 check "an API key signs Codex in" codex_key_stored
 
@@ -322,23 +500,30 @@ check "an unknown agent is refused" \
 # The panel used to decide this from a credentials file on disk, which misses
 # every credential that never lands there. T3 Code honours ANTHROPIC_API_KEY and
 # CLAUDE_CODE_OAUTH_TOKEN, so a container holding one showed as authenticated in
-# T3 Code and "Not signed in" here. Ask each CLI instead, and assert both
-# directions: the reading has to change when the credential appears, or it is
-# not reading anything.
-setup_status() { docker exec "$1" sh -c \
-  "curl -sS --max-time 20 -b /tmp/envjar http://127.0.0.1:3774/status"; }
-
+# T3 Code and "Not signed in" here. Ask each CLI instead. This container only
+# preinstalls Claude, which also proves the variable picks a subset, and that a
+# harness that is not installed reads as unknown rather than signed out.
 env_token_reads_as_signed_in() {
   docker rm -f "${NAME}-env" >/dev/null 2>&1 || true
-  docker run -d --name "${NAME}-env" -e T3_SETUP_KEY=envkey \
+  docker run -d --name "${NAME}-env" -e T3_SETUP_KEY=envkey -e T3_PREINSTALL=claude \
     -e CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-smoke "$IMAGE" >/dev/null
   retry 25 "docker exec ${NAME}-env sh -c \"curl -sS --max-time 5 -c /tmp/envjar \
     -d 'key=envkey' -o /dev/null http://127.0.0.1:3774/login && \
     curl -fsS --max-time 20 -b /tmp/envjar http://127.0.0.1:3774/status | grep -q harnesses\"" || return 1
-  setup_status "${NAME}-env" | python3 -c '
+  for _ in $(seq 1 60); do
+    [ "$(status_json "${NAME}-env" /tmp/envjar | jq -r '.setup.state // ""' 2>/dev/null)" = finished ] && break
+    sleep 4
+  done
+  retry 10 claude_reads_signed_in_from_env
+}
+claude_reads_signed_in_from_env() {
+  status_json "${NAME}-env" /tmp/envjar | python3 -c '
 import json, sys
-h = {a["id"]: a for a in json.load(sys.stdin)["harnesses"]}
-sys.exit(0 if h["claude"]["signedIn"] is True else 1)'
+s = json.load(sys.stdin)
+h = {a["id"]: a for a in s["harnesses"]}
+only_claude = [i["id"] for i in s["setup"]["items"]] == ["claude"]
+others_unknown = all(h[i]["signedIn"] is None and not h[i]["installed"] for i in ("codex", "grok", "cursor"))
+sys.exit(0 if h["claude"]["signedIn"] is True and only_claude and others_unknown else 1)'
 }
 check "an env-var Claude credential reads as signed in" env_token_reads_as_signed_in
 docker rm -f "${NAME}-env" >/dev/null 2>&1 || true
@@ -347,8 +532,7 @@ docker rm -f "${NAME}-env" >/dev/null 2>&1 || true
 # "not signed in" straight after a key is stored, which is exactly when someone
 # is looking at the panel.
 key_flips_signed_in() {
-  docker exec "$NAME" sh -c \
-    "curl -sS --max-time 20 -b /tmp/jar http://127.0.0.1:3774/status" | python3 -c '
+  status_json | python3 -c '
 import json, sys
 h = {a["id"]: a for a in json.load(sys.stdin)["harnesses"]}
 sys.exit(0 if h["codex"]["signedIn"] is True and h["claude"]["signedIn"] is False else 1)'
@@ -358,16 +542,105 @@ check "a stored key flips the panel without waiting for a cache" key_flips_signe
 # Grok has no status command, and its credentials file proves nothing - a file
 # of exactly the shape its own help text documents still leaves the CLI saying
 # "You are not authenticated". So the reading comes from `grok models`, the way
-# T3 Code does it, and a fresh container must read as a definite no rather than
-# the "not readable" this used to show.
+# T3 Code does it, and a fresh container must read as a definite no.
 grok_reads_definitely() {
-  docker exec "$NAME" sh -c \
-    "curl -sS --max-time 25 -b /tmp/jar http://127.0.0.1:3774/status" | python3 -c '
+  status_json | python3 -c '
 import json, sys
 h = {a["id"]: a for a in json.load(sys.stdin)["harnesses"]}
 sys.exit(0 if h["grok"]["signedIn"] is False and h["cursor"]["signedIn"] is False else 1)'
 }
 check "Grok and Cursor report a definite sign-in state" grok_reads_definitely
+
+session_state() {
+  docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$1'"
+}
+signin_id() {
+  auth_post "{\"agent\":\"$1\"}" /auth/signin | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'
+}
+
+# Claude renders its URL as an OSC-8 hyperlink wrapped over several lines;
+# scraping the visible text yields a truncated URL missing the PKCE challenge
+# and state, which would send you to a sign-in page that cannot complete.
+claude_url_complete() {
+  local id
+  id="$(signin_id claude)"
+  [ -n "$id" ] || return 1
+  sleep 14
+  session_state "$id" | grep -q 'code_challenge' &&
+  session_state "$id" | grep -q '"state":"awaiting-code"'
+}
+check "Claude sign-in captures a complete OAuth URL" claude_url_complete
+
+# Capturing the URL is half the flow; the code has to get back in. That prompt
+# runs the terminal in raw mode, where Enter arrives as CR - an LF is taken as
+# part of the pasted text and the prompt just sits there, which is what left the
+# panel saying "Submitting" for ever. A rejected code is the only exchange that
+# can be driven without an account, and it proves the same thing: the CLI read
+# the line, tried it, and answered. Stuck on "submitted" means it never did.
+claude_code_reaches_the_prompt() {
+  local id state
+  id="$(signin_id claude)"
+  [ -n "$id" ] || return 1
+  sleep 14
+  auth_post "{\"id\":\"$id\",\"code\":\"bogusCode123#bogusState456\"}" /auth/code >/dev/null
+  state=submitted
+  for _ in $(seq 1 20); do
+    state="$(session_state "$id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+    [ "$state" != "submitted" ] && break
+    sleep 2
+  done
+  # And the verdict has to stick. The child is killed once its output says the
+  # code was rejected, and `script` reports that kill as a clean exit, which
+  # flipped the session to "done" a moment later. Re-read after it settles.
+  sleep 6
+  state="$(session_state "$id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+  [ "$state" = "failed" ]
+}
+check "a pasted code reaches the Claude prompt" claude_code_reaches_the_prompt
+
+# Completion is "this agent is signed in now", not "the CLI exited": these are
+# terminal UIs, and one that prints its result and stays up is not a failure.
+# Codex is the one whose state can be flipped from outside mid-flow, so use it
+# - signed out first, since only a transition counts.
+signin_finishes_on_transition() {
+  local id state
+  docker exec -u t3 "$NAME" sh -c 'rm -f ~/.codex/auth.json'
+  id="$(signin_id codex)"
+  [ -n "$id" ] || return 1
+  sleep 12
+  auth_post '{"agent":"codex","key":"sk-smoke-transition"}' /auth/apikey | grep -q '"ok":true' || return 1
+  for _ in $(seq 1 10); do
+    state="$(session_state "$id" | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
+    [ "$state" = "done" ] && return 0
+    sleep 3
+  done
+  return 1
+}
+check "a sign-in finishes when the agent becomes signed in" signin_finishes_on_transition
+
+# Codex's default login starts a callback server on localhost:1455, which is
+# unreachable from a browser on any other machine. Any sign-in URL naming
+# localhost is broken by construction for a remote server.
+codex_device_not_localhost() {
+  local id session
+  docker exec -u t3 "$NAME" sh -c 'rm -f ~/.codex/auth.json'
+  id="$(signin_id codex)"
+  [ -n "$id" ] || return 1
+  sleep 13
+  session="$(session_state "$id")"
+  printf '%s' "$session" | grep -q 'auth.openai.com/codex/device' &&
+  ! printf '%s' "$session" | grep -q localhost
+}
+check "Codex signs in by device code, not a localhost callback" codex_device_not_localhost
+
+grok_device_code() {
+  local id
+  id="$(signin_id grok)"
+  [ -n "$id" ] || return 1
+  sleep 12
+  session_state "$id" | grep -q 'accounts.x.ai'
+}
+check "Grok sign-in captures a device URL" grok_device_code
 
 # OpenCode takes a key per provider and there are over two hundred of them, so
 # the page offers the models.dev catalog rather than asking you to recall an id.
@@ -385,110 +658,52 @@ sys.exit(0 if ok and all(rx.match(i) for i in ids) else 1)'
 }
 check "the provider picker offers a catalog the server accepts" provider_catalog
 
-# Claude renders its URL as an OSC-8 hyperlink wrapped over several lines;
-# scraping the visible text yields a truncated URL missing the PKCE challenge
-# and state, which would send you to a sign-in page that cannot complete.
-claude_url_complete() {
-  local id
-  id="$(auth_post '{"agent":"claude"}' /auth/signin | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-  [ -n "$id" ] || return 1
-  sleep 14
-  docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'" \
-    | grep -q 'code_challenge' &&
-  docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'" \
-    | grep -q '"state":"awaiting-code"'
+# The page's lifecycle buttons, driven the way the page drives them. An install
+# answers as soon as it holds the lock (202) and finishes in the background, so
+# a slow download cannot outlive the request behind a tunnel; the page learns
+# the result from /status.
+printf '\nAgent lifecycle from the page\n'
+lifecycle_post() {
+  docker exec "$NAME" sh -c "curl -sS -o /tmp/lifecycle.json -w '%{http_code}' -b /tmp/jar \
+    -H 'content-type: application/json' -d '{\"id\":\"$2\"}' http://127.0.0.1:3774/harnesses/$1"
 }
-check "Claude sign-in captures a complete OAuth URL" claude_url_complete
-
-# Capturing the URL is half the flow; the code has to get back in. That prompt
-# runs the terminal in raw mode, where Enter arrives as CR - an LF is taken as
-# part of the pasted text and the prompt just sits there, which is what left the
-# panel saying "Submitting" for ever. A rejected code is the only exchange that
-# can be driven without an account, and it proves the same thing: the CLI read
-# the line, tried it, and answered. Stuck on "submitted" means it never did.
-claude_code_reaches_the_prompt() {
-  local id state
-  id="$(auth_post '{"agent":"claude"}' /auth/signin | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-  [ -n "$id" ] || return 1
-  sleep 14
-  auth_post "{\"id\":\"$id\",\"code\":\"bogusCode123#bogusState456\"}" /auth/code >/dev/null
-  state=submitted
-  for _ in $(seq 1 20); do
-    state="$(docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'" \
-      | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
-    [ "$state" != "submitted" ] && break
+operation_result() {
+  local state=""
+  for _ in $(seq 1 90); do
+    state="$(status_json | jq -r ".operations[\"harness:$1\"].state // \"\"")"
+    [ "$state" = running ] || [ -z "$state" ] || break
     sleep 2
   done
-  # And the verdict has to stick. The child is killed once its output says the
-  # code was rejected, and `script` reports that kill as a clean exit, which
-  # flipped the session to "done" a moment later - telling someone they were
-  # signed in when they had just been turned away. Re-read after it settles.
-  sleep 6
-  state="$(docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'" \
-    | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
-  [ "$state" = "failed" ]
+  [ "$state" = ok ]
 }
-check "a pasted code reaches the Claude prompt" claude_code_reaches_the_prompt
-
-# Waiting for the CLI to exit was the wrong finish line. These are terminal UIs;
-# one that prints its result and stays up is not a failure, but it left the
-# panel on "Submitting" for ever. Completion is "this agent is signed in now",
-# so prove a session notices that with the process still running. Codex is the
-# one whose state can be flipped from outside mid-flow, so use it - signed out
-# first, since only a transition counts.
-signin_finishes_on_transition() {
-  local id state
-  docker exec -u t3 "$NAME" sh -c 'rm -f ~/.codex/auth.json'
-  id="$(auth_post '{"agent":"codex"}' /auth/signin | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-  [ -n "$id" ] || return 1
-  sleep 12
-  auth_post '{"agent":"codex","key":"sk-smoke-transition"}' /auth/apikey | grep -q '"ok":true' || return 1
-  for _ in $(seq 1 10); do
-    state="$(docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'" \
-      | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')"
-    [ "$state" = "done" ] && return 0
-    sleep 3
-  done
-  return 1
+grok_binary_path() {
+  docker exec -u t3 "$NAME" cat /home/t3/.t3/userdata/settings.json | jq -r '.providers.grok.binaryPath // ""'
 }
-check "a sign-in finishes when the agent becomes signed in" signin_finishes_on_transition
 
-# Codex's default login starts a callback server on localhost:1455, which is
-# unreachable from a browser on any other machine - the redirect lands on the
-# user's own localhost. Any sign-in URL naming localhost is broken by
-# construction for a remote server, so assert against the whole class.
-codex_device_not_localhost() {
-  local id session
-  id="$(auth_post '{"agent":"codex"}' /auth/signin | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-  [ -n "$id" ] || return 1
-  sleep 13
-  session="$(docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'")"
-  printf '%s' "$session" | grep -q 'auth.openai.com/codex/device' &&
-  ! printf '%s' "$session" | grep -q localhost
+uninstall_retracts_t3_wiring() {
+  local code
+  code="$(lifecycle_post uninstall grok)"
+  { [ "$code" = 200 ] || { [ "$code" = 202 ] && operation_result grok; }; } || return 1
+  [ -z "$(grok_binary_path)" ] &&
+  status_json | jq -e '.harnesses[] | select(.id == "grok") | .installed == false' >/dev/null
 }
-check "Codex signs in by device code, not a localhost callback" codex_device_not_localhost
+check "uninstall from the page removes the agent and T3's path to it" uninstall_retracts_t3_wiring
 
-grok_device_code() {
-  local id
-  id="$(auth_post '{"agent":"grok"}' /auth/signin | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
-  [ -n "$id" ] || return 1
-  sleep 12
-  docker exec "$NAME" sh -c "curl -sS -b /tmp/jar 'http://127.0.0.1:3774/auth/session?id=$id'" \
-    | grep -q 'accounts.x.ai'
+install_answers_then_finishes() {
+  local code
+  code="$(lifecycle_post install grok)"
+  [ "$code" = 202 ] || return 1
+  operation_result grok &&
+  status_json | jq -e '.harnesses[] | select(.id == "grok") | .runnable' >/dev/null &&
+  case "$(grok_binary_path)" in /home/t3/.local/share/mise/installs/grok/*) true ;; *) false ;; esac
 }
-check "Grok sign-in captures a device URL" grok_device_code
+check "install from the page answers at once and finishes in the background" install_answers_then_finishes
 
-# The page's script is built inside a template literal, so an escape can be
-# eaten on the way out and leave the browser with JavaScript that does not
-# parse - which looks like a page that simply never loads its data. Written as
-# a function rather than an eval string: the nested quoting this needs is
-# exactly the kind that dies inside eval, taking the whole run with it.
 # The client script used to be embedded in a template literal in server.mjs,
 # which quietly ate escapes on the way out: `/\s+/` reached the browser as
-# `/s+/` and split agent names on the letter s, and an apostrophe once
-# terminated a string mid-sentence. Neither is a syntax error in the result, so
-# parsing it proves nothing. The invariant worth asserting is stronger and
-# simpler: what the browser receives is byte-for-byte the file on disk.
+# `/s+/` and split agent names on the letter s. That is not a syntax error in
+# the result, so parsing it proves nothing; assert instead that what the
+# browser receives is byte-for-byte the file on disk.
 client_script_is_verbatim() {
   PAGE_HTML="$(mktemp)"; CLIENT_JS_COPY="$(mktemp)"
   docker exec "$NAME" sh -c \
@@ -516,10 +731,9 @@ check "T3 Code is pointed at the shipped binary" \
 
 cloudflared_matches_t3() {
   local want have
-  want="$(docker exec "$NAME" sh -c \
-    "grep -o 'cloudflared/releases/download/[0-9.]*' $T3_BUNDLE | head -1" 2>/dev/null \
-    | sed 's|.*/||')"
-  [ -n "$want" ] || return 0
+  # The binary distribution has no greppable server bundle, so the Dockerfile
+  # pin is the compatibility assertion.
+  want="$(grep -m1 '^ARG CLOUDFLARED_VERSION=' Dockerfile | cut -d= -f2)"
   have="$(docker exec "$NAME" cloudflared --version 2>/dev/null | awk '{print $3}')"
   CF_WANT="$want"; CF_HAVE="$have"
   [ "$want" = "$have" ]
@@ -586,17 +800,18 @@ check "cloudflared's own metrics port is not offered as a user port" \
   "docker exec $NAME t3-expose | grep -cq 'not published'"
 
 # Screenshots prove the page renders; they do not prove it is square. This
-# measures the rendered geometry - glyphs off centre in their box, a connector
-# that spans a line break, buttons in one group with different heights - across
-# the viewport matrix. Only the full image carries a browser to do it with.
+# measures the rendered geometry - glyphs off centre in their box, buttons in
+# one group with different heights - across the viewport matrix. Only the
+# browser variant carries a browser to do it with.
 console_layout_is_clean() {
-  docker exec "$NAME" test -x /usr/bin/chromium 2>/dev/null || return 0
+  [ "$HAS_BROWSER" -eq 1 ] || return 0
+  docker exec "$NAME" test -x /usr/bin/chromium 2>/dev/null || return 1
   docker cp scripts/ui-audit.js "$NAME:/tmp/ui-audit.js" >/dev/null 2>&1 || return 1
   docker exec \
-    -e NODE_PATH=/opt/npm-global/lib/node_modules/@playwright/mcp/node_modules \
+    -e NODE_PATH=/opt/t3-mcp/lib/node_modules/@playwright/mcp/node_modules \
     -e CHROME_PATH=/usr/bin/chromium \
     "$NAME" node /tmp/ui-audit.js "http://127.0.0.1:3774/" "$SETUP_KEY" \
-    >"${UI_AUDIT_LOG:-/dev/null}" 2>&1
+    >"$UI_AUDIT_LOG" 2>&1
 }
 check "the console has no layout defects" console_layout_is_clean
 
@@ -641,8 +856,19 @@ check "the page falls back to its own path when no mount is known" \
 mount_is_declared() { page_says_mount "http://127.0.0.1:3774/__setup"; }
 check "and tells the page which prefix it is under" mount_is_declared
 
+# Captured rather than piped into `grep -q`: the page is ~90 KB, and grep exits
+# at the first match, so curl is killed writing the rest and fails under
+# pipefail. It raced on amd64 and lost reliably under arm64 emulation.
+serves_page_under_prefix() {
+  local page
+  page="$(docker exec "$NAME" curl -fsS --max-time 5 http://127.0.0.1:3774/__setup)" || return 1
+  case "$page" in
+    *'<!doctype html>'*|*'<!DOCTYPE html>'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 check "serves the page under an unconfigured path prefix" \
-  "retry 5 \"docker exec $NAME curl -fsS --max-time 5 http://127.0.0.1:3774/__setup | grep -qi '<!doctype html>'\""
+  "retry 5 serves_page_under_prefix"
 check "and its routes work under that prefix" \
   "retry 5 \"docker exec $NAME sh -c \\\"curl -sS --max-time 5 -c /tmp/j2 -d 'key=$SETUP_KEY' -o /dev/null http://127.0.0.1:3774/__setup/login && curl -fsS --max-time 5 -b /tmp/j2 http://127.0.0.1:3774/__setup/status | grep -q publicUrl\\\"\""
 
@@ -656,7 +882,7 @@ rm -f "$SETUP_JAR"
 
 printf '\nStartup pairing link\n'
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
-docker run -d --name "${NAME}-boot" \
+docker run -d --name "${NAME}-boot" -e T3_PREINSTALL=none \
   -e "T3_PUBLIC_URL=${PUBLIC_URL}" \
   -e T3_PRINT_PAIRING_ON_START=1 \
   "$IMAGE" >/dev/null
@@ -678,4 +904,9 @@ fi
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
 
 printf '\n%d passed, %d failed\n\n' "$pass" "$fail"
+if [ "$fail" -gt 0 ] && [ -s "$UI_AUDIT_LOG" ]; then
+  printf 'Console layout audit output:\n'
+  sed 's/^/  /' "$UI_AUDIT_LOG"
+  printf '\n'
+fi
 [ "$fail" -eq 0 ]

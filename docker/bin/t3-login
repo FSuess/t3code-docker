@@ -7,11 +7,26 @@
 # it as root can leave root-owned files (SQLite's -wal and -shm among them)
 # that the server, running as t3, then cannot write.
 # This runs the login as t3 so everything lands where the server expects it.
+#
+# When a harness has been installed through the harness manager, the login runs
+# that exact mise-managed executable - the same one T3 launches - so credentials
+# land in the home the managed harness reads.
 set -euo pipefail
+
+# T3 runs through the immutable image infrastructure, never a PATH resolution.
+: "${T3_INFRA_LAUNCHER:=/usr/local/bin/t3-admin}"
+: "${T3_INFRA_NODE:=/usr/local/bin/node}"
+# Provider integration resolver.
+: "${T3_PROVIDER_CLI:=/opt/t3-provider/cli.mjs}"
 
 if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
   exec gosu t3 "$0" "$@"
 fi
+
+# Managed harnesses live in the persistent user tool environment. Source it so
+# the resolver inside the module sees the same MISE_* paths the server does.
+# shellcheck source=/dev/null
+[ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
 
 usage() {
   cat <<'USAGE'
@@ -20,12 +35,16 @@ Usage: t3-login <harness>
   claude     Claude Code        -> claude auth login
   codex      Codex              -> codex login
   opencode   OpenCode           -> opencode auth login
-  cursor     Cursor CLI         -> agent login
+  cursor     Cursor CLI         -> cursor-agent login
   grok       Grok Build         -> grok login
   connect    T3 Connect         -> t3 connect
 
 Run this with a TTY:  docker compose exec -it t3code t3-login claude
 Then enable the provider in T3 Code under Settings > Providers.
+
+Each agent signs in with its managed executable. The first start installs
+them in the background; if one is not there yet, wait for it (the setup page
+shows progress) or run `t3-harness install <id>`.
 
 `connect` authorizes this environment for T3 Connect. It does not start or
 disturb the running server - the link takes effect on the next start, so
@@ -33,22 +52,41 @@ restart the container afterwards.
 USAGE
 }
 
+# The managed executable for a harness when one is runnable.
+harness_exec() { # id
+  local managed=""
+  if [ -r "$T3_PROVIDER_CLI" ] && [ -x "$T3_INFRA_NODE" ]; then
+    managed="$("$T3_INFRA_NODE" "$T3_PROVIDER_CLI" resolve "$1" 2>/dev/null || true)"
+  fi
+  if [ -n "$managed" ] && [ -x "$managed" ]; then
+    printf '%s' "$managed"
+    return 0
+  fi
+  return 0
+}
+
 harness="${1:-}"
 case "$harness" in
-  claude)   cmd=(claude auth login) ;;
-  codex)    cmd=(codex login) ;;
-  opencode) cmd=(opencode auth login) ;;
-  cursor)   cmd=(agent login) ;;
-  grok)     cmd=(grok login) ;;
-  connect)  cmd=(t3 connect) ;;
+  claude|codex|opencode|cursor|grok)
+    case "$harness" in
+      claude)   bin="$(harness_exec claude)";     args=(auth login) ;;
+      codex)    bin="$(harness_exec codex)";       args=(login) ;;
+      opencode) bin="$(harness_exec opencode)"; args=(auth login) ;;
+      # cursor-agent is canonical; the native installer's `agent` alias is
+      # never relied on.
+      cursor)   bin="$(harness_exec cursor)"; args=(login) ;;
+      grok)     bin="$(harness_exec grok)";         args=(login) ;;
+    esac
+    if [ -z "$bin" ]; then
+      echo "t3-login: $harness is not installed; install it with t3-harness install $harness" >&2
+      exit 1
+    fi
+    cmd=("$bin" "${args[@]}")
+    ;;
+  connect)  cmd=("$T3_INFRA_LAUNCHER" connect) ;;
   -h|--help|"") usage; [ -n "$harness" ] && exit 0 || exit 2 ;;
   *) printf 't3-login: unknown harness %s\n\n' "$harness" >&2; usage >&2; exit 2 ;;
 esac
-
-if ! command -v "${cmd[0]}" >/dev/null 2>&1; then
-  echo "t3-login: ${cmd[0]} is not installed in this image" >&2
-  exit 1
-fi
 
 if [ ! -t 0 ]; then
   echo "t3-login: no TTY. Re-run with: docker compose exec -it t3code t3-login $harness" >&2

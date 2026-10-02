@@ -1,14 +1,34 @@
 #!/usr/bin/env bash
-# Report what this container has, what is authenticated, and whether the
-# server is answering. Safe to run at any time; changes nothing.
+# Report what this container has, what is authenticated, whether the server is
+# answering, and how durable the mounts holding all of it are. Safe to run at
+# any time; it creates no root-owned state (mise may initialise user-owned state
+# under the home, which is where installed tools are supposed to live).
 set -uo pipefail
+
+# T3 runs through the immutable image infrastructure, never a PATH resolution.
+: "${T3_INFRA_LAUNCHER:=/usr/local/bin/t3-admin}"
 
 # `docker exec` lands as root (the image sets no USER so the entrypoint can
 # remap uids). Step down so nothing here leaves root-owned files in the
-# state directory.
+# state directory. gosu also sets HOME to /home/t3, which the mise paths below
+# depend on.
 if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
   exec gosu t3 "$0" "$@"
 fi
+
+# The persistent mise paths, matching docker/user-env.sh. `docker exec` does not
+# run the profile hook that normally exports them, so default them here for the
+# probe. mise resolves to the same paths by itself; naming them explicitly is
+# what makes the doctor report useful.
+: "${MISE_CONFIG_DIR:=$HOME/.config/mise}"
+: "${MISE_DATA_DIR:=$HOME/.local/share/mise}"
+: "${MISE_STATE_DIR:=$HOME/.local/state/mise}"
+: "${MISE_CACHE_DIR:=$HOME/.cache/mise}"
+export MISE_CONFIG_DIR MISE_DATA_DIR MISE_STATE_DIR MISE_CACHE_DIR
+# The same PATH the server and its terminals have: mise shims and the user's
+# npm prefix. Without it every toolchain reads as missing from `docker exec`.
+# shellcheck source=/dev/null
+[ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
 
 ok()   { printf '  \033[32m%-22s\033[0m %s\n' "$1" "${2:-}"; }
 bad()  { printf '  \033[31m%-22s\033[0m %s\n' "$1" "${2:-}"; }
@@ -26,8 +46,70 @@ version_of() {
   ok "$bin" "${out:-installed}"
 }
 
+# Field 4 of mountinfo is the mount's source and field 5 its mount point. The
+# source is the only way from inside a container to tell a bind mount from a
+# named volume from an anonymous one; that distinction is the whole point,
+# because the image declares VOLUME /home/t3 and an anonymous volume looks
+# persistent from the inside while being replaced on recreate.
+covering_mount() {
+  awk -v path="$1" '
+    $5 == "/" { next }
+    path == $5 || index(path, $5 "/") == 1 {
+      if (length($5) > length(point)) { point = $5; root = $4 }
+    }
+    END { if (point != "") print point "\t" root }
+  ' /proc/self/mountinfo
+}
+
+# path -> "<point>\t<durable|anonymous|none>\t<description>"
+mount_verdict() {
+  local line point root name
+  line="$(covering_mount "$1")"
+  if [ -z "$line" ]; then
+    printf '\t%s\t%s\n' none "not on a mount; nothing here survives this container"
+    return
+  fi
+  point="${line%%	*}"
+  root="${line##*	}"
+  case "$root" in
+    # A named or anonymous volume, however the daemon's data root is prefixed
+    # (a btrfs subvolume data root reports sources as /@/var/lib/docker/...).
+    */var/lib/docker/volumes/*/_data)
+      name="${root##*/var/lib/docker/volumes/}"
+      name="${name%%/*}"
+      if printf '%s' "$name" | grep -qE '^[0-9a-f]{64}$'; then
+        printf '%s\t%s\t%s\n' "$point" anonymous \
+          "anonymous volume at ${point}; recreated containers get a new one"
+      else
+        printf '%s\t%s\t%s\n' "$point" durable \
+          "named volume '${name}' at ${point}"
+      fi
+      ;;
+    *)
+      printf '%s\t%s\t%s\n' "$point" durable "host path ${root} at ${point}"
+      ;;
+  esac
+}
+
+mise_installed_tools() {
+  mise -C "$HOME" ls --installed --json 2>/dev/null \
+    | jq -r '[to_entries[] | "\(.key) \(.value[0].version)"] | join(", ")' 2>/dev/null
+}
+
+# Print one durability verdict and leave the kind in MOUNT_KIND for the caller.
+report_mount() {
+  local v
+  v="$(mount_verdict "$1")"
+  MOUNT_KIND="$(printf '%s' "$v" | cut -f2)"
+  case "$MOUNT_KIND" in
+    durable)   ok "$2" "$(printf '%s' "$v" | cut -f3)" ;;
+    anonymous) warn "$2" "$(printf '%s' "$v" | cut -f3)" ;;
+    *)         bad "$2" "$(printf '%s' "$v" | cut -f3)" ;;
+  esac
+}
+
 head_ "T3 Code"
-version_of t3 t3 --version
+version_of t3 "$T3_INFRA_LAUNCHER" --version
 printf '  %-22s %s\n' "state dir" "${T3CODE_HOME:-unset}"
 printf '  %-22s %s\n' "bind" "${T3CODE_HOST:-unset}:${T3CODE_PORT:-unset}"
 printf '  %-22s %s\n' "public URL" "${T3_PUBLIC_URL:-<unset - t3-pair will warn>}"
@@ -45,11 +127,35 @@ else
 fi
 
 head_ "Harnesses"
-version_of claude claude --version
-version_of codex codex --version
-version_of opencode opencode --version
-version_of grok grok --version
-version_of cursor-agent cursor-agent --version
+# The manager's own answer: exact version and whether T3 can run it. Cursor in
+# particular has no shim on PATH (its package would shadow node), so asking
+# PATH would say it is missing when it is installed.
+declare -A runnable=()
+harness_rows="$(t3-harness list 2>/dev/null || true)"
+if [ -z "$harness_rows" ]; then
+  bad "manager" "t3-harness list returned nothing"
+fi
+while IFS=$'\t' read -r id version state; do
+  [ -n "$id" ] || continue
+  case "$state" in
+    runnable*) ok "$id" "$version"; runnable[$id]=1 ;;
+    *"…")      warn "$id" "$state" ;;
+    "not installed") warn "$id" "not installed (setup page, or: t3-harness install $id)" ;;
+    *)         bad "$id" "$version $state" ;;
+  esac
+done <<< "$harness_rows"
+
+preinstall_file="$MISE_STATE_DIR/t3-preinstall.json"
+if [ -r "$preinstall_file" ]; then
+  setup_state="$(jq -r '.run.state // "idle"' "$preinstall_file" 2>/dev/null)"
+  setup_failed="$(jq -r '[.items | to_entries[] | select(.value.state == "failed") | .key] | join(", ")' \
+    "$preinstall_file" 2>/dev/null)"
+  if [ -n "$setup_failed" ]; then
+    warn "first-start setup" "$setup_state; failed: $setup_failed (retried on the next start)"
+  else
+    ok "first-start setup" "$setup_state (T3_PREINSTALL=${T3_PREINSTALL:-all})"
+  fi
+fi
 
 head_ "Harness sign-in"
 # Only some harnesses keep a credential file we can point at; for the rest
@@ -63,10 +169,10 @@ cred codex    "$HOME/.codex/auth.json"
 cred opencode "$HOME/.local/share/opencode/auth.json"
 for h in cursor grok; do
   case "$h" in
-    cursor) dir="$HOME/.cursor"; bin=cursor-agent ;;
-    grok)   dir="$HOME/.grok";   bin=grok ;;
+    cursor) dir="$HOME/.cursor" ;;
+    grok)   dir="$HOME/.grok" ;;
   esac
-  if ! command -v "$bin" >/dev/null 2>&1; then
+  if [ -z "${runnable[$h]:-}" ]; then
     warn "$h" "not installed"
   elif [ -d "$dir" ]; then
     printf '  %-22s %s\n' "$h" "config dir present (sign-in state not readable)"
@@ -92,6 +198,60 @@ version_of cmake cmake --version
 version_of ffmpeg ffmpeg -version
 version_of gh gh --version
 
+head_ "Toolchains (mise)"
+version_of mise mise --version
+printf '  %-22s %s\n' "config dir" "$MISE_CONFIG_DIR"
+printf '  %-22s %s\n' "data dir" "$MISE_DATA_DIR"
+printf '  %-22s %s\n' "state dir" "$MISE_STATE_DIR"
+printf '  %-22s %s\n' "cache dir" "$MISE_CACHE_DIR"
+
+# What mise resolves from the home directory, not a second guess at the config
+# precedence. -C $HOME keeps project configs out of it whichever directory the
+# doctor happened to be run from.
+active_config="$(mise -C "$HOME" config ls --json 2>/dev/null || true)"
+if [ -n "$active_config" ]; then
+  printf '  %-22s\n' "active config"
+  printf '%s' "$active_config" | jq -r \
+    '.[] | "    " + .path + (if (.tools | length) > 0 then "  [" + (.tools | join(", ")) + "]" else "" end)' \
+    2>/dev/null || printf '    %s\n' "(unreadable)"
+else
+  warn "active config" "mise could not report its config"
+fi
+printf '  %-22s auto_install=%s not_found_system_fallback=%s pin=%s\n' "policy" \
+  "$(mise -C "$HOME" settings get auto_install 2>/dev/null || echo '?')" \
+  "$(mise -C "$HOME" settings get not_found_system_fallback 2>/dev/null || echo '?')" \
+  "$(mise -C "$HOME" settings get pin 2>/dev/null || echo '?')"
+installed_tools="$(mise_installed_tools)"
+printf '  %-22s %s\n' "installed tools" "${installed_tools:-none}"
+printf '  %s\n' "(explicit project execution: mise exec -- <command>)"
+
+head_ "Ownership"
+migration_marker="${T3CODE_HOME:-$HOME/.t3}/.ownership-migration"
+if [ -f "$migration_marker" ]; then
+  target="$(sed -n 's/^target_uid=/uid=/p; s/^target_gid=/gid=/p' \
+    "$migration_marker" 2>/dev/null | paste -sd ' ' -)"
+  warn "migration" "pending${target:+ ($target)}; the next container start retries"
+  printf '  %-22s %s\n' "" "$migration_marker"
+else
+  ok "migration" "complete"
+fi
+
+# What the mounts look like right now. The verdict is observed, not promised:
+# whether the next container reuses a volume is a property of how it is run, not
+# of this one. A state-only mount keeps threads and credentials but not the
+# installed tools, which live under /home/t3/.local/share/mise.
+head_ "Persistence (observed now)"
+report_mount "$MISE_DATA_DIR" "tools & mise"
+tools_kind="$MOUNT_KIND"
+report_mount "${T3CODE_HOME:-$HOME/.t3}" "T3 state"
+report_mount "${T3_WORKSPACE:-/workspace}" "workspace"
+if [ "$tools_kind" != durable ]; then
+  warn "durable tools" "need a durable mount covering /home/t3; a state-only"
+  printf '  %-22s %s\n' "" "mount loses installed tools and harnesses on recreate"
+fi
+printf '  %s\n' \
+  "Observed at this start only; the next container can mount something else."
+
 head_ "Browser"
 if command -v chromium >/dev/null 2>&1; then
   ok chromium "$(chromium --version 2>/dev/null | head -1)"
@@ -102,7 +262,7 @@ if command -v chromium >/dev/null 2>&1; then
     bad "headless render" "chromium could not render a page"
   fi
 else
-  warn chromium "not installed (slim image)"
+  warn chromium "not installed (this is the core image; use the browser target)"
 fi
 version_of chrome-devtools-mcp chrome-devtools-mcp --version
 version_of playwright-mcp playwright-mcp --version

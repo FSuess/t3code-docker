@@ -345,38 +345,308 @@ if ($('mint')) {
   };
 
   // ------------------------------------------------------------ agents --
+  // The Agents and Toolchains cards are thin surfaces over the shared harness
+  // manager (via /status): exact versions, runnable state, the operation in
+  // flight, and how the last one ended. Lifecycle POSTs answer as soon as the
+  // work holds the lock and finish in the background, so a click is tracked
+  // here by key ("harness:claude", "toolchain:rust") until /status says how
+  // it ended.
+  const versionDrafts = new Map();
+  const lifecycleBusy = new Set();   // POST in flight
+  const pendingOps = new Map();      // accepted (202), waiting on /status
+  const notices = new Map();         // last error or warning per key: {text, tone}
+  let lastStatus = null;             // the last /status, to redraw a row at once
+  const DONE = { install: 'Installed', update: 'Updated', uninstall: 'Uninstalled' };
+  const WORKING = { install: 'Installing…', update: 'Updating…', uninstall: 'Removing…' };
+
+  const setupItem = (s, kind, id) =>
+    ((s.setup && s.setup.items) || []).find((i) => i.kind === kind && i.id === id) || null;
+  const queued = (s, kind, id) => {
+    const item = setupItem(s, kind, id);
+    return Boolean(s.setup && s.setup.state === 'running' && item && item.state === 'pending');
+  };
+  const runningOp = (s, key) => {
+    const op = (s.operations || {})[key];
+    return op && op.state === 'running' ? op.kind : null;
+  };
+  const isBusy = (s, key, facts) =>
+    lifecycleBusy.has(key) || pendingOps.has(key) || Boolean(runningOp(s, key)) || Boolean(facts.inProgress);
+
+  // A click accepted earlier has finished: say how, once.
+  const factsFor = (s, key) => {
+    const [target, id] = key.split(':');
+    const list = target === 'harness' ? s.harnesses : (s.toolchains || []);
+    return list.find((x) => x.id === id) || {};
+  };
+  const settleOperations = (s) => {
+    for (const [key, pending] of pendingOps) {
+      const op = (s.operations || {})[key];
+      if (!op) {
+        // The setup service restarted and forgot it. Once nothing is running
+        // for this row any more, stop waiting: the row shows where it ended.
+        if (Date.now() - pending.at > 10000 && !factsFor(s, key).inProgress) {
+          pendingOps.delete(key);
+          notices.set(key, { tone: 'warn', text: 'The setup service restarted during this '
+            + pending.kind + '; the row shows where it ended up.' });
+        }
+        continue;
+      }
+      if (op.state === 'running') continue;
+      pendingOps.delete(key);
+      if (op.state === 'ok') {
+        if (op.warning) notices.set(key, { tone: 'warn', text: op.warning });
+        else notices.delete(key);
+        toast(DONE[op.kind] + ' ' + pending.name, CHECK);
+      } else {
+        notices.set(key, { tone: 'err', text: op.error || ('Could not ' + op.kind + ' ' + pending.name) });
+      }
+    }
+  };
+  const noticeLine = (key) => {
+    const notice = notices.get(key);
+    return notice
+      ? '<span style="color:var(--' + (notice.tone === 'warn' ? 'warn' : 'err') + '-fg)">'
+        + esc(notice.text) + '</span>'
+      : '';
+  };
+  // Show the click as taken straight away, without waiting on /status.
+  const redrawRows = () => {
+    if (!lastStatus) return;
+    renderToolchains(lastStatus);
+    if (!panelActive) renderAgents(lastStatus);
+  };
+
+  const callLifecycle = async (target, kind, id, name) => {
+    const key = target + ':' + id;
+    const version = target === 'harness' ? (versionDrafts.get(id) ?? '').trim() : '';
+    notices.delete(key);
+    lifecycleBusy.add(key);
+    redrawRows();
+    try {
+      const res = await fetch(BASE + '/' + (target === 'harness' ? 'harnesses' : 'toolchains') + '/' + kind, {
+        method: 'POST', headers: {'content-type': 'application/json'},
+        body: JSON.stringify(version ? {id, version} : {id}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 202) {
+        pendingOps.set(key, { kind, name, at: Date.now() });
+        versionDrafts.delete(id);
+      } else if (!res.ok || data.ok === false) {
+        notices.set(key, { tone: 'err', text: data.error || ('Could not ' + kind + ' ' + name) });
+      } else {
+        versionDrafts.delete(id);
+        toast(DONE[kind] + ' ' + name, CHECK);
+      }
+    } catch (error) {
+      notices.set(key, { tone: 'err', text: String(error.message || error) });
+    } finally {
+      lifecycleBusy.delete(key);
+    }
+    load();
+  };
+
+  const confirmUninstall = (target, id, name) => confirmDialog({
+    title: 'Uninstall ' + name + '?',
+    body: target === 'harness'
+      ? 'The managed executable is removed. Credentials stay, so installing it again signs straight back in.'
+      : 'It is removed from the volume. A project that pins its own version still gets it from mise.',
+    confirmLabel: 'Uninstall',
+    onConfirm: () => callLifecycle(target, 'uninstall', id, name),
+  });
+
+  const agentChip = (s, h) => {
+    const key = 'harness:' + h.id;
+    const op = runningOp(s, key) || (pendingOps.get(key) || {}).kind || (h.inProgress ? h.operation : null);
+    if (op || lifecycleBusy.has(key)) return chip('info', WORKING[op] || 'Working…');
+    if (queued(s, 'agent', h.id)) return chip('idle', 'Queued');
+    if (!h.supported) return chip('idle', 'No build for this arch');
+    if (!h.installed) return h.failed ? chip('bad', 'Install failed') : chip('idle', 'Not installed');
+    if (h.runnable && h.signedIn === true) return chip('ok', 'Signed in');
+    if (h.runnable && h.signedIn === false) return chip('warn', 'Not signed in');
+    if (h.runnable) return chip('idle', 'Installed');
+    return chip('bad', 'Not runnable');
+  };
+
+  const failureLine = (facts) => {
+    if (!facts.failed || !facts.failure) return '';
+    // A failed update leaves the previous release in place; say which happened.
+    const text = facts.installed && facts.operation && facts.operation !== 'install'
+      ? 'Last ' + facts.operation + ' failed: ' + facts.failure
+      : facts.failure;
+    return '<span style="color:var(--err-fg)">' + esc(text.slice(0, 220)) + '</span>';
+  };
+
+  const agentMeta = (h) => {
+    const lines = [];
+    if (h.version) lines.push('<span class="tc-mono">' + esc(h.version) + '</span>');
+    const failure = failureLine(h);
+    if (failure) lines.push(failure);
+    const notice = noticeLine('harness:' + h.id);
+    if (notice) lines.push(notice);
+    // How each one authenticates, so a button press holds no surprises.
+    const how = h.canSignIn && h.canSetKey ? 'Browser sign-in, or a stored API key'
+      : h.canSignIn ? 'Browser sign-in'
+      : h.canSetKey ? 'API key, per provider' : '';
+    if (how && h.runnable) lines.push(esc(how));
+    return lines.length
+      ? '<div class="tc-row-meta">' + lines.join('<br>') + '</div>' : '';
+  };
+
   const renderAgents = (s) => {
+    settleOperations(s);
     const signed = s.harnesses.filter((h) => h.signedIn === true).length;
     $('agent-count').textContent = signed + ' of ' + s.harnesses.length + ' signed in';
+    // Preserve version drafts across the periodic re-render: without this the
+    // poll wipes an explicit version mid-typing.
+    for (const input of document.querySelectorAll('.hv-version')) {
+      if (input.dataset.agent) versionDrafts.set(input.dataset.agent, input.value);
+    }
     $('agents').innerHTML = s.harnesses.map((h) => {
-      const status = !h.installed ? chip('bad', 'Not installed')
-        : h.signedIn === true ? chip('ok', 'Signed in')
-        : h.signedIn === false ? chip('warn', 'Not signed in')
-        : chip('idle', 'Sign-in state not readable');
-      const actions = !h.installed ? ''
-        : (h.canSignIn
+      const busy = isBusy(s, 'harness:' + h.id, h) || queued(s, 'agent', h.id);
+      const draft = versionDrafts.get(h.id) ?? '';
+      const versionInput = '<input class="tc-input tc-input--mono tc-input--sm hv-version"'
+        + ' data-agent="' + h.id + '" placeholder="latest" aria-label="Version for ' + esc(h.name) + '"'
+        + ' value="' + esc(draft) + '" style="width:7.5rem" />';
+      let lifecycle = '';
+      if (busy) {
+        lifecycle = '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm" disabled'
+          + ' aria-label="Working"><span class="tc-spin"></span></button>';
+      } else if (!h.installed) {
+        lifecycle = versionInput
+          + '<button type="button" class="tc-btn tc-btn--primary tc-btn--sm h-install"'
+          + ' data-agent="' + h.id + '">' + (h.failed ? 'Retry' : 'Install') + '</button>';
+      } else {
+        lifecycle = versionInput
+          + '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm h-update"'
+          + ' data-agent="' + h.id + '">Update</button>'
+          + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm h-uninstall"'
+          + ' data-agent="' + h.id + '">Uninstall</button>';
+      }
+      const signin = h.runnable && !busy
+        ? (h.canSignIn
             ? '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm signin"'
               + ' data-agent="' + h.id + '">Sign in</button>' : '')
           + (h.canSetKey
             ? '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm setkey"'
-              + ' data-agent="' + h.id + '" data-kind="' + esc(h.keyKind) + '">API key</button>' : '');
-      // Saying how each one authenticates removes the guesswork about what a
-      // button is going to do before you press it.
-      const how = !h.installed ? 'Not present in this image'
-        : h.canSignIn && h.canSetKey ? 'Browser sign-in, or a stored API key'
-        : h.canSignIn ? 'Browser sign-in'
-        : h.canSetKey ? 'API key, per provider'
+              + ' data-agent="' + h.id + '" data-kind="' + esc(h.keyKind) + '">API key</button>' : '')
         : '';
       return '<div class="tc-row">'
         + '<span class="tc-tile' + (h.signedIn === true ? ' tc-tile--signed' : '')
         + '" style="--tile:var(--id-' + h.id + ')" aria-hidden="true">'
         + esc(initials(h.name)) + '</span>'
         + '<div class="tc-row-main"><div class="tc-row-nameline">'
-        + '<span class="tc-row-name">' + esc(h.name) + '</span>' + status + '</div>'
-        + (how ? '<div class="tc-row-meta">' + esc(how) + '</div>' : '') + '</div>'
-        + '<div class="tc-row-actions">' + actions + '</div>'
+        + '<span class="tc-row-name">' + esc(h.name) + '</span>' + agentChip(s, h) + '</div>'
+        + agentMeta(h) + '</div>'
+        + '<div class="tc-row-actions tc-row-actions--wrap">' + lifecycle + signin + '</div>'
         + '<div class="tc-row-panel" id="agent-' + h.id + '"></div></div>';
     }).join('');
+
+    const nameOf = (id) => (s.harnesses.find((h) => h.id === id) || {}).name || id;
+    for (const input of document.querySelectorAll('.hv-version')) {
+      input.oninput = () => versionDrafts.set(input.dataset.agent, input.value);
+      input.onkeydown = (e) => { if (e.key === 'Enter') e.preventDefault(); };
+    }
+    for (const b of document.querySelectorAll('.h-install')) {
+      b.onclick = () => callLifecycle('harness', 'install', b.dataset.agent, nameOf(b.dataset.agent));
+    }
+    for (const b of document.querySelectorAll('.h-update')) {
+      b.onclick = () => callLifecycle('harness', 'update', b.dataset.agent, nameOf(b.dataset.agent));
+    }
+    for (const b of document.querySelectorAll('.h-uninstall')) {
+      b.onclick = () => confirmUninstall('harness', b.dataset.agent, nameOf(b.dataset.agent));
+    }
+  };
+
+  // -------------------------------------------------------- toolchains --
+  const renderToolchains = (s) => {
+    settleOperations(s);
+    const list = s.toolchains || [];
+    const installed = list.filter((t) => t.installed).length;
+    $('toolchain-count').textContent = list.length ? installed + ' of ' + list.length + ' installed' : '';
+    if (!list.length) {
+      $('toolchains').innerHTML = '<div class="tc-row"><div class="tc-row-meta">'
+        + 'Toolchain state is not readable right now.</div></div>';
+      return;
+    }
+    $('toolchains').innerHTML = list.map((t) => {
+      const key = 'toolchain:' + t.id;
+      const op = runningOp(s, key) || (pendingOps.get(key) || {}).kind || (t.inProgress ? t.operation : null);
+      const waiting = queued(s, 'toolchain', t.id);
+      const busy = isBusy(s, key, t) || waiting;
+      const state = op || lifecycleBusy.has(key) ? chip('info', WORKING[op] || 'Working…')
+        : waiting ? chip('idle', 'Queued')
+        : t.installed ? chip('ok', 'Installed')
+        : t.failed ? chip('bad', 'Install failed') : chip('idle', 'Not installed');
+      const lines = [];
+      if (t.version) lines.push('<span class="tc-mono">' + esc(t.version) + '</span>');
+      const failure = failureLine(t);
+      if (failure) lines.push(failure);
+      const notice = noticeLine(key);
+      if (notice) lines.push(notice);
+      const actions = busy
+        ? '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm" disabled'
+          + ' aria-label="Working"><span class="tc-spin"></span></button>'
+        : t.installed
+          ? '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm t-update" data-tool="'
+            + t.id + '">Update</button>'
+            + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm t-uninstall" data-tool="'
+            + t.id + '">Uninstall</button>'
+          : '<button type="button" class="tc-btn tc-btn--primary tc-btn--sm t-install" data-tool="'
+            + t.id + '">' + (t.failed ? 'Retry' : 'Install') + '</button>';
+      return '<div class="tc-row">'
+        + '<span class="tc-tile" style="--tile:var(--id-toolchain)" aria-hidden="true">'
+        + esc(initials(t.name)) + '</span>'
+        + '<div class="tc-row-main"><div class="tc-row-nameline">'
+        + '<span class="tc-row-name">' + esc(t.name) + '</span>' + state + '</div>'
+        + (lines.length ? '<div class="tc-row-meta">' + lines.join('<br>') + '</div>' : '')
+        + '</div><div class="tc-row-actions tc-row-actions--wrap">' + actions + '</div></div>';
+    }).join('');
+
+    const nameOf = (id) => (list.find((t) => t.id === id) || {}).name || id;
+    for (const b of document.querySelectorAll('.t-install')) {
+      b.onclick = () => callLifecycle('toolchain', 'install', b.dataset.tool, nameOf(b.dataset.tool));
+    }
+    for (const b of document.querySelectorAll('.t-update')) {
+      b.onclick = () => callLifecycle('toolchain', 'update', b.dataset.tool, nameOf(b.dataset.tool));
+    }
+    for (const b of document.querySelectorAll('.t-uninstall')) {
+      b.onclick = () => confirmUninstall('toolchain', b.dataset.tool, nameOf(b.dataset.tool));
+    }
+  };
+
+  // ------------------------------------------------------------- setup --
+  // The first start installs everything T3_PREINSTALL names in the
+  // background. Say so at the top of the page while it runs, and afterwards
+  // only if something failed.
+  const renderSetup = (s) => {
+    const el = $('setup-progress');
+    if (!el) return;
+    const setup = s.setup;
+    const items = (setup && setup.items) || [];
+    if (!items.length) { el.innerHTML = ''; return; }
+    const done = items.filter((i) => i.state === 'done').length;
+    // After a finished run, anything still pending was not tried: the run
+    // stops after three failures in a row, which is nearly always no network.
+    const failed = items.filter((i) => i.state === 'failed'
+      || (setup.state === 'finished' && i.state === 'pending'));
+    if (setup.state === 'running') {
+      const current = items.find((i) => i.state === 'installing');
+      el.innerHTML = '<div class="tc-notice tc-notice--info"><span class="tc-spin" aria-hidden="true"></span>'
+        + '<div><strong>Setting up this container</strong> &mdash; '
+        + (current ? 'installing ' + esc(current.name) : 'checking what is already here')
+        + ' (' + done + ' of ' + items.length + ' done). Agents and toolchains install once,'
+        + ' onto the volume, and each one is ready below as soon as it finishes.</div></div>';
+    } else if (failed.length) {
+      el.innerHTML = '<div class="tc-notice tc-notice--warn"><div>Could not install '
+        + esc(failed.map((i) => i.name).join(', ')) + ' on first start'
+        + (failed[0].error ? ' (' + esc(failed[0].error.slice(0, 140)) + ')' : '')
+        + '. Press Retry on the row to try again now; the next restart retries as well.</div></div>';
+    } else if (setup.state === 'interrupted') {
+      el.innerHTML = '<div class="tc-notice tc-notice--quiet">First-start setup stopped part way'
+        + ' (' + done + ' of ' + items.length + ' done). It carries on the next time the container starts.</div>';
+    } else {
+      el.innerHTML = '';
+    }
   };
 
   // ----------------------------------------------------------- sessions --
@@ -597,12 +867,14 @@ if ($('mint')) {
   };
 
   // --------------------------------------------------------------- load --
+  let fastPoll = null;
   const load = async () => {
     let s;
     try {
       const res = await fetch(BASE + '/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
       s = await res.json();
+      lastStatus = s;
     } catch (error) {
       // Name the URL and the reason. "Could not read status" sent someone
       // hunting a migration bug when the page was calling the wrong path.
@@ -629,20 +901,38 @@ if ($('mint')) {
       : '<span class="tc-dot" style="background:var(--err-fg)"></span>Server down';
 
     // A part that could not be read says so, instead of rendering as "none".
+    // A stale harness answer says so too: the sign-in state below is the last
+    // definite verdict, not a fresh probe (offline the refresh exceeds its
+    // budget and warms the next poll instead). Never render it as current.
     const note = $('degraded');
     if (note) {
-      note.innerHTML = (s.degraded || []).length
+      const staleHarness = s.harnessCache && s.harnessCache.stale
+        && (s.harnessCache.source === 'cache' || s.harnessCache.source === 'cheap');
+      note.innerHTML = ((s.degraded || []).length
         ? '<div class="tc-notice tc-notice--warn">Could not read '
           + esc(s.degraded.map((d) => d.what).join(', '))
           + '. Shown below as empty; the container may still be starting.</div>'
-        : '';
+        : '')
+        + (staleHarness
+          ? '<div class="tc-notice tc-notice--quiet">Harness sign-in state is cached'
+            + ' while a fresh probe finishes — it refreshes on the next poll.</div>'
+          : '');
     }
 
     renderStrip(s);
     renderSessions(s);
     renderPairProgress(s);
     renderDetails(s);
+    renderSetup(s);
+    renderToolchains(s);
     if (!panelActive) renderAgents(s);
+
+    // Poll faster while something is installing, so a row flips to Installed
+    // within seconds of finishing rather than on the next 15 s tick.
+    const active = (s.setup && s.setup.state === 'running') || pendingOps.size > 0
+      || s.harnesses.some((h) => h.inProgress) || (s.toolchains || []).some((t) => t.inProgress);
+    clearTimeout(fastPoll);
+    if (active) fastPoll = setTimeout(load, 3000);
 
     for (const b of document.querySelectorAll('.revoke')) {
       b.onclick = () => confirmDialog({

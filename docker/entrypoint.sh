@@ -19,24 +19,64 @@ T3_HOME=/home/t3
 : "${T3_SETUP_ENABLED:=1}"
 : "${T3_SETUP_PORT:=3774}"
 : "${T3_PERSIST_AGENT_CREDENTIALS:=1}"
+: "${T3_PREINSTALL:=all}"
+# The image's own runtimes. T3 runs as the root-owned platform binary; setup
+# and repository JavaScript helpers run under the image Node. Neither resolves
+# `node` or `t3` through PATH. Overridable for tests.
+: "${T3_INFRA_NODE:=/usr/local/bin/node}"
+: "${T3_INFRA_BINARY:=/opt/t3/t3}"
+: "${T3_INFRA_LAUNCHER:=/usr/local/bin/t3-admin}"
+# Provider integration: maps the harness manager's selection onto T3's
+# per-provider `binaryPath`.
+: "${T3_PROVIDER_CLI:=/opt/t3-provider/cli.mjs}"
 export T3CODE_HOME T3CODE_HOST T3CODE_PORT T3_WORKSPACE T3_SETUP_PORT
+export T3_INFRA_NODE T3_INFRA_BINARY T3_INFRA_LAUNCHER T3_PROVIDER_CLI T3_PREINSTALL
+
+# Ownership migration is recorded here before anything else changes. The state
+# directory is the one path every deployment mounts, so a marker written there
+# survives the restart or recreate that must finish the migration.
+OWNERSHIP_MARKER="${T3CODE_HOME}/.ownership-migration"
+
+# This runs as root inside a directory the t3 user owns, so it must never open
+# a path t3 could have pointed somewhere else. mktemp creates a fresh file with
+# O_EXCL (a planted symlink makes it fail, not follow), and rename replaces the
+# marker's directory entry itself rather than writing through it.
+write_ownership_marker() {
+  local tmp
+  # The directory itself could be a link the t3 user planted; root writes
+  # nothing through it. The migration still runs, it is just not resumable.
+  if [ -L "$T3CODE_HOME" ]; then
+    log "WARNING: ${T3CODE_HOME} is a symlink; not recording migration intent there"
+    return 0
+  fi
+  tmp="$(mktemp "${OWNERSHIP_MARKER}.XXXXXX")"
+  {
+    printf 'version=1\n'
+    printf 'target_uid=%s\n' "$PUID"
+    printf 'target_gid=%s\n' "$PGID"
+    printf 'started=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$tmp"
+  chmod 0644 "$tmp"
+  mv -fT "$tmp" "$OWNERSHIP_MARKER"
+  log "recorded ownership migration intent (${OWNERSHIP_MARKER})"
+}
 
 # --- privileged half: fix uids, then re-exec as the unprivileged user --------
 if [ "$(id -u)" -eq 0 ]; then
   current_uid="$(id -u "$T3_USER")"
   current_gid="$(id -g "$T3_USER")"
-  remapped=0
+  remap=0
+  [ "$PGID" != "$current_gid" ] && remap=1
+  [ "$PUID" != "$current_uid" ] && remap=1
 
-  if [ "$PGID" != "$current_gid" ]; then
-    log "remapping group ${T3_USER}: ${current_gid} -> ${PGID}"
-    groupmod -o -g "$PGID" "$T3_USER"
-    remapped=1
-  fi
-  if [ "$PUID" != "$current_uid" ]; then
-    log "remapping user ${T3_USER}: ${current_uid} -> ${PUID}"
-    usermod -o -u "$PUID" "$T3_USER"
-    remapped=1
-  fi
+  # A marker left by an earlier start means that migration did not finish. It
+  # must be completed even when the account already carries the target ids and
+  # a top-level writability probe passes: the interruption may have left deep
+  # files owned by the old uid while the top directory already looks correct.
+  resumed=0
+  [ -f "$OWNERSHIP_MARKER" ] && resumed=1
+  [ "$resumed" -eq 1 ] && log "resuming an interrupted ownership migration"
+  pending="$resumed"
 
   mkdir -p "$T3CODE_HOME" "$T3_WORKSPACE"
 
@@ -45,13 +85,56 @@ if [ "$(id -u)" -eq 0 ]; then
   # directory's uid: a volume mounted directly at the state dir arrives
   # root-owned while its parent still looks perfectly correct, and the server
   # then dies on `mkdir userdata` with nothing but an EACCES stack trace.
+  need=0
+  [ "$remap" -eq 1 ] && need=1
+  [ "$resumed" -eq 1 ] && need=1
   for dir in "$T3_HOME" "$T3CODE_HOME"; do
     mkdir -p "$dir"
-    if [ "$remapped" -eq 1 ] || ! gosu "$T3_USER" test -w "$dir"; then
+    gosu "$T3_USER" test -w "$dir" || need=1
+  done
+
+  # Persist the intent before the first account or ownership change. `usermod`
+  # rewrites ownership inside the home itself, so a crash between it and the
+  # explicit traversal would otherwise leave a half-migrated tree that passes a
+  # later writability probe and is never repaired.
+  if [ "$need" -eq 1 ] && [ "$pending" -eq 0 ]; then
+    write_ownership_marker
+    pending=1
+  fi
+
+  if [ "$remap" -eq 1 ]; then
+    if [ "$PGID" != "$current_gid" ]; then
+      log "remapping group ${T3_USER}: ${current_gid} -> ${PGID}"
+      groupmod -o -g "$PGID" "$T3_USER"
+    fi
+    if [ "$PUID" != "$current_uid" ]; then
+      log "remapping user ${T3_USER}: ${current_uid} -> ${PUID}"
+      usermod -o -u "$PUID" "$T3_USER"
+    fi
+  fi
+
+  # A resumed migration traverses both trees: the previous attempt may have
+  # stopped anywhere between them. A fresh one only walks what is not writable.
+  for dir in "$T3_HOME" "$T3CODE_HOME"; do
+    mkdir -p "$dir"
+    if [ "$resumed" -eq 1 ] || [ "$remap" -eq 1 ] || ! gosu "$T3_USER" test -w "$dir"; then
       log "taking ownership of ${dir}"
       chown -R "$PUID:$PGID" "$dir"
     fi
   done
+
+  # Only a completed, verified traversal clears the marker. `set -e` above means
+  # a failed chown aborts with the marker still in place, so the next start
+  # retries instead of trusting a partially migrated tree.
+  if [ "$pending" -eq 1 ]; then
+    if gosu "$T3_USER" test -w "$T3_HOME" && gosu "$T3_USER" test -w "$T3CODE_HOME"; then
+      rm -f "$OWNERSHIP_MARKER"
+      log "ownership migration complete"
+    else
+      log "WARNING: ownership migration finished but a directory is still not"
+      log "         writable; leaving ${OWNERSHIP_MARKER} to retry."
+    fi
+  fi
 
   # /workspace is the user's own tree. Only adopt it when it is empty or
   # already root-owned; never rewrite ownership across somebody's repos.
@@ -92,10 +175,34 @@ if ! mkdir -p "$T3CODE_HOME" 2>/dev/null || [ ! -w "$T3CODE_HOME" ]; then
   exit 1
 fi
 
+# Establish the user-only tool environment before anything is launched, so the
+# server, the setup service and the terminals T3 opens all inherit it. The
+# fragment returns early for root; this half is already the unprivileged user.
+# shellcheck source=/dev/null
+[ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
+
+# A home volume from before the image wrote ~/.npmrc keeps its old one (or
+# none), and `docker exec -u t3 npm i -g` then fails on the root-owned system
+# prefix. Add the prefix once, without touching anything else in the file.
+if ! grep -qs '^prefix=' "${T3_HOME}/.npmrc"; then
+  # A file without a trailing newline would otherwise get the prefix glued
+  # onto its last line - often an auth token.
+  if [ -s "${T3_HOME}/.npmrc" ] && [ -n "$(tail -c 1 "${T3_HOME}/.npmrc")" ]; then
+    printf '\n' >> "${T3_HOME}/.npmrc" 2>/dev/null || true
+  fi
+  printf 'prefix=/opt/npm-global\n' >> "${T3_HOME}/.npmrc" 2>/dev/null || true
+fi
+
 if [ "${1:-}" != "t3-serve" ]; then
   exec "$@"
 fi
 shift || true
+
+# T3 decides an agent is installed by finding its name on PATH, and the
+# dispatcher answers to every agent name whether it is installed or not. Keep
+# it out of what the server and everything started here inherits.
+PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vx '/usr/local/lib/t3-agents' | paste -sd: -)"
+export PATH
 
 register_projects() {
   [ "$T3_AUTO_ADD_PROJECTS" = "1" ] || return 0
@@ -103,7 +210,7 @@ register_projects() {
 
   local dir
   if [ -e "${T3_WORKSPACE}/.git" ]; then
-    t3 project add "$T3_WORKSPACE" >/dev/null 2>&1 \
+    "$T3_INFRA_LAUNCHER" project add "$T3_WORKSPACE" >/dev/null 2>&1 \
       && log "registered project ${T3_WORKSPACE}" || true
     return 0
   fi
@@ -112,7 +219,7 @@ register_projects() {
     [ -d "$dir" ] || continue
     [ -e "${dir}.git" ] || continue
     dir="${dir%/}"
-    t3 project add "$dir" >/dev/null 2>&1 \
+    "$T3_INFRA_LAUNCHER" project add "$dir" >/dev/null 2>&1 \
       && log "registered project ${dir}" || true
   done
 }
@@ -173,9 +280,12 @@ report_persistence() {
   fi
 
   case "$root" in
-    /var/lib/docker/volumes/*/_data)
-      local name="${root#/var/lib/docker/volumes/}"
-      name="${name%/_data}"
+    # A named or anonymous volume. The data root can carry a prefix (a btrfs
+    # subvolume layout reports sources as /@/var/lib/docker/volumes/...), so
+    # match the volume path wherever it starts rather than only at the root.
+    */var/lib/docker/volumes/*/_data)
+      local name="${root##*/var/lib/docker/volumes/}"
+      name="${name%%/*}"
       if printf '%s' "$name" | grep -qE '^[0-9a-f]{64}$'; then
         log "WARNING: ${point} is an anonymous volume. It survives a restart, but"
         log "         recreating this container creates a new one and every agent"
@@ -194,6 +304,38 @@ report_persistence() {
 persist_agent_credentials
 report_persistence
 
+# Hand T3 the harness manager's choice of executable. T3 watches its settings
+# file and re-reads it live, so a managed Install/Update/Uninstall reaches the
+# running server through the same write the setup console triggers. A missing
+# or degraded mise is not fatal: no binaryPath is written, and T3's provider
+# stays unconfigured rather than pointed at an executable that is not there.
+sync_managed_providers() {
+  [ -r "$T3_PROVIDER_CLI" ] || return 0
+  [ -x "$T3_INFRA_NODE" ] || return 0
+  local out
+  if out="$("$T3_INFRA_NODE" "$T3_PROVIDER_CLI" sync 2>&1)"; then
+    log "managed provider selections: ${out}"
+  else
+    log "WARNING: could not apply managed harness selections to T3 settings"
+    log "         ${out}"
+  fi
+}
+
+sync_managed_providers
+
+# Put back what the image used to bake. Everything T3_PREINSTALL names (by
+# default all five agents and Go, Rust, Bun, Deno and uv) that is not on the
+# volume yet installs in the background, once: progress is on the setup page,
+# each agent is handed to T3 as soon as it lands, and a failure is retried on
+# the next start. Nothing here blocks the server from coming up.
+start_preinstall() {
+  [ -r /opt/t3-harness/preinstall.mjs ] || return 0
+  [ -x "$T3_INFRA_NODE" ] || return 0
+  ( "$T3_INFRA_NODE" /opt/t3-harness/preinstall.mjs || true ) &
+}
+
+start_preinstall
+
 # The setup service exists for one job: minting a pairing link on demand,
 # without a shell in the container and without a restart. Everything after
 # pairing belongs to T3 Code's own UI, which does it better.
@@ -202,7 +344,7 @@ start_setup_service() {
   [ -f /opt/t3-setup/server.mjs ] || return 0
 
   if [ -z "${T3_SETUP_KEY:-}" ]; then
-    T3_SETUP_KEY="$(node -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')"
+    T3_SETUP_KEY="$("$T3_INFRA_NODE" -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')"
     log "T3_SETUP_KEY was not set; generated one for this container:"
     log "    ${T3_SETUP_KEY}"
     log "    Set T3_SETUP_KEY yourself to keep it stable across recreates."
@@ -221,7 +363,8 @@ start_setup_service() {
 
   (
     while :; do
-      node /opt/t3-setup/server.mjs || log "setup service exited; restarting in 5s"
+      "$T3_INFRA_NODE" /opt/t3-setup/server.mjs \
+        || log "setup service exited; restarting in 5s"
       sleep 5
     done
   ) &
@@ -263,7 +406,7 @@ fi
 log "note: the token in the server banner below expires in 5 minutes and is"
 log "      addressed to this container - use t3-pair for a link that lasts"
 
-exec t3 serve \
+exec "$T3_INFRA_LAUNCHER" serve \
   --host "$T3CODE_HOST" \
   --port "$T3CODE_PORT" \
   "$@" \

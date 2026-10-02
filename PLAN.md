@@ -1,5 +1,10 @@
 # T3 Code Docker — Research & Implementation Plan
 
+> **Historical research record.** This is the original image design research.
+> It describes the former `slim`/`full` product with baked runtimes and
+> harnesses. The current `core`/`browser` image is documented in the
+> [README](README.md).
+
 **Goal:** a batteries-included Docker image that runs [T3 Code](https://github.com/pingdotgg/t3code)
 as a headless server on a Linux box, so that a phone (T3 Code iOS/Android app) or a browser is the
 *only* thing you need locally. No laptop in the loop.
