@@ -804,6 +804,50 @@ install_answers_then_finishes() {
 }
 check "install from the page answers at once and finishes in the background" install_answers_then_finishes
 
+# Any other mise tool, added from the Toolchains page: found in mise's registry,
+# installed at an exact version into the global config, runnable from a login
+# shell, listed by the CLI, refused under an agent's name, and removed again.
+# shfmt is one small binary with published checksums, so this stays quick.
+package_post() {
+  docker exec "$NAME" sh -c "curl -sS -o /tmp/package.json -w '%{http_code}' -b /tmp/jar \
+    -H 'content-type: application/json' -d '{\"id\":\"$2\"}' http://127.0.0.1:3774/packages/$1"
+}
+package_settled() {
+  local state=""
+  for _ in $(seq 1 90); do
+    state="$(status_json | jq -r ".operations[\"package:$1\"].state // \"\"")"
+    case "$state" in running|queued|"") sleep 2 ;; *) break ;; esac
+  done
+  [ "$state" = ok ]
+}
+registry_is_served() {
+  local registry
+  registry="$(docker exec "$NAME" curl -sS -b /tmp/jar http://127.0.0.1:3774/packages/registry)" || return 1
+  jq -e '(.tools | length) > 500 and any(.tools[]; .name == "shfmt")' >/dev/null <<<"$registry"
+}
+check "the console serves mise's registry" registry_is_served
+added_tool_installs() {
+  [ "$(package_post install shfmt)" = 202 ] || return 1
+  package_settled shfmt || return 1
+  status_json | jq -e '.packages[] | select(.id == "shfmt" and .installed and (.version | test("^[0-9]+[.]")))' >/dev/null || return 1
+  docker exec -u t3 "$NAME" grep -Eq '^shfmt = "[0-9]+[.][0-9.]+"' /home/t3/.config/mise/config.toml || return 1
+  docker exec -u t3 "$NAME" bash -lc 'cd /tmp && shfmt --version' >/dev/null 2>&1
+}
+check "any mise tool installs from the page, pinned exactly, and runs in a login shell" added_tool_installs
+check "and the CLI lists it" "output_has 'docker exec $NAME t3-harness packages' '^shfmt'"
+added_tool_refused_under_an_agents_name() {
+  [ "$(package_post install claude-code)" = 400 ] || return 1
+  docker exec "$NAME" jq -e '.code == "managed-elsewhere"' /tmp/package.json >/dev/null
+}
+check "an agent's name is refused as an added tool" added_tool_refused_under_an_agents_name
+added_tool_uninstalls() {
+  case "$(package_post uninstall shfmt)" in 200|202) ;; *) return 1 ;; esac
+  package_settled shfmt || return 1
+  ! status_json | jq -e '.packages[] | select(.id == "shfmt")' >/dev/null || return 1
+  ! docker exec -u t3 "$NAME" grep -q '^shfmt' /home/t3/.config/mise/config.toml
+}
+check "and uninstalls, leaving nothing in the config or the list" added_tool_uninstalls
+
 # The client script used to be embedded in a template literal in server.mjs,
 # which quietly ate escapes on the way out: `/\s+/` reached the browser as
 # `/s+/` and split agent names on the letter s. That is not a syntax error in

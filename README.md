@@ -44,7 +44,8 @@ signs the agents in without a shell.
   Cursor and Grok; Go, Rust, Bun, Deno and uv. They install on the first start,
   in the background, at exact recorded versions - so the image stays small, a
   pull never resets them, and Update is a button rather than a new image. Node,
-  Python, clang, ffmpeg, ImageMagick and psql are in the image itself.
+  Python, clang, ffmpeg, ImageMagick and psql are in the image itself, and
+  anything else mise can install, from kubectl to Java, is one search away.
 - **Agents can see.** Headless Chromium plus Playwright and Chrome DevTools MCP
   servers, wired into Claude Code, Codex and OpenCode.
 - **Show your dev server to your phone.** A port listening in the container is
@@ -491,9 +492,44 @@ environment variables at a compatible endpoint.
 Go, Rust (with clippy and rustfmt), Bun, Deno and uv install on the first start
 alongside the agents, through [mise](https://mise.jdx.dev/), into the persistent
 home, and work in every directory. The **Toolchains** page in the setup
-console updates or removes each one, or installs one you left out of
-`T3_PREINSTALL`.
+console updates or removes each one, installs one you left out of
+`T3_PREINSTALL`, and adds any other tool mise can install (below).
 Node and Python come with the image.
+
+### Any other tool
+
+Anything else mise can install is a button away too. **Add a tool** on the
+Toolchains page searches mise's built-in registry, about a thousand tools from
+`kubectl` and `terraform` to `java` and `zig`, by name, by the command it
+provides (`rg` finds ripgrep) or by what it does (`json`). A backend spec works
+as well: `npm:prettier`, `cargo:ripgrep`, `github:owner/repo`. Before anything
+installs, the sheet shows where the tool comes from, how its downloads are
+verified, which commands it provides, and whether one of them is already in
+the image (an added `node` comes first in terminals and for agents). Pick the
+newest release or any other one; a prefix like `3.12` takes the newest under
+it.
+
+<p align="center">
+  <img src="docs/media/add-tool.png" alt="Adding kubectl from the Toolchains page: its source, how downloads are verified, and the release to install" width="100%">
+</p>
+
+Added tools follow the toolchains' rules: installed into the global mise config
+at an exact version, one operation at a time, never updated on their own. Each
+row shows when a newer release exists, and **Update all** covers them with the
+toolchains. Tools you add with `mise use -g` in a terminal show up in the same
+list and can be updated or removed from there. ⌘K reaches the registry too:
+type `install terraform`. From a shell:
+
+```bash
+docker compose exec t3code t3-harness packages                       # what has been added
+docker compose exec t3code t3-harness install kubectl                 # newest, recorded exact
+docker compose exec t3code t3-harness install python --version 3.12   # newest 3.12.x
+docker compose exec t3code t3-harness update kubectl
+docker compose exec t3code t3-harness uninstall kubectl
+```
+
+The agents and the five toolchains are managed on their own pages, in any
+spelling (`claude-code`, `core:go`), so nothing is configured twice.
 
 Projects can still ask for their own versions: mise reads whatever the project
 already declares — `mise.toml`, `.tool-versions`, or idiomatic files like
