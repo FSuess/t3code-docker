@@ -72,6 +72,8 @@ export function createFs() {
     mkdir: (path, options) => fsp.mkdir(path, options),
     rename: (from, to) => fsp.rename(from, to),
     link: (from, to) => fsp.link(from, to),
+    symlink: (target, path) => fsp.symlink(target, path),
+    readlink: (path) => fsp.readlink(path),
     unlink: (path) => fsp.unlink(path),
     stat: (path) => fsp.stat(path),
     async exists(path) {

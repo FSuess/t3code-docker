@@ -452,6 +452,10 @@ agents_by_name_from_exec() {
   [ "$(docker exec "$NAME" sh -c 'stat -c %U /home/t3/.claude.json 2>/dev/null || echo t3')" = t3 ]
 }
 check "agents run by name from docker exec, as the t3 user" agents_by_name_from_exec
+# Cursor has no mise shim, so the manager links the installed executable onto
+# the t3 user's PATH; a terminal (and T3's own lookup) finds exactly that.
+check "a login shell finds the installed cursor-agent through its link" \
+  "docker exec -u t3 $NAME bash -lc 'cd /tmp && readlink \"\$(command -v cursor-agent)\"' | grep -q '/mise/installs/cursor-agent/'"
 # T3 reads its PATH from `$SHELL -ilc` and calls an agent installed when its
 # name is found there. The dispatcher answers to every name, so it must never
 # be on that PATH, or an uninstalled agent reads as installed.

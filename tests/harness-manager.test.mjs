@@ -18,6 +18,7 @@ import {
   normalizeArch,
 } from "../docker/harness/index.mjs";
 import { firstError } from "../docker/harness/mise.mjs";
+import * as lock from "../docker/harness/lock.mjs";
 
 const HOME = "/home/t3";
 const DATA_DIR = path.join(HOME, ".local/share/mise");
@@ -26,6 +27,7 @@ const STATE_DIR = path.join(HOME, ".local/state/mise");
 class MemoryFs {
   constructor() {
     this.files = new Map();
+    this.links = new Map();
     this.dirs = new Set(["/"]);
   }
 
@@ -61,6 +63,18 @@ class MemoryFs {
     this.files.delete(from);
   }
 
+  async symlink(target, linkPath) {
+    if (this.files.has(linkPath) || this.links.has(linkPath)) {
+      throw Object.assign(new Error("EEXIST"), { code: "EEXIST" });
+    }
+    this.links.set(linkPath, target);
+  }
+
+  async readlink(linkPath) {
+    if (!this.links.has(linkPath)) throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+    return this.links.get(linkPath);
+  }
+
   async link(from, to) {
     const entry = this.files.get(from);
     if (!entry) throw Object.assign(new Error(`ENOENT: ${from}`), { code: "ENOENT" });
@@ -69,6 +83,7 @@ class MemoryFs {
   }
 
   async unlink(filePath) {
+    if (this.links.delete(filePath)) return;
     if (!this.files.delete(filePath)) {
       throw Object.assign(new Error(`ENOENT: ${filePath}`), { code: "ENOENT" });
     }
@@ -814,4 +829,57 @@ test("mise failures report their cause, not the boilerplate around it", () => {
   assert.equal(firstError(failure), "Failed to install http:grok@9.9.9: 404 Not Found for url (https://example.test/linux-x64/grok)");
   const offline = { code: 0, error: null, stdout: "", stderr: "mise WARN  Remote versions cannot be fetched for anthropics/claude-code: error sending request" };
   assert.match(firstError(offline), /^Remote versions cannot be fetched/);
+});
+
+test("Cursor gets a link on the t3 PATH exactly while it is installed", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  const link = path.join(HOME, ".local/share/t3-harness/bin/cursor-agent");
+
+  await manager.install("cursor");
+  assert.equal(fs.links.get(link), world.execPath("cursor-agent", "2026.09.15-d2fe57e"));
+  world.latest["cursor-agent"] = "2026.09.28-64d2043";
+  await manager.update("cursor");
+  assert.equal(fs.links.get(link), world.execPath("cursor-agent", "2026.09.28-64d2043"), "follows an update");
+  await manager.install("claude");
+  assert.equal(fs.links.has(path.join(HOME, ".local/share/t3-harness/bin/claude")), false, "shimmed agents get none");
+
+  await manager.uninstall("cursor");
+  assert.equal(fs.links.has(link), false, "gone with the install");
+});
+
+test("breaking a stale lock never deletes one another process just took", async () => {
+  const fs = new MemoryFs();
+  const lockPath = path.join(STATE_DIR, "harness.lock");
+  const ctxFor = (pid, overrideFs) => ({
+    fs: overrideFs,
+    lockPath,
+    pid,
+    now: () => 1_700_000_000_000,
+    lockStaleMs: 60_000,
+    isAlive: (candidate) => candidate === 1 || candidate === 2,
+    startTimeOf: (candidate) => (candidate === 1 || candidate === 2 ? "100" : null),
+  });
+  // A stale lock left by a process that is gone.
+  fs.seedFile(lockPath, JSON.stringify({ pid: 99, token: "stale", id: "claude", operation: "install", startedAt: 1_700_000_000_000 }));
+
+  // B decides the lock is stale, but before it moves it, A breaks it too and
+  // takes the lock. B's move then catches A's live lock.
+  let interleaved = false;
+  const fsB = Object.create(fs);
+  fsB.rename = async (from, to) => {
+    if (!interleaved && from === lockPath) {
+      interleaved = true;
+      const a = await lock.acquireLock(ctxFor(1, fs), { id: "codex", operation: "install" });
+      assert.equal(a.acquired, true, "A takes the lock");
+    }
+    return fs.rename(from, to);
+  };
+  const b = await lock.acquireLock(ctxFor(2, fsB), { id: "grok", operation: "install" });
+  assert.equal(b.acquired, false, "B does not get it");
+  assert.equal(b.holder.pid, 1, "A still holds it");
+  const holder = JSON.parse(await fs.readFile(lockPath));
+  assert.equal(holder.pid, 1);
+  assert.equal([...fs.files.keys()].some((key) => key.includes(".stale.")), false, "nothing left aside");
 });

@@ -52,6 +52,13 @@ if [ "$(id -u)" != "0" ]; then
     *) PATH="${MISE_DATA_DIR}/shims:${PATH}"; export PATH ;;
   esac
 
+  # Harnesses that get no mise shim (Cursor) are linked here by the harness
+  # manager while they are installed, and only then.
+  case ":$PATH:" in
+    *":/home/t3/.local/share/t3-harness/bin:"*) ;;
+    *) PATH="/home/t3/.local/share/t3-harness/bin:${PATH}"; export PATH ;;
+  esac
+
   # The agent dispatcher (/usr/local/lib/t3-agents, on the image PATH for
   # `docker exec`) is deliberately not added here. T3 reads its PATH from an
   # interactive login shell, which runs this file, and decides an agent is

@@ -97,6 +97,11 @@ export const CATALOGUE = Object.freeze([
     // does not exist instead: nothing gets a shim, and T3, sign-in and the
     // browser helper all launch cursor-agent by its absolute path anyway.
     miseOptions: "bin_path=dist-package/.t3-no-shims",
+    // With no shim, a shell would not find it at all. The manager keeps a
+    // link to exactly the installed executable on the t3 user's PATH instead,
+    // and removes it on uninstall - so T3, which looks agents up by name,
+    // sees Cursor exactly when it is installed.
+    linkOnPath: true,
     versionArgs: ["--version"],
     // Cursor versions are date-hash pins, not semver; 2026.09.15-d2fe57e.
     versionPattern: "(\\d{4}\\.\\d{2}\\.\\d{2}-[0-9a-f]+)",

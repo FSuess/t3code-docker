@@ -53,6 +53,9 @@ export function createHarnessManager(options = {}) {
     dataDir: options.dataDir ?? env.MISE_DATA_DIR ?? path.join(home, ".local", "share", "mise"),
     stateDir: options.stateDir ?? env.MISE_STATE_DIR ?? path.join(home, ".local", "state", "mise"),
     cacheDir: options.cacheDir ?? env.MISE_CACHE_DIR ?? path.join(home, ".cache", "mise"),
+    // Links for harnesses that get no mise shim (Cursor), on the t3 user's
+    // PATH through docker/user-env.sh.
+    linkDir: options.linkDir ?? env.T3_HARNESS_BIN_DIR ?? path.join(home, ".local", "share", "t3-harness", "bin"),
     // Only a backstop for a holder that is alive but hung: a dead or replaced
     // holder is detected from its pid and start time straight away.
     lockStaleMs: options.lockStaleMs ?? 60 * 60 * 1000,
@@ -258,6 +261,7 @@ export function createHarnessManager(options = {}) {
       onStarted,
       after: async () => {
         authCache.delete(id);
+        await refreshLinks();
         return { harness: await resolve(id) };
       },
     });
@@ -474,6 +478,38 @@ export function createHarnessManager(options = {}) {
     }, options);
   }
 
+  /**
+   * Point each linkOnPath harness's link at its runnable executable, or remove
+   * it. Runs after every operation and on every start (from preinstall), so
+   * the link can never outlive the install it names. Best effort: a link that
+   * cannot be written costs a shell lookup, nothing else.
+   */
+  async function refreshLinks() {
+    const linked = CATALOGUE.filter((entry) => entry.linkOnPath);
+    if (!linked.length) return;
+    let snap;
+    try {
+      snap = await snapshot();
+    } catch {
+      return;
+    }
+    if (snap.degraded.length) return; // mise could not answer; change nothing
+    for (const entry of linked) {
+      const facts = await factsFor(entry, snap, { authenticate: false });
+      const link = path.join(ctx.linkDir, entry.miseTool);
+      const target = facts.runnable && facts.executable ? facts.executable : null;
+      try {
+        const current = await ctx.fs.readlink(link).catch(() => null);
+        if (current === target) continue;
+        if (current !== null) await ctx.fs.unlink(link);
+        if (target) {
+          await ctx.fs.mkdir(ctx.linkDir, { recursive: true });
+          await ctx.fs.symlink(target, link);
+        }
+      } catch { /* best effort */ }
+    }
+  }
+
   /** Read-only facts for every catalogue entry. */
   async function status(options = {}) {
     const snap = await snapshot();
@@ -504,6 +540,7 @@ export function createHarnessManager(options = {}) {
     update,
     uninstall,
     invalidateAuth,
+    refreshLinks,
     toolchains: {
       status: toolchainStatus,
       resolve: resolveToolchain,
@@ -519,6 +556,7 @@ export function createHarnessManager(options = {}) {
       cacheDir: ctx.cacheDir,
       lock: ctx.lockPath,
       state: ctx.statePath,
+      links: ctx.linkDir,
     },
   };
 }

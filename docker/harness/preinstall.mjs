@@ -149,6 +149,9 @@ export async function runPreinstall({
   const { items, unknown } = parsePreinstall(env.T3_PREINSTALL);
   if (unknown.length) log(`T3_PREINSTALL: ignoring unknown ${unknown.join(", ")}`);
 
+  // Shell links follow what is installed, whatever this run does next.
+  try { await manager.refreshLinks?.(); } catch { /* best effort */ }
+
   const record = await readRecord(fs, file);
   if (!items.length) {
     record.run = { state: "off", plan: [], startedAt: null, finishedAt: null, current: null };

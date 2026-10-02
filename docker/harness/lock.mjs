@@ -14,7 +14,8 @@
 // pid, and a lock left by the killed one would look alive until the age
 // ceiling. The ceiling stays only as a backstop for a holder that is alive but
 // hung. The reader (including status) never writes, so a stuck lock cannot be
-// "cleaned up" into a silent concurrent install.
+// "cleaned up" into a silent concurrent install, and breaking a stale lock
+// moves it aside and checks it rather than deleting whatever is there.
 import crypto from "node:crypto";
 import path from "node:path";
 import { processAlive as defaultProcessAlive, processStartTime as defaultStartTime } from "./io.mjs";
@@ -24,9 +25,9 @@ export function lockPath(stateDir) {
 }
 
 /** Parse a lock file; malformed content is treated as stale, never trusted. */
-export async function readLock(ctx) {
+export async function readLock(ctx, file = ctx.lockPath) {
   try {
-    const raw = await ctx.fs.readFile(ctx.lockPath, "utf8");
+    const raw = await ctx.fs.readFile(file, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
     return parsed;
@@ -94,12 +95,22 @@ export async function acquireLock(ctx, { id, operation }) {
       if (!lockIsStale(current, ctx)) {
         return { acquired: false, holder: current, error: null };
       }
-      // The owner is gone. Read the lock again immediately before removing it,
-      // so a lock another process took in the meantime is never the one that
-      // gets deleted; then race for ours on the next pass.
-      const again = await readLock(ctx);
-      if ((again?.token ?? null) !== (current?.token ?? null)) continue;
-      try { await ctx.fs.unlink(ctx.lockPath); } catch { /* someone else won */ }
+      // The owner is gone. Two processes can both see that, so the stale lock
+      // is not deleted by name: it is moved aside under a name only this
+      // attempt uses, and then checked. If what moved is not the lock judged
+      // stale, another process took the lock in between, and it goes straight
+      // back. Then race for ours on the next pass.
+      const aside = `${ctx.lockPath}.stale.${token}`;
+      try {
+        await ctx.fs.rename(ctx.lockPath, aside);
+      } catch {
+        continue; // already gone
+      }
+      const moved = await readLock(ctx, aside);
+      if ((moved?.token ?? null) !== (current?.token ?? null)) {
+        try { await ctx.fs.link(aside, ctx.lockPath); } catch { /* taken again meanwhile */ }
+      }
+      try { await ctx.fs.unlink(aside); } catch { /* already gone */ }
       continue;
     }
 
