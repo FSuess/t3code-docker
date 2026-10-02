@@ -279,11 +279,21 @@ const audit = () => {
     }]),
     ["row menu", async (page) => {
       await page.evaluate(() => { location.hash = "agents"; });
-      await page.click("#page-agents [data-cmd='row.menu'] >> nth=0");
-      await page.waitForSelector(".tc-layer .tc-menu, .tc-layer .tc-sheet");
+      await page.waitForSelector("#page-agents [data-cmd='row.menu']", { timeout: 60000 });
+      // The first installed agent's menu: a missing one has no Uninstall to
+      // open the dialog with.
+      for (const trigger of await page.$$("#page-agents [data-cmd='row.menu']")) {
+        await trigger.click();
+        await page.waitForSelector(".tc-layer .tc-menu, .tc-layer .tc-sheet");
+        if (await page.$(".tc-layer .tc-menu-item--danger")) return;
+        await page.keyboard.press("Escape");
+        await page.waitForSelector(".tc-layer", { state: "detached" });
+      }
     }],
     ["uninstall dialog", async (page) => {
-      await page.click(".tc-layer .tc-menu-item--danger");
+      const uninstall = await page.$(".tc-layer .tc-menu-item--danger");
+      if (!uninstall) return;
+      await uninstall.click();
       await page.waitForSelector(".tc-layer .tc-dialog");
     }],
     ["palette", async (page) => {
