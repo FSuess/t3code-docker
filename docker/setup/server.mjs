@@ -24,6 +24,8 @@ import { loadAssets, renderConsole, renderUnlock, contentSecurityPolicy } from "
 import { parseListeners, processLabel, looksLikeDatabase } from "./ports.mjs";
 import { createStorageFacts } from "./storage.mjs";
 import { createLatestCache } from "./latest.mjs";
+import { createT3Api } from "./t3-api.mjs";
+import { createAntigravity } from "./antigravity.mjs";
 
 const run = promisify(execFile);
 const gzip = promisify(gzipCallback);
@@ -91,6 +93,25 @@ const t3 = (args) =>
     maxBuffer: 4 * 1024 * 1024,
     timeout: T3_TIMEOUT_MS,
   });
+
+// T3 Code's own API, for what only T3 can do: install Google's Antigravity
+// runtime (T3 pins and checks it) and sign it in. The console holds a bearer
+// session of its own for it, issued through the same launcher; it is not a
+// device, so the Devices page and its "paired" events leave it out.
+const CONSOLE_SUBJECT = "t3-setup-console";
+const t3Api = createT3Api({
+  url: `ws://127.0.0.1:${T3_PORT}/ws`,
+  issueSession: async () => {
+    const { stdout } = await t3(["auth", "session", "issue", "--ttl", "4h", "--label", "Setup console", "--subject", CONSOLE_SUBJECT, "--json"]);
+    const start = stdout.indexOf("{");
+    if (start < 0) throw new Error("t3 auth session issue printed no session");
+    return JSON.parse(stdout.slice(start));
+  },
+  revokeSession: (sessionId) => t3(["auth", "session", "revoke", String(sessionId)]),
+});
+const antigravity = createAntigravity({ api: t3Api });
+const T3_AGENT_IDS = new Set(["antigravity"]);
+const isConsoleSession = (session) => session?.subject === CONSOLE_SUBJECT;
 
 const health = async () => {
   try {
@@ -605,6 +626,9 @@ const status = async () => {
     degraded.push({ what, error: String(raced.error ?? "unavailable").slice(0, 200) });
     return fallback;
   };
+  // Antigravity, as T3 reports it, read beside the rest. Its own short cache:
+  // a poll waits on T3 only for the very first read.
+  const antigravityRead = attempt("Antigravity", () => antigravity.status(), null);
   const [server, harnessSnap, pairings, sessions, toolchainSnap, setup] = await Promise.all([
     attempt("server health", health, { ok: false, detail: "health check failed" }),
     attempt("agent probes", () => harnessLifecycleStatus(true), {
@@ -621,13 +645,18 @@ const status = async () => {
       return harnessModule.readPreinstall({ stateDir: manager.paths.stateDir });
     }, null),
   ]);
+  const antigravityRow = await antigravityRead;
+  const devices = Array.isArray(sessions) ? sessions.filter((session) => !isConsoleSession(session)) : sessions;
   noticeSetupProgress(setup);
-  noticeSessions(sessions);
+  noticeSessions(devices);
   // Added tools, with what the registry says about each; their ids feed the
   // background check for newer releases.
   const packageRows = await withRegistry(toolchainSnap?.packages ?? []);
   knownPackages.clear();
   for (const row of packageRows) if (row.configured) knownPackages.add(row.id);
+  // Shown when T3 has the provider, or when T3 is up but would not answer the
+  // console (the row says so); while T3 itself is down the page already says.
+  const t3Agents = antigravityRow && (antigravityRow.available || (!antigravityRow.reachable && server?.ok)) ? [antigravityRow] : [];
   const harnesses = harnessSnap?.harnesses ?? [];
   const disk = storage.snapshot();
   for (const entry of harnessSnap?.degraded ?? []) {
@@ -667,7 +696,7 @@ const status = async () => {
       workspaceProjects: disk.workspaceProjects,
     },
     browser: BROWSER,
-    harnesses: withLatest("harness", harnesses),
+    harnesses: [...withLatest("harness", harnesses), ...t3Agents],
     // Freshness of the harness facts above: `live` completed on this request,
     // `cache`/`cheap` are local or last-known state served because the
     // authenticated refresh exceeded its budget (it keeps running and warms
@@ -692,7 +721,7 @@ const status = async () => {
     // 202 can still end in a toast or an error on the row.
     operations: operationsSeen,
     pairings,
-    sessions: sessions ?? [],
+    sessions: devices ?? [],
     events,
     degraded,
   };
@@ -766,6 +795,8 @@ const AGENTS = {
   cursor: { name: "Cursor",
     signin: { argv: ["cursor-agent", "login"], pty: true, env: { NO_OPEN_BROWSER: "1" } } },
   opencode: { name: "OpenCode", apiKey: { kind: "opencode" } },
+  // Signed in through T3's own Google flow (startAntigravitySignin).
+  antigravity: { name: "Antigravity" },
 };
 
 const stripAnsi = (text) =>
@@ -927,11 +958,64 @@ const startSignin = async (agentId) => {
   return session;
 };
 
+/**
+ * Antigravity's sign-in is T3's own Google flow, shown in the same sheet as the
+ * CLIs': T3 hands out a Google link, the browser lands on a 127.0.0.1 address
+ * it cannot load, and the address pasted back (`/auth/code`) goes to T3,
+ * which checks it. The session object reads like a CLI's to the page.
+ */
+const startAntigravitySignin = async () => {
+  const id = randomBytes(9).toString("hex");
+  const session = {
+    id, agentId: "antigravity", state: "starting", url: null, code: null,
+    needsCode: true, output: "", error: null, child: null, t3: true,
+    flow: null, flowId: null, expiresAt: null, startedAt: Date.now(),
+  };
+  sessions.set(id, session);
+  const end = (state, error = null) => {
+    if (TERMINAL_STATES.has(session.state)) return;
+    session.state = state;
+    session.error = error;
+    session.flow?.close();
+  };
+  try {
+    session.flow = await antigravity.signIn((state) => {
+      if (TERMINAL_STATES.has(session.state)) return;
+      const expires = Date.parse(state.expiresAt ?? "");
+      if (Number.isFinite(expires)) session.expiresAt = expires;
+      if (state.phase === "waiting" && state.authorizationUrl) {
+        session.url = state.authorizationUrl;
+        if (session.state === "starting") session.state = "awaiting-code";
+      } else if (state.phase === "verifying") {
+        session.state = "submitted";
+      } else if (state.phase === "succeeded") {
+        end("done");
+        recordEvent("signin.ok", "Signed in Antigravity");
+        void antigravity.recheck().catch(() => {});
+      } else if (state.phase === "failed") {
+        end("failed", state.message ?? "Google sign-in did not finish.");
+      } else if (state.phase === "cancelled") {
+        end("cancelled", state.message ?? null);
+      }
+    });
+    session.flowId = session.flow.flowId;
+  } catch (error) {
+    end("failed", String(error?.message ?? error).slice(0, 300));
+  }
+  // T3 gives a flow a few minutes; this only catches a flow nobody ended.
+  setTimeout(() => {
+    if (TERMINAL_STATES.has(session.state)) return;
+    if (session.flowId) void antigravity.cancelSignIn(session.flowId).catch(() => {});
+    end("failed", "Timed out waiting for the browser step.");
+  }, SESSION_TTL_MS).unref?.();
+  return session;
+};
+
 const publicSession = (s) => ({
   id: s.id, agent: s.agentId, state: s.state, url: s.url, code: s.code, qr: s.qr ?? null,
   needsCode: s.needsCode, error: s.error,
   // When the wait for the browser step gives up, for the device code's countdown.
-  startedAt: s.startedAt, expiresAt: s.startedAt + SESSION_TTL_MS,
+  startedAt: s.startedAt, expiresAt: s.expiresAt ?? s.startedAt + SESSION_TTL_MS,
   tail: s.output.trim().split("\n").slice(-4).join("\n"),
 });
 
@@ -1412,6 +1496,34 @@ const runJob = async (job) => {
 };
 
 /**
+ * Install (or update to the release T3 pins) or remove Antigravity's runtime
+ * through T3's installer, reporting into the row like any other job.
+ */
+const t3Jobs = new Map(); // key -> job, while it runs
+const runT3Job = (job) => {
+  t3Jobs.set(job.key, job);
+  setOperation(job, { state: "running", error: null, warning: null, progress: null, startedAt: Date.now(), finishedAt: null });
+  const onProgress = (progress) => {
+    const op = operations.get(job.key);
+    if (op?.token === job.token && op.state === "running") op.progress = progress;
+  };
+  const work = job.kind === "uninstall"
+    ? antigravity.uninstall()
+    : antigravity.install({ signal: job.controller.signal, onProgress });
+  void work
+    .catch((error) => ({ ok: false, code: "failed", error: String(error?.message ?? error) }))
+    .then((result) => {
+      t3Jobs.delete(job.key);
+      const cancelled = job.controller.signal.aborted && !result?.ok;
+      finishJob(job, {
+        result: cancelled ? { ok: false, code: "cancelled", error: "cancelled" }
+          : { ...result, ...(result?.version ? { harness: { installedVersion: result.version } } : {}) },
+        sync: null,
+      });
+    });
+};
+
+/**
  * The id an operation is keyed and run under, or the answer refusing it. A
  * package's name comes from whoever typed it, so it is validated, refused when
  * an agent or toolchain owns it, and normalized (rg -> ripgrep) before it is
@@ -1424,6 +1536,7 @@ const lifecycleId = async (target, rawId) => {
     if (!normalized.ok) return { refused: { http: 400, body: normalized } };
     return { id: normalized.id };
   }
+  if (target === "harness" && T3_AGENT_IDS.has(id)) return { id };
   const ids = target === "harness" ? HARNESS_IDS : TOOLCHAIN_IDS;
   if (!ids.has(id)) {
     const code = target === "harness" ? "unknown-harness" : "unknown-toolchain";
@@ -1452,6 +1565,12 @@ const startLifecycle = async (target, kind, input) => {
     };
   }
   const job = { key, target, kind, id, version, token: randomBytes(6).toString("hex"), controller: new AbortController(), queuedAt: Date.now(), reported: false };
+  // T3 installs Antigravity's runtime itself: no mise, no lock, nothing to
+  // wait behind. Its job runs at once, beside the queue.
+  if (target === "harness" && T3_AGENT_IDS.has(id)) {
+    runT3Job(job);
+    return { http: 202, body: { ok: true, code: "started", id, kind, target } };
+  }
   if (active || queue.length) {
     enqueue(job);
     return { http: 202, body: { ok: true, code: "queued", id, kind, target } };
@@ -1476,6 +1595,11 @@ const startLifecycle = async (target, kind, input) => {
 /** Take a job out of the queue, or stop the one running (its mise run included). */
 const cancelLifecycle = (target, rawId) => {
   const key = `${target}:${String(rawId ?? "").trim()}`;
+  const t3Job = t3Jobs.get(key);
+  if (t3Job) {
+    t3Job.controller.abort();
+    return { http: 202, body: { ok: true, code: "cancelling" } };
+  }
   const index = queue.findIndex((job) => job.key === key);
   if (index !== -1) {
     const [job] = queue.splice(index, 1);
@@ -1492,7 +1616,7 @@ const cancelLifecycle = (target, rawId) => {
 
 const ROUTES = ["/login", "/logout", "/status", "/pair", "/revoke", "/ports",
   "/ports/expose", "/ports/unexpose",
-  "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses",
+  "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses/enable", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
   "/auth/apikey/remove", "/auth/apikey", "/auth/signin", "/auth/session", "/auth/code", "/auth/cancel",
   "/providers", "/updates/check",
@@ -1670,6 +1794,20 @@ const server = createServer(async (req, res) => {
         return sendJson(res, 503, { ok: false, error: `mise could not list its registry: ${String(error?.message ?? error)}` });
       }
     }
+    // Turn a T3-installed agent back on in T3 Code (Antigravity, after someone
+    // switched it off there).
+    if (req.method === "POST" && route === "/harnesses/enable") {
+      const input = JSON.parse((await readBody(req)) || "{}");
+      if (!T3_AGENT_IDS.has(String(input.id ?? ""))) return sendJson(res, 404, { ok: false, code: "unknown-harness", error: `unknown harness: ${input.id}` });
+      try {
+        await antigravity.enable();
+        recordEvent("harness.enabled", "Turned Antigravity on in T3 Code");
+        return sendJson(res, 200, { ok: true });
+      } catch (error) {
+        return sendJson(res, 502, { ok: false, error: String(error?.message ?? error).slice(0, 300) });
+      }
+    }
+
     // An agent's releases, newest first, for "Install a specific version": each
     // with when it was published and whether mise is still holding it back.
     if (req.method === "GET" && route === "/harnesses/versions") {
@@ -1762,6 +1900,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && route === "/auth/signin") {
       try {
         const input = JSON.parse((await readBody(req)) || "{}");
+        if (input.agent === "antigravity") return sendJson(res, 200, publicSession(await startAntigravitySignin()));
         return sendJson(res, 200, publicSession(await startSignin(input.agent)));
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
@@ -1778,6 +1917,22 @@ const server = createServer(async (req, res) => {
       const input = JSON.parse((await readBody(req)) || "{}");
       const session = sessions.get(input.id);
       if (!session) return sendJson(res, 404, { error: "no such session" });
+      if (session.t3) {
+        // The address Google sent the browser to: T3 checks it belongs to
+        // this flow and finishes the sign-in.
+        const callbackUrl = String(input.code ?? "").trim();
+        if (!/^https?:\/\//i.test(callbackUrl) || callbackUrl.length > 16384) {
+          return sendJson(res, 400, { error: "Paste the whole address from the browser's address bar, starting with http://127.0.0.1." });
+        }
+        try {
+          await antigravity.completeSignIn(session.flowId, callbackUrl);
+          if (!TERMINAL_STATES.has(session.state)) session.state = "submitted";
+          session.submittedAt = Date.now();
+          return sendJson(res, 200, publicSession(session));
+        } catch (error) {
+          return sendJson(res, 400, { error: String(error?.message ?? error).slice(0, 300) });
+        }
+      }
       try {
         // A carriage return, not a newline. These prompts run the terminal in
         // raw mode, where Enter arrives as CR; an LF is accepted as part of the
@@ -1795,7 +1950,11 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && route === "/auth/cancel") {
       const input = JSON.parse((await readBody(req)) || "{}");
       const session = sessions.get(input.id);
-      if (session) {
+      if (session?.t3) {
+        if (session.flowId && !TERMINAL_STATES.has(session.state)) void antigravity.cancelSignIn(session.flowId).catch(() => {});
+        session.state = "cancelled";
+        session.flow?.close();
+      } else if (session) {
         session.state = "cancelled";
         try { session.child.kill(); } catch {}
       }
@@ -1855,6 +2014,8 @@ server.listen(PORT, "0.0.0.0", () => {
   // A pass runs once the last is an hour old; looking every ten minutes keeps
   // an answer from going much past that.
   setInterval(() => { void latestCache.refresh().catch(() => {}); }, 10 * 60 * 1000).unref();
+  // Antigravity's row, warm before the first poll asks.
+  setTimeout(() => { void antigravity.refresh().catch(() => {}); }, 3_000).unref();
   // How long mise holds a new release back, for "mise offers it in 21 hours".
   void loadHarness().then((manager) => manager.releaseAge()).then((ms) => { releaseAgeMs = ms; }, () => {});
 });
