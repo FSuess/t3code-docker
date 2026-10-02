@@ -513,7 +513,10 @@ const T3Model = (() => {
       if (busyKind === 'uninstall' || list.some((p) => p.id === id)) continue;
       list.push({ id, name: toolName(id), configured: false, installed: false, version: null });
     }
-    return list.map((p) => toolRow(p, 'package', s, ui, now));
+    // By the name a row shows (npm:prettier reads as prettier), so a tool that
+    // is still waiting to start already sits where it will stay.
+    return list.map((p) => toolRow(p, 'package', s, ui, now))
+      .sort((a, b) => a.name.localeCompare(b.name, 'en', { sensitivity: 'base' }) || a.id.localeCompare(b.id));
   };
 
   // ----------------------------------------------------------- added tools --
@@ -536,16 +539,32 @@ const T3Model = (() => {
     return TOOL_SPEC.test(id) && !id.includes('..') && !id.endsWith('/');
   };
 
-  /**
-   * The release mise installs for a typed version, from a newest-first list:
-   * the exact one, or the newest under it segment by segment, as `mise latest
-   * tool@1.3` does (1.3 -> 1.3.10, never 1.37.1). Null when none matches.
-   */
+  // The releases a typed version names, from a newest-first list, the way
+  // `mise latest tool@1.3` reads it: the exact release, then the ones under it
+  // segment by segment (1.3 -> 1.3.10, 1.3.9, ...; never 1.37.1). mise installs
+  // the first: jq@1.7 is 1.7 even though 1.7.1 exists.
+  const namedReleases = (list, q) => {
+    const under = list.filter((v) => v.startsWith(q + '.') || v.startsWith(q + '-') || v.startsWith(q + '+'));
+    return list.includes(q) ? [q, ...under] : under;
+  };
+
+  /** The release mise installs for a typed version, or null when it names none. */
   const resolveRelease = (versions, query) => {
     const q = String(query || '').trim();
-    if (!q) return null;
+    return (q && namedReleases(versions || [], q)[0]) || null;
+  };
+
+  /**
+   * The releases the version picker lists for what is typed, the one it would
+   * install first. Text that names no release, such as rc or part of a date,
+   * lists the releases containing it instead.
+   */
+  const matchReleases = (versions, query) => {
     const list = versions || [];
-    return list.find((v) => v === q) || list.find((v) => v.startsWith(q + '.') || v.startsWith(q + '-') || v.startsWith(q + '+')) || null;
+    const q = String(query || '').trim();
+    if (!q) return list;
+    const named = namedReleases(list, q);
+    return named.length ? named : list.filter((v) => v.includes(q));
   };
 
   // What the search offers before anything is typed: common picks that are
@@ -1086,7 +1105,7 @@ const T3Model = (() => {
     relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs, imageLabel,
     progressOf, progressText,
     agentRow, agentRows, toolRow, toolchainRow, toolchainRows, packageRows, portRows, looksLikeDatabase,
-    monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, toolName, SUGGESTED_TOOLS,
+    monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, matchReleases, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind,
     readiness, readySummary, needsYou, activity, setupBanner,
     navBadges, summaries,

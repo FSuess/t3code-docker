@@ -319,6 +319,10 @@ html.tc-locked { overflow: hidden; }
 .tc-option[aria-disabled="true"] { cursor: default; opacity: 0.6; }
 .tc-option[aria-disabled="true"]:hover { background: none; }
 .tc-option-meta .tc-icon { width: 12px; height: 12px; }
+/* What a match provides, or why it cannot be picked: wrapped between items,
+   never inside one, and never wider than the name it sits beside. */
+.tc-listbox--rich .tc-option-meta { flex: none; max-width: 40%; flex-wrap: wrap; justify-content: flex-end; column-gap: 6px; line-height: 20px; }
+.tc-listbox--rich .tc-option-meta > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .tc-combobox-note { display: flex; align-items: center; gap: var(--space-2); padding: 10px 12px; border-top: 1px solid var(--hairline); font-size: 13px; color: var(--fg-muted); }
 .tc-tool-picked { display: flex; align-items: flex-start; gap: var(--space-3); }
 .tc-tool-picked-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }

@@ -614,6 +614,16 @@ test("a tool shows from the click on: in flight, then queued, before the server 
   assert.equal(M.toolName("kubectl"), "kubectl");
 });
 
+test("added tools list by the name they show, a queued one already in its place", () => {
+  const s = statusWith({
+    packages: [{ id: "aqua:BurntSushi/ripgrep", name: "ripgrep", configured: true, installed: true, version: "15.2.0" },
+      { id: "jq", name: "jq", configured: true, installed: true, version: "1.8.2" },
+      { id: "npm:prettier", name: "prettier", configured: true, installed: true, version: "3.3.3" }],
+    operations: { "package:kubectl": { kind: "install", state: "queued" } },
+  });
+  assert.deepEqual(plain(M.packageRows(s, ui(), NOW).map((r) => r.name)), ["jq", "kubectl", "prettier", "ripgrep"]);
+});
+
 test("a typed version resolves the way mise does, segment by segment", () => {
   const releases = ["1.37.1", "1.37.0", "1.4.0", "1.3.10", "1.3.9", "1.3.0-rc.1", "1.3"];
   assert.equal(M.resolveRelease(releases, "1.3"), "1.3", "an exact release wins");
@@ -623,4 +633,17 @@ test("a typed version resolves the way mise does, segment by segment", () => {
   assert.equal(M.resolveRelease(releases, "2"), null);
   assert.equal(M.resolveRelease(null, "1"), null);
   assert.equal(M.resolveRelease(releases, ""), null);
+});
+
+test("the version list shows what a typed version names, the release it installs first", () => {
+  const releases = ["1.37.1", "1.37.0", "1.4.0", "1.3.10", "1.3.9", "1.3.0-rc.1", "1.3"];
+  assert.deepEqual(plain(M.matchReleases(releases, "1.3")), ["1.3", "1.3.10", "1.3.9", "1.3.0-rc.1"], "not 1.37, which mise would not install");
+  assert.deepEqual(plain(M.matchReleases(releases.slice(0, 5), "1.3")), ["1.3.10", "1.3.9"]);
+  assert.deepEqual(plain(M.matchReleases(releases, "rc")), ["1.3.0-rc.1"], "text that names no release finds the ones containing it");
+  assert.deepEqual(plain(M.matchReleases(releases, " ")), releases);
+  assert.deepEqual(plain(M.matchReleases(releases, "2")), []);
+  assert.deepEqual(plain(M.matchReleases(null, "1")), []);
+  for (const q of ["1", "1.3", "1.37", "1.3.0", "1.4"]) {
+    assert.equal(M.matchReleases(releases, q)[0], M.resolveRelease(releases, q), `the highlighted release is the one ${q} installs`);
+  }
 });

@@ -1522,6 +1522,8 @@
 
   const toolSheet = { layer: null };
   const spinnerNote = (text) => html`<div class="tc-combobox-note"><span class="tc-spinner tc-info" aria-hidden="true"></span>${text}</div>`;
+  // A backend spec wraps after its colon and slashes, not mid-name.
+  const pathBreaks = (text) => raw(Kit.esc(text).replace(/[:/]/g, '$&<wbr>'));
   const marked = (text, match) => match
     ? raw(Kit.esc(text.slice(0, match[0])) + '<mark>' + Kit.esc(text.slice(match[0], match[1])) + '</mark>' + Kit.esc(text.slice(match[1])))
     : text;
@@ -1551,9 +1553,9 @@
     }
     const e = o.entry;
     const bins = (e.bins || []).filter((b) => b !== e.name);
-    const meta = o.managed ? html`<span class="tc-option-meta">On ${o.managed}</span>`
-      : o.installed ? html`<span class="tc-option-meta">${icon('check', 'tc-icon--xs')}${o.installed.version || 'Added'}</span>`
-        : bins.length ? html`<span class="tc-option-meta tc-mono">${bins.slice(0, 2).join(' ')}</span>` : '';
+    const meta = o.managed ? html`<span class="tc-option-meta"><span>On ${o.managed}</span></span>`
+      : o.installed ? html`<span class="tc-option-meta">${icon('check', 'tc-icon--xs')}<span>${o.installed.version || 'Added'}</span></span>`
+        : bins.length ? html`<span class="tc-option-meta tc-mono">${bins.slice(0, 2).map((b) => html`<span>${b}</span>`)}</span>` : '';
     return html`<li class="tc-option tc-option--rich" role="option" id="tool-opt-${i}" data-index="${i}" aria-selected="${selected}"${o.managed ? raw(' aria-disabled="true"') : ''}>
       <span class="tc-tile tc-tile--sm" style="--_tile: var(--id-toolchain)" aria-hidden="true">${M.monogram(e.name)}</span>
       <span class="tc-option-text"><span class="tc-option-name">${marked(e.name, o.match)}</span>${e.description ? html`<span class="tc-option-desc">${e.description}</span>` : ''}</span>${meta}</li>`;
@@ -1578,7 +1580,7 @@
     const info = toolSheet.info;
     const bins = (info && info.bins && info.bins.length ? info.bins : t.bins) || [];
     const rows = [
-      ['Source', info ? html`<code>${info.backend || t.id}</code>` : toolSheet.infoError ? html`<span class="tc-muted">${toolSheet.infoError}</span>` : html`<span class="tc-muted"><span class="tc-spinner tc-info" aria-hidden="true"></span> Asking mise…</span>`],
+      ['Source', info ? html`<code>${pathBreaks(info.backend || t.id)}</code>` : toolSheet.infoError ? html`<span class="tc-muted">${toolSheet.infoError}</span>` : html`<span class="tc-muted"><span class="tc-spinner tc-info" aria-hidden="true"></span> Asking mise…</span>`],
     ];
     if (info) rows.push(['Downloads', describeSecurity(info.security)]);
     if (bins.length) rows.push(['Provides', html`${bins.slice(0, 6).map((b, i) => html`${i ? ' ' : ''}<code>${b}</code>`)}${bins.length > 6 ? ' and ' + (bins.length - 6) + ' more' : ''}`]);
@@ -1594,7 +1596,7 @@
     const list = toolSheet.versions;
     const q = toolSheet.versionQuery.trim();
     const current = addedTool(toolSheet.tool.id);
-    const filtered = list ? list.filter((v) => !q || v.startsWith(q) || v.includes(q)).slice(0, 80) : [];
+    const filtered = M.matchReleases(list, q).slice(0, 80);
     const typed = q && !(list || []).includes(q);
     return html`
       <div class="tc-combobox">
@@ -1791,10 +1793,11 @@
         if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); moveActive('versionActive', options.length, e.key === 'ArrowDown' ? 1 : -1); }
         else if (e.key === 'Enter') {
           e.preventDefault();
-          // Enter takes the highlighted release, then a second Enter installs it.
+          // Enter takes the highlighted release, then a second Enter installs
+          // it; one already typed out in full installs at once.
           const pick = options[toolSheet.versionActive];
           const value = pick ? pick.getAttribute('data-version') : '';
-          if (pick && toolSheet.version !== value && (!toolSheet.versionQuery.trim() || value.startsWith(toolSheet.versionQuery.trim()))) {
+          if (pick && toolSheet.version !== value && toolSheet.versionQuery.trim() !== value) {
             toolSheet.version = value;
             e.target.value = value;
             toolSheet.versionQuery = value;
