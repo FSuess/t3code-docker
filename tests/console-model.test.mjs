@@ -457,3 +457,38 @@ test("a build stamp is named short enough for a sidebar, and in full for a toolt
   assert.equal(branch.full, "main@1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d · core");
   assert.equal(M.imageLabel({}).text, null);
 });
+
+test("an install that failed asks for a retry and counts as needing the user", () => {
+  const s = statusWith({
+    harnesses: [harness("claude", { installed: false, runnable: false, signedIn: null, installedVersion: null, version: null, failed: true, failure: "404", operation: "install" })],
+    toolchains: [
+      toolchain("go", { installed: false, version: null, failed: true, failure: "go: cannot find GOROOT directory: /usr/local/go", operation: "install" }),
+      toolchain("uv", { installed: false, version: null }),
+    ],
+  });
+  const go = tool(s, "go");
+  assert.equal(go.state, "failed");
+  assert.deepEqual(plain(go.action), { cmd: "toolchain.install", label: "Retry", icon: "refresh-cw", variant: "warning" });
+  assert.equal(go.status.text, "Install failed: go: cannot find GOROOT directory: /usr/local/go");
+  assert.equal(tool(s, "uv").action.label, "Install", "never tried is still Install");
+  const claude = row(s, "claude");
+  assert.equal(claude.action.label, "Retry");
+  assert.deepEqual(plain(claude.menu.map((m) => m.cmd)), ["harness.version"], "nothing to uninstall");
+  assert.deepEqual(plain(M.needsYou(s, null, ui()).map((r) => r.id)).sort(), ["claude", "go"]);
+  assert.deepEqual(plain(M.navBadges(s, null, ui()).toolchains), { tone: "warn", count: 1 });
+  assert.ok(M.paletteItems(s, null, ui(), NOW).some((i) => i.label === "Retry Go" && i.attention));
+});
+
+test("a row's error is not repeated when its status line already says it", () => {
+  const failure = "go: cannot find GOROOT directory: /usr/local/go";
+  const s = statusWith({ toolchains: [toolchain("go", { installed: false, version: null, failed: true, failure, operation: "install" })] });
+  assert.equal(tool(s, "go", { notices: new Map([["toolchain:go", { tone: "danger", text: failure }]]) }).notice, undefined);
+  const other = tool(s, "go", { notices: new Map([["toolchain:go", { tone: "warn", text: "The setup service restarted" }]]) });
+  assert.equal(other.notice.text, "The setup service restarted");
+});
+
+test("settings an older image left behind flag Environment", () => {
+  assert.deepEqual(plain(M.navBadges(statusWith({ legacyEnv: ["GOROOT", "PATH"] }), null, ui()).environment), { tone: "warn", count: 1 });
+  assert.deepEqual(plain(M.navBadges(statusWith({ legacyEnv: ["GOROOT"] }), null, ui()).more), { tone: "warn", count: 1 });
+  assert.equal(M.navBadges(statusWith({ legacyEnv: [] }), null, ui()).environment, null);
+});

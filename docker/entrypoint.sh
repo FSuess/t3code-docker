@@ -8,7 +8,8 @@ log() { printf '[t3code] %s\n' "$*" >&2; }
 # directories. The PATH it inherits is the container's, and a container
 # recreated from an older image can carry that image's PATH, which listed
 # directories the t3 user can write ahead of the system ones. The inherited PATH
-# is handed back to the unprivileged half.
+# is handed back to the unprivileged half, where the user environment
+# (docker/user-env.sh) drops what that older image added.
 inherited_path="$PATH"
 if [ "$EUID" -eq 0 ]; then
   PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -191,6 +192,16 @@ fi
 # fragment returns early for root; this half is already the unprivileged user.
 # shellcheck source=/dev/null
 [ -r /etc/profile.d/t3-user-env.sh ] && . /etc/profile.d/t3-user-env.sh
+
+# Settings an older image baked in, still in this container's environment (see
+# docker/user-env.sh). Everything started from here runs without them; say so,
+# because `docker exec` still sees them until they are removed from the
+# container's configuration.
+if [ -n "${T3_LEGACY_ENV:-}" ]; then
+  log "ignoring settings left over from an older image: ${T3_LEGACY_ENV}"
+  log "    they point at toolchains this image no longer ships; remove them from the"
+  log "    container's environment (the image sets its own PATH)"
+fi
 
 # A home volume from before the image wrote ~/.npmrc keeps its old one (or
 # none), and `docker exec -u t3 npm i -g` then fails on the root-owned system

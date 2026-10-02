@@ -27,7 +27,11 @@ jobs:
             bash -n "$f"
             shellcheck -S warning "$f"
           done
+          # Sourced by /etc/profile, so plain sh rather than bash.
+          sh -n docker/user-env.sh
+          shellcheck -s sh -S warning docker/user-env.sh
           bash tests/image-profile.test.sh
+          bash tests/user-env.test.sh
           for f in docker/setup/app.js docker/setup/client/*.js docker/setup/design/ui.js; do
             node --check "$f"
           done

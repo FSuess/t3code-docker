@@ -11,6 +11,68 @@
 # its own user config without needing a shell: a bare `docker exec -u t3 npm i
 # -g` never sources this file.
 
+# Settings an older image baked in. Up to v0.4 the image shipped Go, Rust, Bun
+# and Deno under /usr/local and Cursor under /opt/cursor, and pointed its ENV at
+# them. A container recreated by a tool that copies the old container's
+# environment (a hosting panel's "recreate", Watchtower, a duplicated service)
+# keeps those values, and they now name directories that do not exist: Go
+# refuses to run with GOROOT there, and rustup tries to create /usr/local/rustup.
+# Each is dropped only while it still holds exactly the old value and that path
+# is still missing, so a setting someone chose is never touched. What was
+# dropped is listed in T3_LEGACY_ENV, which the entrypoint logs and the setup
+# console shows, because only the container's own configuration can remove it
+# for good: `docker exec` reads that directly.
+for t3_legacy in GOROOT=/usr/local/go RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo \
+    BUN_INSTALL=/usr/local/bun DENO_INSTALL=/usr/local/deno CURSOR_HOME=/opt/cursor; do
+  t3_name="${t3_legacy%%=*}"
+  # Indirect read of a name from the fixed list above.
+  t3_value=""
+  eval "t3_value=\${${t3_name}:-}"
+  if [ "$t3_value" = "${t3_legacy#*=}" ] && [ ! -e "$t3_value" ]; then
+    unset "$t3_name"
+    T3_LEGACY_ENV="${T3_LEGACY_ENV:+$T3_LEGACY_ENV }${t3_name}"
+  fi
+done
+# The same image's PATH, with the bin directories of those toolchains. Split
+# by hand rather than with IFS, so no entry is ever glob-expanded.
+t3_rest="${PATH}:"
+t3_path=""
+t3_dropped=""
+while [ -n "$t3_rest" ]; do
+  t3_dir="${t3_rest%%:*}"
+  t3_rest="${t3_rest#*:}"
+  case "$t3_dir" in
+    /usr/local/go/bin|/usr/local/cargo/bin|/usr/local/bun/bin|/usr/local/deno/bin|/opt/cursor/.local/bin)
+      if [ ! -e "$t3_dir" ]; then t3_dropped=1; continue; fi ;;
+  esac
+  t3_path="${t3_path:+${t3_path}:}${t3_dir}"
+done
+if [ -n "$t3_dropped" ]; then
+  PATH="$t3_path"
+  export PATH
+  case " ${T3_LEGACY_ENV:-} " in
+    *" PATH "*) ;;
+    *) T3_LEGACY_ENV="${T3_LEGACY_ENV:+$T3_LEGACY_ENV }PATH" ;;
+  esac
+fi
+[ -n "${T3_LEGACY_ENV:-}" ] && export T3_LEGACY_ENV
+unset t3_legacy t3_name t3_value t3_rest t3_path t3_dir t3_dropped
+
+# The build this container runs, from a file the image writes at build time.
+# The image's ENV says the same, but values carried over in a recreated
+# container's own environment win over the image's; this file cannot be
+# overridden that way. Read, never sourced.
+if [ -r /etc/t3code-image ]; then
+  while IFS='=' read -r t3_key t3_val; do
+    case "$t3_key" in
+      version) T3_IMAGE_VERSION="$t3_val" ;;
+      variant) T3_IMAGE_VARIANT="$t3_val" ;;
+    esac
+  done < /etc/t3code-image
+  export T3_IMAGE_VERSION T3_IMAGE_VARIANT
+  unset t3_key t3_val
+fi
+
 if [ "$(id -u)" != "0" ]; then
   # User globals from `npm i -g`. Writable by t3, so on t3's PATH only.
   : "${NPM_CONFIG_PREFIX:=/opt/npm-global}"

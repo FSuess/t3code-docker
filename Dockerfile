@@ -320,6 +320,10 @@ ARG IMAGE_VERSION=dev
 ARG IMAGE_VARIANT=core
 ENV T3_IMAGE_VERSION=${IMAGE_VERSION} \
     T3_IMAGE_VARIANT=${IMAGE_VARIANT}
+# The same stamp in a file: a recreated container can carry an older image's
+# T3_IMAGE_* in its own environment, which wins over ENV but not over this
+# (docker/user-env.sh reads it).
+RUN printf 'version=%s\nvariant=%s\n' "$IMAGE_VERSION" "$IMAGE_VARIANT" > /etc/t3code-image
 LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
@@ -375,6 +379,10 @@ ARG IMAGE_VERSION=dev
 ARG IMAGE_VARIANT=browser
 ENV T3_IMAGE_VERSION=${IMAGE_VERSION} \
     T3_IMAGE_VARIANT=${IMAGE_VARIANT}
+# The same stamp in a file: a recreated container can carry an older image's
+# T3_IMAGE_* in its own environment, which wins over ENV but not over this
+# (docker/user-env.sh reads it).
+RUN printf 'version=%s\nvariant=%s\n' "$IMAGE_VERSION" "$IMAGE_VARIANT" > /etc/t3code-image
 LABEL org.opencontainers.image.version="${IMAGE_VERSION}"
 
 # ---------------------------------------------------------------------------

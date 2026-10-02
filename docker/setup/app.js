@@ -397,7 +397,7 @@
         });
       if (setup.state !== 'running' && failed.length) {
         out.push(notice('warn', 'triangle-alert', 'First start could not install ' + M.listOf(failed.map((i) => i.name)),
-          (failed[0].error ? failed[0].error.slice(0, 160) + '. ' : '') + 'Press Install on the row to try again now; the next restart retries as well.'));
+          (failed[0].error ? failed[0].error.slice(0, 160) + '. ' : '') + 'Press Retry on the row to try again now; the next restart retries as well.'));
       } else if (setup.state === 'interrupted') {
         const done = items.filter((i) => i.state === 'done').length;
         out.push(notice(null, 'history', 'First start stopped part way', done + ' of ' + items.length + ' installed. It carries on the next time the container starts.'));
@@ -866,8 +866,12 @@
     const t3 = s.t3 || {};
     const consolePath = BASE || '/';
     const keySource = s.setupKeySource;
+    const legacy = s.legacyEnv || [];
+    const legacyVars = legacy.filter((name) => name !== 'PATH');
     return html`
       ${pageNotices('environment')}
+      ${legacy.length ? notice('warn', 'triangle-alert', 'Settings left over from an older image',
+        html`This container’s environment still has ${legacyVars.map((name, i) => html`${i ? (i === legacyVars.length - 1 ? ' and ' : ', ') : ''}<code>${name}</code>`)}${legacy.includes('PATH') ? html`${legacyVars.length ? ' and ' : ''}the old <code>PATH</code>` : ''}, from an image that shipped its own Go, Rust, Bun and Deno. Everything this image starts ignores them. Remove them from the container’s settings so <code>docker exec</code> stops seeing them too; the image sets its own <code>PATH</code>.`) : ''}
       ${section('ev-server', 'Server', html`<div class="tc-group"><div class="tc-readouts">
         ${readout('T3 Code', server.ok ? html`${dot('ok')}Running ${server.version || ''}` : html`${dot('danger')}Not answering`)}
         ${readout('Image', html`<span class="tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || 'unversioned'}</span>`, true)}

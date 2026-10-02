@@ -116,6 +116,16 @@ report_mount() {
 
 head_ "T3 Code"
 version_of t3 "$T3_INFRA_LAUNCHER" --version
+printf '  %-22s %s\n' "image" "${T3_IMAGE_VERSION:-unknown} · ${T3_IMAGE_VARIANT:-unknown}"
+# Read from `docker exec`'s environment, which is the container's configuration
+# itself: the user environment above dropped these for this run, and the
+# entrypoint does the same for everything it starts, but only removing them from
+# the container's settings stops them coming back.
+if [ -n "${T3_LEGACY_ENV:-}" ]; then
+  warn "older image settings" "ignored: ${T3_LEGACY_ENV}"
+  warn "" "an older image set these and this container still carries them;"
+  warn "" "remove them from its environment (the image sets its own PATH)"
+fi
 printf '  %-22s %s\n' "state dir" "${T3CODE_HOME:-unset}"
 printf '  %-22s %s\n' "bind" "${T3CODE_HOST:-unset}:${T3CODE_PORT:-unset}"
 printf '  %-22s %s\n' "public URL" "${T3_PUBLIC_URL:-<unset - t3-pair will warn>}"

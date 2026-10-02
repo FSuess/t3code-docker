@@ -194,6 +194,14 @@ const T3Model = (() => {
     };
   };
 
+  /**
+   * A row's own notice (an error from its last click), unless the status line
+   * already says it: a failed install reads the same from /status as from the
+   * operation that just ended, and saying it twice reads as two problems.
+   */
+  const distinctNotice = (notice, status) =>
+    notice && !(status && status.text && String(status.text).includes(notice.text)) ? notice : undefined;
+
   // ---------------------------------------------------------------- agents --
   const methodText = (h) => {
     const meta = AGENTS[h.id] || {};
@@ -280,15 +288,19 @@ const T3Model = (() => {
     const notice = ui && ui.notices ? ui.notices.get(act.key) : null;
 
     if (!h.installed) {
-      row.state = 'missing';
       if (h.failed && h.failure) {
+        // The install itself failed: that needs the user, and the verb is Retry.
+        row.state = 'failed';
+        row.attention = true;
         row.status = { dot: 'danger', text: (FAILED[h.operation] || 'Failed') + ': ' + h.failure };
+        row.action = { cmd: 'harness.install', label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
       } else {
+        row.state = 'missing';
         row.status.text = 'Not installed';
+        row.action = { cmd: 'harness.install', label: 'Install', icon: 'download' };
       }
-      row.action = { cmd: 'harness.install', label: 'Install', icon: 'download' };
       row.menu = [{ cmd: 'harness.version', label: 'Install a specific version…', icon: 'history' }];
-      if (notice) row.notice = notice;
+      row.notice = distinctNotice(notice, row.status);
       return row;
     }
 
@@ -327,7 +339,7 @@ const T3Model = (() => {
       if (updateAvailable) row.action = { cmd: 'harness.update', label: 'Update' };
       else if (isKey) row.action = { cmd: 'harness.apikey', label: 'Add key', icon: 'key-round' };
     }
-    if (notice) row.notice = notice;
+    row.notice = distinctNotice(notice, row.status);
 
     // Everything else is one press away in the menu.
     if (updateAvailable) row.menu.push({ cmd: 'harness.update', label: 'Update to ' + latest, icon: 'circle-arrow-up' });
@@ -401,17 +413,24 @@ const T3Model = (() => {
       return row;
     }
     const notice = ui && ui.notices ? ui.notices.get(act.key) : null;
-    if (notice) row.notice = notice;
 
     if (!t.installed) {
-      row.state = 'missing';
       row.dim = true;
-      if (t.failed && t.failure) row.status = { dot: 'danger', text: (FAILED[t.operation] || 'Failed') + ': ' + t.failure };
-      else if (planned || !status.setup || status.setup.state === 'off') row.status.text = 'Not installed';
-      else row.status = { dot: null, text: 'Not installed · left out of', code: 'T3_PREINSTALL' };
-      row.action = { cmd: 'toolchain.install', label: 'Install', icon: 'download' };
+      if (t.failed && t.failure) {
+        row.state = 'failed';
+        row.attention = true;
+        row.status = { dot: 'danger', text: (FAILED[t.operation] || 'Failed') + ': ' + t.failure };
+        row.action = { cmd: 'toolchain.install', label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
+      } else {
+        row.state = 'missing';
+        if (planned || !status.setup || status.setup.state === 'off') row.status.text = 'Not installed';
+        else row.status = { dot: null, text: 'Not installed · left out of', code: 'T3_PREINSTALL' };
+        row.action = { cmd: 'toolchain.install', label: 'Install', icon: 'download' };
+      }
+      row.notice = distinctNotice(notice, row.status);
       return row;
     }
+    row.notice = distinctNotice(notice, row.status);
     if (t.failed && t.failure && t.operation && t.operation !== 'install') {
       row.state = 'failed';
       row.attention = true;
@@ -703,8 +722,10 @@ const T3Model = (() => {
         : toolsRunning ? { tone: 'info', count: toolsRunning } : { count: tools.filter((t) => t.version).length },
       ports: portsFailed ? { tone: 'warn', count: portsFailed }
         : published ? { tone: 'info', count: published } : ports ? { count: portList.length } : null,
-      environment: null,
-      more: toolsFailed ? { tone: 'warn', count: toolsFailed } : null,
+      // Settings an older image left in the container's environment.
+      environment: (s.legacyEnv || []).length ? { tone: 'warn', count: 1 } : null,
+      more: toolsFailed + ((s.legacyEnv || []).length ? 1 : 0)
+        ? { tone: 'warn', count: toolsFailed + ((s.legacyEnv || []).length ? 1 : 0) } : null,
     };
   };
 

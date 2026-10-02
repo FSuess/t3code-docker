@@ -83,10 +83,24 @@ trap cleanup EXIT
 
 printf '\nSmoke-testing %s (variant %s)\n\n' "$IMAGE" "$VARIANT"
 
+# Run as a container recreated from a v0.4 image does: a hosting panel or
+# Watchtower that copies the old container's environment keeps the toolchain
+# settings that image baked in, and its old variant name. Everything below, the
+# first-start install of Go and Rust included, has to work regardless.
+LEGACY_VARIANT=slim
+[ "$VARIANT" = browser ] && LEGACY_VARIANT=full
+LEGACY_ENV=(-e GOROOT=/usr/local/go -e GOPATH=/home/t3/go
+  -e RUSTUP_HOME=/usr/local/rustup -e CARGO_HOME=/usr/local/cargo
+  -e BUN_INSTALL=/usr/local/bun -e DENO_INSTALL=/usr/local/deno -e CURSOR_HOME=/opt/cursor
+  -e "T3_IMAGE_VARIANT=${LEGACY_VARIANT}")
+# ...and the PATH it declared, which the startup-pairing container below runs with.
+LEGACY_PATH=/usr/local/bun/bin:/usr/local/deno/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/t3/go/bin:/opt/cursor/.local/bin:/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 docker run -d --name "$NAME" \
   -p "127.0.0.1:${PORT}:3773" \
   -e "T3_PUBLIC_URL=${PUBLIC_URL}" \
   -e "T3_SETUP_KEY=${SETUP_KEY}" \
+  "${LEGACY_ENV[@]}" \
   "$IMAGE" >/dev/null
 
 printf 'Waiting for the server to answer...\n'
@@ -392,6 +406,32 @@ assert 'volumeKind' in s['paths'] and 'volumeBytes' in s['paths'], 'storage fact
 "
 }
 check "status carries what the console reads" status_has_console_fields
+
+# This container carries an older image's settings (see LEGACY_ENV). They are
+# reported, the image still names itself correctly, and nothing it started runs
+# with them.
+legacy_settings_are_reported() {
+  docker exec "$NAME" sh -c \
+    "curl -sS --max-time 25 -b /tmp/jar http://127.0.0.1:3774/status" | python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+want = {'GOROOT', 'RUSTUP_HOME', 'CARGO_HOME', 'BUN_INSTALL', 'DENO_INSTALL', 'CURSOR_HOME'}
+assert want <= set(s.get('legacyEnv') or []), s.get('legacyEnv')
+assert (s.get('image') or {}).get('variant') == '$VARIANT', s.get('image')
+"
+}
+check "settings left by an older image are reported, not obeyed" legacy_settings_are_reported
+setup_service_runs_without_them() {
+  local env
+  env="$(docker exec "$NAME" sh -c 'tr "\0" "\n" < "/proc/$(pgrep -f "^/usr/local/bin/node /opt/t3-setup/server.mjs" | head -1)/environ"')" || return 1
+  case "$env" in *T3_SETUP_PORT=*) ;; *) return 1 ;; esac
+  ! printf '%s\n' "$env" | grep -qE '^(GOROOT|RUSTUP_HOME|CARGO_HOME|BUN_INSTALL|DENO_INSTALL|CURSOR_HOME)='
+}
+check "and the services the entrypoint starts run without them" setup_service_runs_without_them
+check "the log says which were ignored" \
+  "docker logs $NAME 2>&1 | grep -q 'ignoring settings left over from an older image: GOROOT'"
+check "t3-doctor says to remove them" \
+  "docker exec $NAME t3-doctor 2>/dev/null | grep -q 'older image settings'"
 
 # Lock console: the session ends here and the key is needed again.
 lock_signs_out() {
@@ -944,15 +984,13 @@ rm -f "$SETUP_JAR"
 
 printf '\nStartup pairing link\n'
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
-# With the PATH every image up to v0.4 declared, which a container recreated by a
-# tool that copies the old container's environment keeps: the entrypoint and the
-# helpers run their root step from the system directories only, whatever PATH
-# the container hands them.
-LEGACY_PATH=/usr/local/bun/bin:/usr/local/deno/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/t3/go/bin:/opt/cursor/.local/bin:/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# With the whole environment of a container recreated from a v0.4 image, PATH
+# included: the entrypoint and the helpers run their root step from the system
+# directories only, whatever PATH the container hands them.
 docker run -d --name "${NAME}-boot" -e T3_PREINSTALL=none \
   -e "T3_PUBLIC_URL=${PUBLIC_URL}" \
   -e T3_PRINT_PAIRING_ON_START=1 \
-  -e "PATH=${LEGACY_PATH}" \
+  "${LEGACY_ENV[@]}" -e "PATH=${LEGACY_PATH}" \
   "$IMAGE" >/dev/null
 boot_ok=0
 for _ in $(seq 1 40); do
@@ -969,7 +1007,9 @@ else
   no "T3_PRINT_PAIRING_ON_START logs a usable pairing link"
   docker logs "${NAME}-boot" 2>&1 | tail -15
 fi
-check "a helper run as root under that PATH steps down and works" \
+check "an older image's PATH is reported and set aside" \
+  "docker logs ${NAME}-boot 2>&1 | grep -q 'ignoring settings left over from an older image: .*PATH'"
+check "and a helper run as root under it steps down and works" \
   "docker exec ${NAME}-boot t3-harness list 2>/dev/null | grep -q '^claude'"
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
 

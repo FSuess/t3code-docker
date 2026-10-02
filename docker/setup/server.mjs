@@ -566,6 +566,10 @@ const status = async () => {
     t3: { port: Number(T3_PORT), bind: `${process.env.T3CODE_HOST || "0.0.0.0"}:${T3_PORT}` },
     setupPort: PORT,
     setupKeySource: SETUP_KEY_SOURCE,
+    // Settings an older image baked in that this container still carries, which
+    // the user environment dropped for everything the entrypoint started
+    // (docker/user-env.sh); only the container's configuration can remove them.
+    legacyEnv: (process.env.T3_LEGACY_ENV ?? "").split(/\s+/).filter(Boolean),
     // Environment states where things live. Read them rather than printing a
     // plausible-looking default: a wrong path here is worse than no path.
     paths: {
