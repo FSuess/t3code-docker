@@ -99,7 +99,7 @@ enter your `T3_SETUP_KEY`, and press **Create pairing link**. Scan the QR with
 the T3 Code app, or open the link in a browser.
 
 From there you are inside T3 Code. Sign each agent in from the setup page's
-**Agents** card, through its own browser flow, then enable the provider under
+**Agents** page, through its own browser flow, then enable the provider under
 **Settings → Providers**.
 
 That is the whole path — no shell in the container at any point. `docker exec`
@@ -151,28 +151,40 @@ T3_PUBLIC_URL=https://t3.example.com
 
 Leave `T3_SETUP_KEY` empty and one is generated at boot and printed to the log;
 setting it yourself keeps it stable when the container is recreated. Then open
-port 3774, enter the key, and press **Create pairing link** — you get a URL and
-a QR code built against your public address, valid for as long as you choose.
-The same panel shows the **pair code** on its own, for clients like the desktop
-app that ask for a server URL and a code as separate fields. The page also
-shows whether the server is healthy, whether `T3_PUBLIC_URL` is set, and which
-agents are signed in.
+port 3774 and enter the key.
 
-Beyond pairing it is a small management surface: connected clients with a
-**Revoke** button each, outstanding unredeemed links with the same, the
-environment status, an **Agents** card that signs your coding agents in (and
-installs, updates or removes them), and a **Toolchains** card that does the same
-for Go, Rust, Bun, Deno and uv. While the first start is still installing, a
-banner at the top says what it is on.
+The console opens on **Overview**, which lists what stands between this
+container and a working phone — the server running, `T3_PUBLIC_URL` set, a
+device paired, the agents signed in — with the next step's button in the list.
+Once all four are done it folds into a single **Ready** line and shows recent
+activity instead. On a desktop the pages are in a sidebar (Overview, Devices,
+Agents, Toolchains, Ports, Environment); on a phone they are a tab bar, and
+every flow fits a 390px screen.
 
-The top bar shows which image is running — `v0.5.0 · browser` — alongside the
-server's health, so a pull can be confirmed from the page instead of guessed at.
-It reads a build stamp baked in at image build time: the release tag in CI, and
-`dev` for a local build.
+On **Devices**, press **Create pairing link** — you get a URL and a QR code
+built against your public address, valid for as long as you choose, and the
+**pair code** on its own for clients like the desktop app that ask for a
+server URL and a code as separate fields. The link is tracked: once the device
+it was made for appears, the page says **Paired with …** with an **Open T3
+Code** button, and says so if the link expires or is revoked first. Paired
+devices and unused links are listed below it, each with **Revoke**.
 
-Creating a link tracks it: once the device it was made for appears, the panel
-flips to **Paired** with an **Open T3 Code** button, and says so if the link
-expires or is revoked before anyone uses it.
+Every row shows one action for its state — **Install**, **Sign in**,
+**Update**, **Retry** — and keeps the rest in its **⋯** menu (a bottom sheet on a
+phone). Uninstalling, revoking and publishing a database port ask first. **⌘K**
+(Ctrl K) opens a palette that reaches every action and page, `G` then a letter
+goes to a page, and `P` on Devices makes a link.
+
+The sidebar's server card shows which image is running — `v0.5.0 · browser` —
+alongside the server's health, so a pull can be confirmed from the page instead
+of guessed at. It reads a build stamp baked in at image build time: the release
+tag in CI, and `dev` for a local build. **Environment** has the rest: the
+public URL, where state and work live and whether those mounts survive a
+recreate, the agent browser, **Copy diagnostics** (the status with anything
+identifying taken out, for an issue), and **Lock** to sign this browser out.
+
+The page is a single self-contained document: no fonts, scripts or styles are
+fetched from anywhere, which matters over a tunnel from a phone.
 
 When the console is reachable at `/__setup` on the same hostname — the routing
 in [Exposing it through one hostname](#exposing-it-through-one-hostname) — T3
@@ -184,13 +196,16 @@ controls live, and renders nothing when the console is not routed there.
 ### Signing agents in, and keeping them current, from the page
 
 The agents are not baked into the image; the first start installs them onto
-the volume. Each row of the **Agents** card shows the exact version installed
-and points T3 Code at that executable, and **Update** and **Uninstall** are
-buttons on the same row: Update moves to the newest release (or one you type),
-and a download carries on in the background with the row showing progress, so
-a slow connection or a tunnel's request timeout does not matter. If an update
-fails, the previous version stays installed and working. Nothing installs or
-updates just because a poll ran. From a shell:
+the volume. Each row on the **Agents** page shows the exact version installed
+and points T3 Code at that executable. When a newer release exists the version
+gets an arrow and the row an **Update** button; **Install a specific
+version…** and **Uninstall…** are in its menu. A download carries on in the
+background with the row showing its progress and a **Cancel** button, so a slow
+connection or a tunnel's request timeout does not matter. Operations run one
+at a time: press Update on three rows, or **Update all**, and they queue. If an
+update fails, the previous version stays installed and working. Nothing
+installs or updates just because a poll ran; the newest releases are looked up
+in the background every few hours. From a shell:
 
 ```bash
 docker compose exec t3code t3-harness list
@@ -216,13 +231,15 @@ by running the CLIs rather than reading about them:
 | Cursor | browser flow, polls to completion | — |
 | Grok Build | device code — URL plus a code to confirm | — |
 
-**Sign in** shows the URL as a link and a QR code, so you can approve it on the
-phone in your hand; where the CLI wants the code pasted back, a field appears
-for it. Nothing is typed into a terminal, and the page never becomes one — it
-runs the CLI and reads what it prints.
+**Sign in** opens a sheet that follows the CLI's own flow as numbered steps:
+open the page (or scan its QR on the phone in your hand), enter the device code
+shown large, or paste the code the browser gives back. It closes by itself once
+the agent reports a session; **Esc** cancels and stops the CLI. Nothing is
+typed into a terminal, and the page never becomes one — it runs the CLI and
+reads what it prints.
 
 <p align="center">
-  <img src="docs/media/agent-signin.png" alt="Signing Claude Code in from the setup page" width="100%">
+  <img src="docs/media/agent-signin.png" alt="Signing Grok Build in with a device code, from the setup page" width="100%">
 </p>
 
 The signed-in badge asks each CLI rather than looking for a credentials file, so
@@ -381,13 +398,14 @@ laptop. Docker's own answer is to publish the port when the container starts,
 which means predicting the port before you know it, and still leaves you
 without TLS or a route in from outside your LAN.
 
-So the setup page has a **Ports** panel. It lists what is listening, including
-servers bound to `127.0.0.1`, which is the usual default and the case that most
-needs help. Press **Publish** and you get a public `https://` URL and a QR code
-to open it on another device:
+So the setup page has a **Ports** page. It lists what is listening and what
+runs it (`vite`, `next-server`), including servers bound to `127.0.0.1`, which
+is the usual default and the case that most needs help. Press **Publish** and
+you get a public `https://` URL and a QR code to open it on another device. A
+port that looks like a database asks first:
 
 <p align="center">
-  <img src="docs/media/ports-panel.png" alt="The Ports panel, listing what is listening in the container" width="100%">
+  <img src="docs/media/ports-panel.png" alt="The Ports page, listing what is listening in the container" width="100%">
 </p>
 
 The same thing from a terminal:
@@ -399,8 +417,8 @@ t3-expose stop 3000   # take it down
 ```
 
 `t3-expose` is a client of the setup server's `/ports` API - the same API the
-panel calls - not a second implementation. Publish from the terminal and the
-panel shows it; press Stop in the panel and the terminal agrees. There is one
+page calls - not a second implementation. Publish from the terminal and the
+page shows it; press Stop on the page and the terminal agrees. There is one
 place tunnels are started, so the two cannot drift apart.
 
 Underneath is a [Cloudflare quick
@@ -472,8 +490,9 @@ environment variables at a compatible endpoint.
 
 Go, Rust (with clippy and rustfmt), Bun, Deno and uv install on the first start
 alongside the agents, through [mise](https://mise.jdx.dev/), into the persistent
-home, and work in every directory. The **Toolchains** card on the setup page
-updates or removes each one, or installs one you left out of `T3_PREINSTALL`.
+home, and work in every directory. The **Toolchains** page in the setup
+console updates or removes each one, or installs one you left out of
+`T3_PREINSTALL`.
 Node and Python come with the image.
 
 Projects can still ask for their own versions: mise reads whatever the project
