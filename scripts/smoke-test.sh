@@ -421,17 +421,29 @@ assert (s.get('image') or {}).get('variant') == '$VARIANT', s.get('image')
 "
 }
 check "settings left by an older image are reported, not obeyed" legacy_settings_are_reported
+# Read as t3, the user the service runs as: another user's /proc/<pid>/environ
+# needs CAP_SYS_PTRACE, which Docker does not grant even to root in the
+# container. The pattern is anchored at the end of the command line, because
+# the sh running it carries the same text earlier in its own.
 setup_service_runs_without_them() {
   local env
-  env="$(docker exec "$NAME" sh -c 'tr "\0" "\n" < "/proc/$(pgrep -f "^/usr/local/bin/node /opt/t3-setup/server.mjs" | head -1)/environ"')" || return 1
+  env="$(docker exec -u t3 "$NAME" sh -c 'tr "\0" "\n" < "/proc/$(pgrep -f "node /opt/t3-setup/server\.mjs$" | head -1)/environ"')" || return 1
   case "$env" in *T3_SETUP_PORT=*) ;; *) return 1 ;; esac
-  ! printf '%s\n' "$env" | grep -qE '^(GOROOT|RUSTUP_HOME|CARGO_HOME|BUN_INSTALL|DENO_INSTALL|CURSOR_HOME)='
+  ! grep -qE '^(GOROOT|RUSTUP_HOME|CARGO_HOME|BUN_INSTALL|DENO_INSTALL|CURSOR_HOME)=' <<<"$env"
 }
 check "and the services the entrypoint starts run without them" setup_service_runs_without_them
+# Each of these captures the output and then matches it. Piped straight into
+# `grep -q`, the writer is killed by SIGPIPE when grep stops at an early match,
+# and under pipefail the check fails for a reason unrelated to what it tests.
+output_has() {
+  local out
+  out="$(eval "$1" 2>&1)" || true
+  grep -q -- "$2" <<<"$out"
+}
 check "the log says which were ignored" \
-  "docker logs $NAME 2>&1 | grep -q 'ignoring settings left over from an older image: GOROOT'"
+  "output_has 'docker logs $NAME' 'ignoring settings left over from an older image: GOROOT'"
 check "t3-doctor says to remove them" \
-  "docker exec $NAME t3-doctor 2>/dev/null | grep -q 'older image settings'"
+  "output_has 'docker exec $NAME t3-doctor' 'older image settings'"
 
 # Lock console: the session ends here and the key is needed again.
 lock_signs_out() {
@@ -1008,9 +1020,9 @@ else
   docker logs "${NAME}-boot" 2>&1 | tail -15
 fi
 check "an older image's PATH is reported and set aside" \
-  "docker logs ${NAME}-boot 2>&1 | grep -q 'ignoring settings left over from an older image: .*PATH'"
+  "output_has 'docker logs ${NAME}-boot' 'ignoring settings left over from an older image: .*PATH'"
 check "and a helper run as root under it steps down and works" \
-  "docker exec ${NAME}-boot t3-harness list 2>/dev/null | grep -q '^claude'"
+  "output_has 'docker exec ${NAME}-boot t3-harness list' '^claude'"
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
 
 printf '\n%d passed, %d failed\n\n' "$pass" "$fail"
