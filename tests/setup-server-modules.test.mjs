@@ -164,3 +164,12 @@ test("concurrent callers share one pass", async () => {
   await Promise.all([world.cache.refresh(), world.cache.refresh(), world.cache.refresh({ force: true })]);
   assert.equal(world.lookups.length, 2);
 });
+
+test("one key can be looked up now, outside the schedule, and a failure changes nothing", async () => {
+  const world = latestWorld({ answers: { "package:jq": "1.8.2", "package:bad": new Error("offline") } });
+  await world.cache.refreshOne("package:jq");
+  assert.equal(world.cache.get("package:jq").latestVersion, "1.8.2");
+  assert.deepEqual(JSON.parse(world.written).versions["package:jq"], { version: "1.8.2", at: 1_000_000 });
+  await world.cache.refreshOne("package:bad");
+  assert.equal(world.cache.get("package:bad").latestVersion, null);
+});

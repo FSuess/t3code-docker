@@ -58,9 +58,24 @@ export function createLatestCache({ keys, lookup, read, write, ttlMs = DEFAULT_T
     return running;
   };
 
+  /**
+   * Look one key up now, outside the schedule: a tool just added at an older
+   * release should say a newer one exists without waiting for the next pass.
+   */
+  const refreshOne = async (key) => {
+    await load();
+    try {
+      const version = String(await lookup(key)).trim();
+      if (!version) return;
+      versions[key] = { version, at: now() };
+      await write(JSON.stringify({ checkedAt, versions }, null, 2));
+    } catch { /* the scheduled pass tries again */ }
+  };
+
   return {
     load,
     refresh,
+    refreshOne,
     refreshing: () => Boolean(running),
     /** `{ latestVersion, latestCheckedAt }` for a row; nulls when unknown. */
     get: (key) => {

@@ -286,11 +286,18 @@ const latestCache = createLatestCache({
   keys: () => [
     ...[...HARNESS_IDS].map((id) => `harness:${id}`),
     ...[...TOOLCHAIN_IDS].map((id) => `toolchain:${id}`),
+    // The tools added beyond those, as the last status read listed them.
+    ...[...knownPackages].map((id) => `package:${id}`),
   ],
   lookup: async (key) => {
-    const [target, id] = key.split(":");
+    // On the first colon only: a package id can carry its own (npm:prettier).
+    const cut = key.indexOf(":");
+    const target = key.slice(0, cut);
+    const id = key.slice(cut + 1);
     const manager = await loadHarness();
-    return target === "harness" ? manager.latest(id) : manager.toolchains.latest(id);
+    if (target === "harness") return manager.latest(id);
+    if (target === "package") return manager.packages.latest(id);
+    return manager.toolchains.latest(id);
   },
   read: async () => {
     const { readFile } = await import("node:fs/promises");
@@ -304,6 +311,66 @@ const latestCache = createLatestCache({
 });
 /** Each row with the newest release known for it (`latestVersion`, `latestCheckedAt`). */
 const withLatest = (target, rows) => rows.map((row) => ({ ...row, ...latestCache.get(`${target}:${row.id}`) }));
+
+// --- added tools ---------------------------------------------------------------
+//
+// Any mise tool beyond the agents and toolchains (docker/harness/packages.mjs).
+// The registry ships inside mise, so it is read once, kept parsed and
+// compressed, and lets each row say what a tool is and which commands it
+// provides. Versions and details ask the network, so they are fetched on
+// demand, cached briefly, and shared by concurrent requests.
+const knownPackages = new Set();
+let registryLoad = null;
+const packageRegistry = () => {
+  registryLoad ??= (async () => {
+    const entries = await (await loadHarness()).packages.registry();
+    const byName = new Map();
+    for (const entry of entries) {
+      byName.set(entry.name, entry);
+      for (const alias of entry.aliases) if (!byName.has(alias)) byName.set(alias, entry);
+    }
+    // The browser needs no full backend specs, only their kinds.
+    const tools = entries.map(({ name, description, kinds, bins, aliases }) => ({ name, description, kinds, bins, aliases }));
+    const body = Buffer.from(JSON.stringify({ tools }));
+    return { entries, byName, body, gzipped: await gzip(body) };
+  })().catch((error) => {
+    registryLoad = null;
+    throw error;
+  });
+  return registryLoad;
+};
+
+/** A package row with what the registry says about it, when it is in there. */
+const withRegistry = async (rows) => {
+  if (!rows.length) return rows;
+  const registry = await withTimeout(packageRegistry(), 1000);
+  if (!registry.ok) return rows;
+  return rows.map((row) => {
+    const entry = registry.value.byName.get(row.id);
+    return entry ? { ...row, description: entry.description, bins: entry.bins } : row;
+  });
+};
+
+/** A small TTL cache whose concurrent misses share one lookup. */
+const ttlCache = (ttlMs, limit = 200) => {
+  const entries = new Map();
+  return (key, load) => {
+    const hit = entries.get(key);
+    if (hit && (hit.pending || Date.now() - hit.at < ttlMs)) return hit.value;
+    const value = load().then((result) => {
+      entries.set(key, { at: Date.now(), value: Promise.resolve(result) });
+      return result;
+    }, (error) => {
+      entries.delete(key);
+      throw error;
+    });
+    entries.set(key, { at: Date.now(), pending: true, value });
+    if (entries.size > limit) entries.delete(entries.keys().next().value);
+    return value;
+  };
+};
+const versionsCache = ttlCache(30 * 60 * 1000);
+const infoCache = ttlCache(6 * 60 * 60 * 1000);
 
 const storage = createStorageFacts({ volume: VOLUME, workspace: WORKSPACE });
 
@@ -547,6 +614,11 @@ const status = async () => {
   ]);
   noticeSetupProgress(setup);
   noticeSessions(sessions);
+  // Added tools, with what the registry says about each; their ids feed the
+  // background check for newer releases.
+  const packageRows = await withRegistry(toolchainSnap?.packages ?? []);
+  knownPackages.clear();
+  for (const row of packageRows) if (row.configured) knownPackages.add(row.id);
   const harnesses = harnessSnap?.harnesses ?? [];
   const disk = storage.snapshot();
   for (const entry of harnessSnap?.degraded ?? []) {
@@ -599,6 +671,8 @@ const status = async () => {
       refreshing: harnessSnap?.cache?.refreshing ?? false,
     },
     toolchains: withLatest("toolchain", toolchainSnap?.toolchains ?? []),
+    // Every other tool in the global mise config, added here or with `mise use -g`.
+    packages: withLatest("package", packageRows),
     // The background install of everything T3_PREINSTALL names, on a first
     // start: what it planned, where it is, and what failed (retried on the
     // next start, or from the row's own Install button).
@@ -1181,8 +1255,10 @@ const syncWarning = (id, sync) => {
 // `t3-harness`) shows up through the manager's inProgress facts instead.
 const operations = new Map(); // "harness:claude" -> { kind, state, error, progress, ... }
 const TOOLCHAIN_IDS = new Set(["go", "rust", "bun", "deno", "uv"]);
+const LIFECYCLE_PATHS = { harnesses: "harness", toolchains: "toolchain", packages: "package" };
 const TOOLCHAIN_NAMES = { go: "Go", rust: "Rust", bun: "Bun", deno: "Deno", uv: "uv" };
-const lifecycleName = (target, id) => (target === "harness" ? AGENTS[id]?.name : TOOLCHAIN_NAMES[id]) ?? id;
+const lifecycleName = (target, id) =>
+  (target === "harness" ? AGENTS[id]?.name : target === "toolchain" ? TOOLCHAIN_NAMES[id] : harnessModule?.displayName?.(id)) ?? id;
 
 // The manager runs one operation at a time under its lock. Rather than turn a
 // second click into "busy", the page's operations queue here and run in order:
@@ -1235,8 +1311,13 @@ const finishJob = (job, { result, sync }) => {
     finishedAt: Date.now(),
   });
   const name = lifecycleName(job.target, job.id);
+  // An added tool is not in the scheduled check until the next status read
+  // lists it; look its newest release up now.
+  if (job.target === "package" && result?.ok && job.kind !== "uninstall") {
+    void latestCache.refreshOne(`package:${job.id}`);
+  }
   if (result?.ok) {
-    const facts = result.harness ?? result.toolchain ?? null;
+    const facts = result.harness ?? result.toolchain ?? result.package ?? null;
     const version = job.kind === "uninstall" ? null : facts?.installedVersion ?? facts?.version ?? null;
     recordEvent(`${job.target}.${PAST[job.kind]}`, `${DONE_TEXT[job.kind]} ${name}${version && job.kind === "update" ? " to" : ""}`, version);
   } else if (!cancelled) {
@@ -1262,7 +1343,7 @@ const runJob = async (job) => {
     drain();
     return outcome;
   }
-  const ops = job.target === "harness" ? manager : manager.toolchains;
+  const ops = job.target === "harness" ? manager : job.target === "package" ? manager.packages : manager.toolchains;
   let markStarted;
   const started = new Promise((resolve) => { markStarted = resolve; });
   const options = {
@@ -1319,15 +1400,34 @@ const runJob = async (job) => {
   return Promise.race([started, done]);
 };
 
-const startLifecycle = async (target, kind, input) => {
-  const ids = target === "harness" ? HARNESS_IDS : TOOLCHAIN_IDS;
-  const rawId = input?.id ?? input?.agent ?? "";
+/**
+ * The id an operation is keyed and run under, or the answer refusing it. A
+ * package's name comes from whoever typed it, so it is validated, refused when
+ * an agent or toolchain owns it, and normalized (rg -> ripgrep) before it is
+ * queued: two spellings of one tool must not queue as two jobs.
+ */
+const lifecycleId = async (target, rawId) => {
   const id = String(rawId ?? "").trim();
+  if (target === "package") {
+    const normalized = await (await loadHarness()).packages.normalize(id);
+    if (!normalized.ok) return { refused: { http: 400, body: normalized } };
+    return { id: normalized.id };
+  }
+  const ids = target === "harness" ? HARNESS_IDS : TOOLCHAIN_IDS;
   if (!ids.has(id)) {
     const code = target === "harness" ? "unknown-harness" : "unknown-toolchain";
-    return { http: 404, body: { ok: false, code, error: `unknown ${target}: ${String(rawId ?? "")}` } };
+    return { refused: { http: 404, body: { ok: false, code, error: `unknown ${target}: ${id}` } } };
   }
-  const rawVersion = target === "harness" ? input?.version : undefined;
+  return { id };
+};
+
+const startLifecycle = async (target, kind, input) => {
+  const resolved = await lifecycleId(target, input?.id ?? input?.agent ?? "");
+  if (resolved.refused) return resolved.refused;
+  const { id } = resolved;
+  // A version applies to installing an agent or an added tool; toolchains
+  // always take mise's newest.
+  const rawVersion = target === "harness" || (target === "package" && kind === "install") ? input?.version : undefined;
   const version = rawVersion === undefined || rawVersion === null || String(rawVersion).trim() === ""
     ? undefined
     : String(rawVersion).trim();
@@ -1356,6 +1456,7 @@ const startLifecycle = async (target, kind, input) => {
     ...(result?.error ? { error: result.error } : {}),
     ...(result?.harness ? { harness: toPublicHarness(result.harness) } : {}),
     ...(result?.toolchain ? { toolchain: result.toolchain } : {}),
+    ...(result?.package ? { package: result.package } : {}),
     ...(sync ? { sync } : {}),
   };
   return { http: lifecycleHttpStatus(result?.code ?? "failed"), body };
@@ -1383,7 +1484,9 @@ const ROUTES = ["/login", "/logout", "/status", "/pair", "/revoke", "/ports",
   "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
   "/auth/apikey/remove", "/auth/apikey", "/auth/signin", "/auth/session", "/auth/code", "/auth/cancel",
-  "/providers", "/updates/check"];
+  "/providers", "/updates/check",
+  "/packages/install", "/packages/update", "/packages/uninstall", "/packages/cancel",
+  "/packages/registry", "/packages/versions", "/packages/info"];
 
 // The session cookie. Secure when the request reached us over HTTPS (directly
 // or through a proxy that says so); a plain-http LAN address must still work.
@@ -1527,10 +1630,10 @@ const server = createServer(async (req, res) => {
         return sendJson(res, 500, { error: String(error?.message ?? error) });
       }
     }
-    const lifecycle = /^\/(harnesses|toolchains)\/(install|update|uninstall|cancel)$/.exec(route);
+    const lifecycle = /^\/(harnesses|toolchains|packages)\/(install|update|uninstall|cancel)$/.exec(route);
     if (req.method === "POST" && lifecycle) {
       try {
-        const target = lifecycle[1] === "harnesses" ? "harness" : "toolchain";
+        const target = LIFECYCLE_PATHS[lifecycle[1]];
         const input = JSON.parse((await readBody(req)) || "{}");
         const { http, body } = lifecycle[2] === "cancel"
           ? cancelLifecycle(target, input?.id)
@@ -1539,6 +1642,45 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }
+    }
+
+    // mise's registry, for the Add a tool search: local to the mise binary,
+    // read once, served compressed (it runs to a thousand tools).
+    if (req.method === "GET" && route === "/packages/registry") {
+      try {
+        const registry = await packageRegistry();
+        const gz = /\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""));
+        return send(res, 200, gz ? registry.gzipped : registry.body, {
+          "content-type": "application/json",
+          vary: "accept-encoding",
+          ...(gz ? { "content-encoding": "gzip" } : {}),
+        });
+      } catch (error) {
+        return sendJson(res, 503, { ok: false, error: `mise could not list its registry: ${String(error?.message ?? error)}` });
+      }
+    }
+    // A tool's releases, newest first, and where it comes from. Both ask the
+    // network through mise, so they are cached and bounded.
+    if (req.method === "GET" && (route === "/packages/versions" || route === "/packages/info")) {
+      const manager = await loadHarness();
+      const parsed = harnessModule.parseToolSpec(raw.searchParams.get("id"));
+      if (!parsed.ok) return sendJson(res, 400, { ok: false, code: "invalid-tool", error: parsed.error });
+      const work = route === "/packages/versions"
+        ? versionsCache(parsed.id, async () => ({ versions: await manager.packages.versions(parsed.id) }))
+        : infoCache(parsed.id, async () => {
+          const info = await manager.packages.info(parsed.id);
+          const registry = await packageRegistry().catch(() => null);
+          const bins = registry?.byName.get(parsed.id)?.bins ?? [];
+          // Commands the image already has. mise's shims come first on t3's
+          // PATH, so an added tool takes precedence over these in terminals
+          // and for agents; the sheet says so before anything is installed.
+          const shadows = bins.filter((bin) => /^[\w.+-]+$/.test(bin)
+            && ["/usr/local/bin", "/usr/bin", "/bin"].some((dir) => existsSync(`${dir}/${bin}`)));
+          return { ...info, bins, shadows };
+        });
+      const answer = await withTimeout(work, 20_000);
+      if (!answer.ok) return sendJson(res, 502, { ok: false, error: String(answer.error ?? "mise did not answer").slice(0, 300) });
+      return sendJson(res, 200, { ok: true, id: parsed.id, ...answer.value });
     }
 
     // "Check for updates now": a fresh pass in the background; rows pick the
