@@ -256,6 +256,12 @@
 .tc-tile--port { --_tile: var(--fg-muted); width: auto; min-width: var(--monogram); padding: 0 4px; border-radius: 5px; font-weight: 500; font-size: 10px; text-transform: none; }
 .tc-tile--port[data-live] { --_tile: var(--info-text); }
 .tc-tile--icon { background: none; color: var(--fg-muted); }
+/* An agent's own mark on a neutral tile, in place of its monogram. */
+.tc-tile--mark { color: var(--fg); background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.tc-tile--mark > .tc-agentmark { width: 68%; height: 68%; }
+.tc-agentmark { display: block; flex: none; }
+.tc-agentmark-ink { fill: var(--agentmark-ink); }
+.tc-agentmark-hole { fill: var(--agentmark-hole); }
 .tc-tile .tc-tile-badge { position: absolute; right: -2px; bottom: -2px; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--surface); background: var(--ok); }
 .tc-tile .tc-tile-badge[data-tone="warn"] { background: var(--warn); }
 .tc-tile .tc-tile-badge[data-tone="idle"] { background: var(--idle); }

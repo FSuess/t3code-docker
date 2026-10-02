@@ -56,6 +56,9 @@
   --id-cursor: oklch(0.541 0.281 293.009);
   --id-grok: oklch(0.588 0.158 241.966);
   --id-toolchain: oklch(0.552 0.016 285.938);
+  /* OpenCode's two-tone mark, as its own artwork draws it per theme. */
+  --agentmark-ink: #211e1e;
+  --agentmark-hole: #cfcecd;
   --backdrop: oklch(0.992 0 0 / 0.6);
   --qr-ground: #ffffff;
   --qr-ink: #18181b;
@@ -118,6 +121,8 @@
   --id-cursor: oklch(0.702 0.183 293.541);
   --id-grok: oklch(0.746 0.16 232.661);
   --id-toolchain: oklch(0.705 0.015 286.067);
+  --agentmark-ink: #f1ecec;
+  --agentmark-hole: #4b4646;
   --backdrop: oklch(0.145 0 0 / 0.64);
   --qr-ground: #ffffff;
   --qr-ink: #18181b;

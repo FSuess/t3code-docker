@@ -33,3 +33,16 @@ Each of these is a bug in the handoff, not a restyle. Keep them when syncing.
 3. **"Press ⌘C" everywhere.** The narration names the keys of the platform it
    runs on (`⌘C` on Apple devices, `Ctrl C` elsewhere), as the Kbd guideline
    asks; `T3C.copyKeys` carries it.
+
+## Local additions
+
+Not in the handoff. Keep them when syncing.
+
+- **Agent marks.** `T3C.agentMark(id)` draws an agent's own mark (Claude Code,
+  Codex, OpenCode, Grok, Cursor, Antigravity) as T3 Code's provider settings
+  draw it, from `AGENT_MARKS` in `ui.js`, and `.tc-tile--mark` sets it on a
+  neutral tile in place of a monogram. One-colour marks fill with
+  `currentColor` so they follow the theme; Claude keeps its orange, OpenCode's
+  two tones are `--agentmark-ink` and `--agentmark-hole` in `tokens.css`, and
+  Antigravity's gradient mark is a 64px image. The class is `tc-agentmark`
+  rather than `tc-brand`, which is the sidebar's brand block.

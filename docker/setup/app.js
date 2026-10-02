@@ -316,7 +316,10 @@
   };
 
   // ------------------------------------------------------------- markup --
-  const tile = (row, size) => html`<span class="${cx('tc-tile', size && 'tc-tile--' + size, row.dim && 'tc-tile--dim')}" style="--_tile: var(${row.hue})" aria-hidden="true">${row.mono}</span>`;
+  // An agent shows its own mark; anything without one, its monogram.
+  const tile = (row, size) => row.mark && T3C.agentMarks[row.mark]
+    ? html`<span class="${cx('tc-tile tc-tile--mark', size && 'tc-tile--' + size, row.dim && 'tc-tile--dim')}" aria-hidden="true">${raw(T3C.agentMark(row.mark))}</span>`
+    : html`<span class="${cx('tc-tile', size && 'tc-tile--' + size, row.dim && 'tc-tile--dim')}" style="--_tile: var(${row.hue})" aria-hidden="true">${row.mono}</span>`;
   const dot = (tone, extra) => html`<span class="${cx('tc-dot', 'tc-dot--' + tone, extra)}"></span>`;
   const badge = (b) => b ? html`<span class="${cx('tc-badge', b.tone && 'tc-badge--' + b.tone)}">${b.spinner ? html`<span class="tc-spinner" aria-hidden="true"></span>` : ''}${b.text}</span>` : '';
   const statusLine = (st, attrs) => html`<span class="tc-status"${attrs || ''}>${st.dot ? dot(st.dot) : ''}<span class="tc-status-text">${st.text}${st.code ? html` <code>${st.code}</code>` : ''}</span></span>`;
@@ -1167,7 +1170,7 @@
         ${step(2, 'Approve, then come back', 'active', waiting('Waiting for ' + meta.name + ' to report a session…'))}`;
     }
     return html`
-      <div class="tc-sheet-head"><span class="tc-tile tc-tile--lg" style="--_tile: var(${meta.hue})" aria-hidden="true">${meta.mono}</span><div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
+      <div class="tc-sheet-head">${tile(meta, 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
       <div class="tc-sheet-body" aria-live="polite">${body}</div>
       <div class="tc-sheet-foot">${signin.phase === 'failed'
         ? html`<button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Close</button><button class="tc-btn tc-btn--primary" type="button" data-sheet="retry">${icon('refresh-cw')}Try again</button>`
@@ -1360,7 +1363,7 @@
       steps = keyStep(1, true);
     }
     return html`
-      <div class="tc-sheet-head"><span class="tc-tile tc-tile--lg" style="--_tile: var(${meta.hue})" aria-hidden="true">${meta.mono}</span><div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="key-title">${isOpenCode ? 'Add a provider key' : 'Use an API key'}</h2><span class="tc-small tc-muted">${isOpenCode ? html`Writes to OpenCode’s <code>auth.json</code> on the volume` : html`Runs <code>codex login --with-api-key</code>; the key goes in on stdin`}</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
+      <div class="tc-sheet-head">${tile(meta, 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="key-title">${isOpenCode ? 'Add a provider key' : 'Use an API key'}</h2><span class="tc-small tc-muted">${isOpenCode ? html`Writes to OpenCode’s <code>auth.json</code> on the volume` : html`Runs <code>codex login --with-api-key</code>; the key goes in on stdin`}</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
       <div class="tc-sheet-body">${steps}</div>
       <div class="tc-sheet-foot"><button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Cancel</button><button class="tc-btn tc-btn--primary" type="submit" data-key="key-save" disabled>${keySheet.saving ? html`<span class="tc-spinner" aria-hidden="true"></span>Saving` : 'Save key'}</button></div>`;
   };

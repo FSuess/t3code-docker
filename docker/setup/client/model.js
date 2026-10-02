@@ -14,11 +14,11 @@ const T3Model = (() => {
   // How each agent looks and signs in. The server says what is installed and
   // signed in; this says how to present it, so the strings live in one place.
   const AGENTS = {
-    claude: { name: 'Claude Code', mono: 'CC', hue: '--id-claude', how: 'browser sign-in', flow: 'code', command: 'claude auth login' },
-    codex: { name: 'Codex', mono: 'CO', hue: '--id-codex', how: 'device code', flow: 'device', command: 'codex login --device-auth' },
-    opencode: { name: 'OpenCode', mono: 'OC', hue: '--id-opencode', how: 'API key, per provider', flow: 'key', command: null },
-    grok: { name: 'Grok Build', mono: 'GB', hue: '--id-grok', how: 'device code', flow: 'device', command: 'grok login --device-auth' },
-    cursor: { name: 'Cursor', mono: 'CU', hue: '--id-cursor', how: 'browser sign-in', flow: 'browser', command: 'cursor-agent login' },
+    claude: { name: 'Claude Code', mark: 'claude', mono: 'CC', hue: '--id-claude', how: 'browser sign-in', flow: 'code', command: 'claude auth login' },
+    codex: { name: 'Codex', mark: 'codex', mono: 'CO', hue: '--id-codex', how: 'device code', flow: 'device', command: 'codex login --device-auth' },
+    opencode: { name: 'OpenCode', mark: 'opencode', mono: 'OC', hue: '--id-opencode', how: 'API key, per provider', flow: 'key', command: null },
+    grok: { name: 'Grok Build', mark: 'grok', mono: 'GB', hue: '--id-grok', how: 'device code', flow: 'device', command: 'grok login --device-auth' },
+    cursor: { name: 'Cursor', mark: 'cursor', mono: 'CU', hue: '--id-cursor', how: 'browser sign-in', flow: 'browser', command: 'cursor-agent login' },
   };
   const AGENT_ORDER = ['claude', 'codex', 'opencode', 'grok', 'cursor'];
 
@@ -233,6 +233,7 @@ const T3Model = (() => {
       target: 'harness',
       name: meta.name,
       mono: meta.mono,
+      mark: meta.mark || null,
       hue: meta.hue,
       version,
       latest: updateAvailable ? latest : null,
