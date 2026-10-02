@@ -223,6 +223,7 @@ const T3Model = (() => {
     const version = h.installedVersion || h.version || null;
     const latest = h.latestVersion || null;
     const updateAvailable = Boolean(h.installed && isNewer(latest, version));
+    const held = h.installed ? heldRelease(h, version, status, now) : null;
     const runningKind = act.serverQueued ? null : (act.ownOp && act.ownOp.kind) || (act.pending && act.pending.kind)
       || (h.inProgress ? h.operation || 'install' : null) || (act.fromSetup ? 'install' : null) || act.busy;
     const isKey = meta.flow === 'key';
@@ -335,15 +336,17 @@ const T3Model = (() => {
           ? plural(names.length, 'provider key') + ' · ' + names.join(', ')
           : 'Signed in · ' + methodText(h);
       } else {
-        row.status.text = 'Signed in · ' + (updateAvailable ? latest + ' is available' : methodText(h));
+        row.status.text = 'Signed in · ' + (updateAvailable ? latest + ' is available' : held ? held.text : methodText(h));
       }
       if (updateAvailable) row.action = { cmd: 'harness.update', label: 'Update' };
       else if (isKey) row.action = { cmd: 'harness.apikey', label: 'Add key', icon: 'key-round' };
     }
     row.notice = distinctNotice(notice, row.status);
+    row.held = held;
 
     // Everything else is one press away in the menu.
     if (updateAvailable) row.menu.push({ cmd: 'harness.update', label: 'Update to ' + latest, icon: 'circle-arrow-up' });
+    if (held) row.menu.push({ cmd: 'release.now', label: 'Install ' + held.version + ' now', icon: 'download', args: { version: held.version } });
     row.menu.push({ cmd: 'harness.version', label: 'Install a specific version…', icon: 'history' });
     if (h.canSetKey) row.menu.push({ cmd: 'harness.apikey', label: isKey ? 'Add a provider key…' : 'Use an API key…', icon: 'key-round' });
     if (h.canSignIn && h.runnable && row.state !== 'signin') row.menu.push({ cmd: 'harness.signin', label: 'Sign in again', icon: 'log-in' });
@@ -389,6 +392,7 @@ const T3Model = (() => {
     const version = t.version || null;
     const latest = t.latestVersion || null;
     const updateAvailable = Boolean(t.installed && isNewer(latest, version));
+    const held = t.installed ? heldRelease(t, version, status, now) : null;
     const runningKind = act.serverQueued ? null : (act.ownOp && act.ownOp.kind) || (act.pending && act.pending.kind)
       || (t.inProgress ? t.operation || 'install' : null) || (act.fromSetup ? 'install' : null) || act.busy;
     const planned = ((status.setup && status.setup.items) || []).some((i) => i.kind === 'toolchain' && i.id === t.id);
@@ -473,10 +477,13 @@ const T3Model = (() => {
       row.status.text = (meta.detail ? meta.detail + ' · ' : 'Installed · ') + latest + ' is available';
       row.action = { cmd: cmd('update'), label: 'Update' };
     } else {
-      row.status.text = [meta.detail || 'Installed', follows ? 'follows ' + follows : latest ? 'up to date' : null].filter(Boolean).join(' · ');
+      row.status.text = [meta.detail || 'Installed', follows ? 'follows ' + follows : held ? held.text : latest ? 'up to date' : null].filter(Boolean).join(' · ');
     }
+    row.held = held;
     if (updateAvailable) row.menu.push({ cmd: cmd('update'), label: 'Update to ' + latest, icon: 'circle-arrow-up' });
     else if (!latest) row.menu.push({ cmd: cmd('update'), label: 'Update to the latest', icon: 'circle-arrow-up' });
+    // Toolchains take only mise's newest; an added tool installs any release named.
+    if (held && isPackage) row.menu.push({ cmd: 'release.now', label: 'Install ' + held.version + ' now', icon: 'download', args: { version: held.version } });
     if (isPackage) row.menu.push({ cmd: 'package.version', label: 'Install a specific version…', icon: 'history' });
     row.menu.push({ sep: true });
     row.menu.push({ cmd: cmd('uninstall'), label: 'Uninstall…', icon: 'trash-2', danger: true });
@@ -540,32 +547,67 @@ const T3Model = (() => {
     return TOOL_SPEC.test(id) && !id.includes('..') && !id.endsWith('/');
   };
 
-  // The releases a typed version names, from a newest-first list, the way
-  // `mise latest tool@1.3` reads it: the exact release, then the ones under it
-  // segment by segment (1.3 -> 1.3.10, 1.3.9, ...; never 1.37.1). mise installs
-  // the first: jq@1.7 is 1.7 even though 1.7.1 exists.
-  const namedReleases = (list, q) => {
-    const under = list.filter((v) => v.startsWith(q + '.') || v.startsWith(q + '-') || v.startsWith(q + '+'));
-    return list.includes(q) ? [q, ...under] : under;
-  };
+  // A release as listed: a version string, or `{ version, waiting, prerelease,
+  // releasedAt, supported }` from /harnesses/versions and /packages/versions.
+  const versionOf = (release) => String((release && typeof release === 'object' ? release.version : release) || '');
+  const under = (version, q) => version.startsWith(q + '.') || version.startsWith(q + '-') || version.startsWith(q + '+');
 
-  /** The release mise installs for a typed version, or null when it names none. */
-  const resolveRelease = (versions, query) => {
+  /**
+   * The release mise installs for a typed version, the way `mise latest
+   * tool@1.3` reads it: exactly the one named, even one mise is still holding
+   * back (naming it installs it at once); otherwise the newest under it segment
+   * by segment (1.3 -> 1.3.10, never 1.37.1) that mise offers - not one still
+   * waiting, not a preview. jq@1.7 is 1.7 even though 1.7.1 exists. Null when
+   * it names none.
+   */
+  const resolveRelease = (releases, query) => {
     const q = String(query || '').trim();
-    return (q && namedReleases(versions || [], q)[0]) || null;
+    if (!q) return null;
+    const list = releases || [];
+    const exact = list.find((r) => versionOf(r) === q);
+    if (exact) return versionOf(exact);
+    const hit = list.find((r) => under(versionOf(r), q) && !(r && (r.waiting || r.prerelease)));
+    return hit ? versionOf(hit) : null;
   };
 
   /**
-   * The releases the version picker lists for what is typed, the one it would
-   * install first. Text that names no release, such as rc or part of a date,
-   * lists the releases containing it instead.
+   * The releases the version picker lists for what is typed, newest first: the
+   * ones it names (the exact release and those under it), or, when it names
+   * none - rc, part of a date - the ones containing it.
    */
-  const matchReleases = (versions, query) => {
-    const list = versions || [];
+  const matchReleases = (releases, query) => {
+    const list = releases || [];
     const q = String(query || '').trim();
     if (!q) return list;
-    const named = namedReleases(list, q);
-    return named.length ? named : list.filter((v) => v.includes(q));
+    const named = list.filter((r) => versionOf(r) === q || under(versionOf(r), q));
+    return named.length ? named : list.filter((r) => versionOf(r).includes(q));
+  };
+
+  /** Which of the listed releases to highlight: the one the typed version installs, else the first. */
+  const releaseIndex = (listed, query) => {
+    const target = resolveRelease(listed, query);
+    const at = target ? (listed || []).findIndex((r) => versionOf(r) === target) : -1;
+    return at === -1 ? 0 : at;
+  };
+
+  /**
+   * A release out but still inside mise's minimum release age: newer than what
+   * is installed and than what mise offers as the newest. `when` says when mise
+   * will offer it ("in 21 hours"), where the backend dates its releases.
+   */
+  const heldRelease = (t, version, status, now) => {
+    const newest = t && t.newestVersion;
+    if (!newest || !version || !isNewer(newest, version)) return null;
+    if (t.latestVersion && !isNewer(newest, t.latestVersion)) return null;
+    const releasedAt = toMs(t.newestReleasedAt);
+    const age = status && Number.isFinite(status.releaseAgeMs) ? status.releaseAgeMs : null;
+    const availableAt = releasedAt !== null && age !== null ? releasedAt + age : null;
+    return {
+      version: newest,
+      releasedAt,
+      availableAt,
+      text: newest + ' is out · ' + (availableAt !== null && availableAt > now ? 'mise offers it ' + relTime(availableAt, now) : 'mise offers it once it has been out a day'),
+    };
   };
 
   // What the search offers before anything is typed: common picks that are
@@ -1106,7 +1148,7 @@ const T3Model = (() => {
     relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs, imageLabel,
     progressOf, progressText,
     agentRow, agentRows, toolRow, toolchainRow, toolchainRows, packageRows, portRows, looksLikeDatabase,
-    monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, matchReleases, toolName, SUGGESTED_TOOLS,
+    monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind,
     readiness, readySummary, needsYou, activity, setupBanner,
     navBadges, summaries,

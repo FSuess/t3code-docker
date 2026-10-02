@@ -635,15 +635,61 @@ test("a typed version resolves the way mise does, segment by segment", () => {
   assert.equal(M.resolveRelease(releases, ""), null);
 });
 
-test("the version list shows what a typed version names, the release it installs first", () => {
+test("the version list shows what a typed version names, newest first, the one it installs highlighted", () => {
   const releases = ["1.37.1", "1.37.0", "1.4.0", "1.3.10", "1.3.9", "1.3.0-rc.1", "1.3"];
-  assert.deepEqual(plain(M.matchReleases(releases, "1.3")), ["1.3", "1.3.10", "1.3.9", "1.3.0-rc.1"], "not 1.37, which mise would not install");
+  assert.deepEqual(plain(M.matchReleases(releases, "1.3")), ["1.3.10", "1.3.9", "1.3.0-rc.1", "1.3"], "not 1.37, which mise would not install");
   assert.deepEqual(plain(M.matchReleases(releases.slice(0, 5), "1.3")), ["1.3.10", "1.3.9"]);
   assert.deepEqual(plain(M.matchReleases(releases, "rc")), ["1.3.0-rc.1"], "text that names no release finds the ones containing it");
   assert.deepEqual(plain(M.matchReleases(releases, " ")), releases);
   assert.deepEqual(plain(M.matchReleases(releases, "2")), []);
   assert.deepEqual(plain(M.matchReleases(null, "1")), []);
   for (const q of ["1", "1.3", "1.37", "1.3.0", "1.4"]) {
-    assert.equal(M.matchReleases(releases, q)[0], M.resolveRelease(releases, q), `the highlighted release is the one ${q} installs`);
+    const listed = M.matchReleases(releases, q);
+    assert.equal(listed[M.releaseIndex(listed, q)], M.resolveRelease(releases, q), `the highlighted release is the one ${q} installs`);
   }
+  assert.equal(M.releaseIndex(M.matchReleases(releases, "1.3"), "1.3"), 3, "jq-style: 1.3 is a release of its own");
+  assert.equal(M.releaseIndex(releases, "nothing"), 0);
+});
+
+test("a release mise still holds back installs when named in full, never through a prefix", () => {
+  const releases = [
+    { version: "2.1.288", waiting: true },
+    { version: "2.1.287", waiting: false },
+    { version: "2.1.286", waiting: false },
+    { version: "2.2.0-beta.1", waiting: false, prerelease: true },
+  ];
+  assert.equal(M.resolveRelease(releases, "2.1.288"), "2.1.288", "named in full");
+  assert.equal(M.resolveRelease(releases, "2.1"), "2.1.287", "a prefix takes what mise offers");
+  assert.equal(M.resolveRelease(releases, "2.2"), null, "nor a preview");
+  assert.equal(M.resolveRelease(releases, "2.2.0-beta.1"), "2.2.0-beta.1");
+  const listed = M.matchReleases(releases, "2.1");
+  assert.deepEqual(plain(listed.map(M.versionOf)), ["2.1.288", "2.1.287", "2.1.286"]);
+  assert.equal(M.releaseIndex(listed, "2.1"), 1, "the highlight sits on the release that installs");
+});
+
+test("a release out but still held back by mise says when it will be offered, and installs now from the menu", () => {
+  const out = Date.parse("2026-10-02T09:00:00Z"); // three hours before NOW
+  const s = statusWith({
+    releaseAgeMs: DAY,
+    harnesses: [harness("claude", { installedVersion: "2.1.287", version: "2.1.287", latestVersion: "2.1.287", newestVersion: "2.1.288", newestReleasedAt: new Date(out).toISOString() })],
+  });
+  const claude = row(s, "claude");
+  assert.equal(claude.updateAvailable, false, "mise does not offer it yet");
+  assert.equal(claude.status.text, "Signed in · 2.1.288 is out · mise offers it in 21 hours");
+  const now = claude.menu.find((m) => m.cmd === "release.now");
+  assert.equal(now.label, "Install 2.1.288 now");
+  assert.deepEqual(plain(now.args), { version: "2.1.288" });
+  // An older install with an update mise offers: the update leads, the held release waits in the menu.
+  const behind = row(statusWith({ releaseAgeMs: DAY, harnesses: [harness("claude", { installedVersion: "2.1.286", version: "2.1.286", latestVersion: "2.1.287", newestVersion: "2.1.288", newestReleasedAt: new Date(out).toISOString() })] }), "claude");
+  assert.equal(behind.action.cmd, "harness.update");
+  assert.equal(behind.status.text, "Signed in · 2.1.287 is available");
+  assert.ok(behind.menu.some((m) => m.cmd === "release.now"));
+  // Already on it, or no date to say when: nothing claims a wait it cannot time.
+  assert.equal(row(statusWith({ harnesses: [harness("claude", { installedVersion: "2.1.288", version: "2.1.288", latestVersion: "2.1.287", newestVersion: "2.1.288" })] }), "claude").held, null);
+  const undated = row(statusWith({ harnesses: [harness("claude", { installedVersion: "2.1.287", version: "2.1.287", latestVersion: "2.1.287", newestVersion: "2.1.288" })] }), "claude");
+  assert.equal(undated.status.text, "Signed in · 2.1.288 is out · mise offers it once it has been out a day");
+  // A toolchain says so too, but only takes mise's newest: no menu item.
+  const go = M.toolchainRows(statusWith({ releaseAgeMs: DAY, toolchains: [toolchain("go", { version: "1.27.1", latestVersion: "1.27.1", newestVersion: "1.27.2", newestReleasedAt: new Date(out).toISOString() })] }), ui(), NOW)[0];
+  assert.equal(go.status.text, "Installed · 1.27.2 is out · mise offers it in 21 hours");
+  assert.equal(go.menu.some((m) => m.cmd === "release.now"), false);
 });

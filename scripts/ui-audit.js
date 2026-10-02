@@ -312,6 +312,15 @@ const audit = () => {
       await page.waitForSelector(".tc-layer #tool-list .tc-option, .tc-layer .tc-combobox-note", { timeout: 30000 });
       await page.keyboard.type("kube");
     }],
+    ["agent release", async (page) => {
+      await page.keyboard.press("Escape");
+      await page.evaluate(() => { location.hash = "agents"; });
+      await page.waitForSelector("#page-agents [data-cmd='row.menu']", { timeout: 60000 });
+      await page.click("#page-agents [data-cmd='row.menu'] >> nth=0");
+      await page.waitForSelector(".tc-layer .tc-menu-item");
+      await page.click(".tc-layer .tc-menu-item:has-text('specific version')");
+      await page.waitForSelector(".tc-layer #ver-list .tc-option, .tc-layer .tc-combobox-note", { timeout: 30000 });
+    }],
     ["pairing", async (page) => {
       await page.keyboard.press("Escape");
       await page.evaluate(() => { location.hash = "devices"; });

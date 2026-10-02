@@ -75,8 +75,9 @@ check("rows show the exact version",
   "the row must render the recorded exact version");
 check("rows offer explicit versions and every lifecycle action",
   has(MODEL, "'harness.install'") && has(MODEL, "'harness.update'") && has(MODEL, "'harness.uninstall'")
-    && has(MODEL, "'harness.version'") && has(APP, "hv-version"),
-  "Install/Update/Uninstall plus an exact-version dialog are required");
+    && has(MODEL, "'harness.version'") && has(APP, "target: 'harness'") && has(APP, "/harnesses/versions?id=")
+    && has(SERVER, '"/harnesses/versions"'),
+  "Install/Update/Uninstall plus an exact-release picker listing the agent's releases are required");
 check("polling preserves version drafts and in-flight work",
   has(APP, "versionDrafts") && has(APP, "lifecycleBusy") && has(APP, "pendingOps")
     && has(KIT, "morphChildren"),
