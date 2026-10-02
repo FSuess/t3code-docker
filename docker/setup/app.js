@@ -73,6 +73,7 @@
     providers: null,
     route: 'overview',
     agentFilter: 'all',
+    toolFilter: '',
   };
   // What the page knows that /status cannot: see the header comment.
   const versionDrafts = new Map();   // agent id -> version typed in the dialog
@@ -93,9 +94,12 @@
 
   const harness = (id) => ((state.status && state.status.harnesses) || []).find((h) => h.id === id) || null;
   const toolchain = (id) => ((state.status && state.status.toolchains) || []).find((t) => t.id === id) || null;
-  const nameOf = (target, id) => target === 'harness'
-    ? (M.AGENTS[id] || {}).name || (harness(id) || {}).name || id
-    : (M.TOOLCHAINS[id] || {}).name || (toolchain(id) || {}).name || id;
+  const addedTool = (id) => ((state.status && state.status.packages) || []).find((p) => p.id === id) || null;
+  const nameOf = (target, id) => target === 'harness' ? (M.AGENTS[id] || {}).name || (harness(id) || {}).name || id
+    : target === 'package' ? (addedTool(id) || {}).name || M.toolName(id)
+      : (M.TOOLCHAINS[id] || {}).name || (toolchain(id) || {}).name || id;
+  // Where each kind of row's operations live in the API.
+  const LIFECYCLE_PATH = { harness: 'harnesses', toolchain: 'toolchains', package: 'packages' };
 
   /** Where "Open T3 Code" goes: the public URL, else T3 Code beside this page. */
   const t3Url = () => {
@@ -234,7 +238,7 @@
     notices.delete(key);
     lifecycleBusy.set(key, kind);
     render();
-    const res = await api('/' + (target === 'harness' ? 'harnesses' : 'toolchains') + '/' + kind, { body: version ? { id, version } : { id } });
+    const res = await api('/' + LIFECYCLE_PATH[target] + '/' + kind, { body: version ? { id, version } : { id } });
     lifecycleBusy.delete(key);
     if (res.status === 202) {
       pendingOps.set(key, { kind, name, at: now() });
@@ -252,16 +256,27 @@
   };
 
   const cancelOperation = async (target, id) => {
-    const res = await api('/' + (target === 'harness' ? 'harnesses' : 'toolchains') + '/cancel', { body: { id } });
+    const res = await api('/' + LIFECYCLE_PATH[target] + '/cancel', { body: { id } });
     if (!res.ok) Kit.toast('Could not cancel', { tone: 'danger', detail: res.error });
     await loadStatus();
   };
 
   const confirmUninstall = async (target, id) => {
     const name = nameOf(target, id);
-    const facts = target === 'harness' ? harness(id) : toolchain(id);
+    const facts = target === 'harness' ? harness(id) : target === 'package' ? addedTool(id) : toolchain(id);
     const version = facts && (facts.installedVersion || facts.version);
-    const ok = await Kit.confirm(target === 'harness'
+    const ok = await Kit.confirm(target === 'package'
+      ? {
+        title: 'Uninstall ' + name + '?',
+        body: 'Removes ' + name + (version ? ' ' + version : '') + ' from your global mise config and from the volume. A project that pins its own version in mise.toml still gets that one.',
+        consequences: [
+          { icon: 'trash-2', text: 'Removed: every release this console installed' },
+          { icon: 'shield-check', text: 'Kept: project pins in mise.toml and .tool-versions' },
+          { icon: 'plus', text: 'Add it again any time from Add a tool' },
+        ],
+        confirm: 'Uninstall',
+      }
+      : target === 'harness'
       ? {
         title: 'Uninstall ' + name + '?',
         body: 'Removes ' + (version ? 'the ' + version + ' executable' : 'the executable') + ' and its T3 Code wiring. Your sign-in and user data stay on the volume, so installing again signs you straight back in.',
@@ -285,12 +300,16 @@
     if (ok) callLifecycle(target, 'uninstall', id);
   };
 
-  /** "Update all": one request each; the server runs them one after another. */
+  /**
+   * "Update all": one request each; the server runs them one after another.
+   * `tools` is the Toolchains page's: the toolchains and the added tools.
+   */
   const updateAll = async (target) => {
-    const rows = target === 'harness' ? M.agentRows(state.status, ui, now()) : M.toolchainRows(state.status, ui, now());
+    const rows = target === 'harness' ? M.agentRows(state.status, ui, now())
+      : [...M.toolchainRows(state.status, ui, now()), ...M.packageRows(state.status, ui, now())];
     const due = rows.filter((r) => r.updateAvailable && r.state !== 'running' && r.state !== 'queued');
     if (!due.length) { Kit.toast('Everything is up to date', { tone: 'info' }); return; }
-    for (const row of due) await callLifecycle(target, 'update', row.id);
+    for (const row of due) await callLifecycle(row.target, 'update', row.id);
   };
 
   // ------------------------------------------------------------- markup --
@@ -329,7 +348,7 @@
     <div class="${cx('tc-row', (row.state === 'running' || row.state === 'signing') && 'tc-row--expanded')}" data-key="row-${row.key}">
       ${tile(row)}
       <div class="tc-row-main">
-        <div class="tc-row-title"><span class="tc-row-name">${row.name}</span>${versionLabel(row)}${badge(row.badge)}</div>
+        <div class="tc-row-title"><span class="tc-row-name"${row.description ? html` title="${row.description}"` : ''}>${row.name}</span>${versionLabel(row)}${badge(row.badge)}</div>
         ${statusLine(row.status)}
         ${noticeLine(row.notice)}
         ${row.state === 'running' ? opLine(row) : ''}
@@ -510,6 +529,7 @@
       'device.paired': 'smartphone', 'port.published': 'globe', 'port.stopped': 'circle-stop', 'harness.updated': 'circle-arrow-up',
       'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'signin.ok': 'log-in', 'setup.finished': 'download',
       'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
+      'package.installed': 'download', 'package.updated': 'circle-arrow-up', 'package.uninstalled': 'trash-2', 'package.failed': 'circle-alert',
     };
     return section('recent-title', 'Recent', html`<div class="tc-group"><ol class="tc-log">${events.slice(0, 8).map((e) => html`
       <li data-key="ev-${e.at}-${e.kind}">${icon(ICONS[e.kind] || 'activity')}<span class="tc-truncate">${e.text}${e.detail ? html` <span class="tc-mono">${e.detail}</span>` : ''}</span><time datetime="${new Date(e.at).toISOString()}" title="${M.absTime(e.at)}">${M.relTime(e.at, n)}</time></li>`)}</ol></div>`,
@@ -739,20 +759,44 @@
   ];
   const toolchainsPage = (s, n) => {
     const rows = M.toolchainRows(s, ui, n);
+    const added = M.packageRows(s, ui, n);
     const paths = s.paths || {};
     const browserImage = (s.image && s.image.variant === 'browser') || Boolean(s.browser);
     const size = Number.isFinite(paths.toolchainsBytes) ? M.formatBytes(paths.toolchainsBytes) + (paths.toolchains ? ' in ' + paths.toolchains : '') : null;
+    // A filter once the list is long enough to need one; it matches the name,
+    // the commands a tool provides and its description.
+    const filterable = added.length > 6;
+    const q = filterable ? state.toolFilter.trim().toLowerCase() : '';
+    const shown = q ? added.filter((r) => [r.name, r.id, ...(r.bins || []), r.description || ''].join(' ').toLowerCase().includes(q)) : added;
+    const addButton = html`<button class="tc-btn tc-btn--xs" type="button" data-cmd="package.add" data-key="tool-add">${icon('plus')}Add a tool<span class="tc-kbd tc-desk-only" aria-hidden="true">N</span></button>`;
+    const filter = filterable ? html`<div class="tc-inputwrap tc-tool-filter">${icon('search')}<input class="tc-input tc-input--sm" id="tool-filter" type="search" placeholder="Filter" aria-label="Filter added tools" autocomplete="off" spellcheck="false"></div>` : '';
     return html`
       ${pageNotices('toolchains')}
-      ${section('tc-title', 'On the volume', html`<div class="tc-group">
+      ${section('tc-title', 'Toolchains', html`<div class="tc-group">
         ${rows.length ? html`<div class="tc-list">${rows.map((row) => resourceRow(row))}</div>`
           : html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-desc">Toolchain state is not readable right now.</span></div>`}
         <div class="tc-card-foot">${icon('info', 'tc-icon--sm')}<span>Available in every directory. A project that pins a version in <code>mise.toml</code> or <code>.tool-versions</code> gets that one instead.</span></div>
       </div>`, { actions: size ? muted(size) : null })}
+      ${section('pk-title', 'Added tools', html`<div class="tc-group">
+        ${shown.length ? html`<div class="tc-list">${shown.map((row) => resourceRow(row))}</div>`
+          : added.length ? html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-desc">No added tool matches “${state.toolFilter.trim()}”.</span></div>`
+            : toolsEmpty()}
+        <div class="tc-card-foot">${icon('terminal', 'tc-icon--sm')}<span>Anything in mise’s registry, or a backend spec like <code>npm:prettier</code>. Tools added with <code>mise use -g</code> in a terminal show up here too.</span></div>
+      </div>`, { actions: html`${filter}${addButton}` })}
       ${section('img-title', 'In the image', html`<div class="tc-group"><div class="tc-included">${INCLUDED.filter((i) => !i[3] || browserImage).map(([ic, what, note]) => html`<div>${icon(ic)}<span>${what}</span><span class="tc-included-what">${note}</span></div>`)}</div></div>`,
         { actions: muted('Updated by pulling a new image') })}
-      ${notice(null, 'shield-check', 'Nothing updates on its own', html`mise records exact versions and never falls back to another tool on <code>PATH</code>. Update is always a button press, here or with <code>mise use</code>.`)}`;
+      ${notice(null, 'shield-check', 'Nothing updates on its own', html`mise records exact versions, for added tools too, and never falls back to another tool on <code>PATH</code>. Update is always a button press, here or with <code>mise use</code>.`)}`;
   };
+
+  // A first look at what can be added: one press opens the sheet on that tool.
+  const QUICK_ADD = ['kubectl', 'terraform', 'aws-cli', 'java', 'zig', 'just'];
+  const toolsEmpty = () => html`<div class="tc-empty">
+    <span class="tc-empty-icon">${icon('plus')}</span>
+    <span class="tc-empty-title">Add any tool mise can install</span>
+    <span class="tc-empty-desc">Cloud CLIs, other languages, linters: about a thousand tools, each pinned to an exact version like the toolchains above.</span>
+    <div class="tc-chips" role="group" aria-label="Suggestions">${QUICK_ADD.map((name) => html`<button class="tc-chip-btn" type="button" data-cmd="package.add" data-id="${name}">${name}</button>`)}</div>
+    <button class="tc-btn tc-btn--primary tc-btn--sm tc-empty-cta" type="button" data-cmd="package.add">${icon('plus')}Add a tool</button>
+  </div>`;
 
   // ---------------------------------------------------------------- ports --
   const portRow = (p) => {
@@ -989,8 +1033,8 @@
           ? html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="pair.start">${icon('plus')}Pair a device</button>`
           : html`<a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a>`;
       } else if (route === 'agents' || route === 'toolchains') {
-        const rows = route === 'agents' ? M.agentRows(s, ui, n) : M.toolchainRows(s, ui, n);
-        if (rows.some((r) => r.updateAvailable)) actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="${route === 'agents' ? 'harness.updateAll' : 'toolchain.updateAll'}">${icon('circle-arrow-up')}Update all</button>`;
+        const rows = route === 'agents' ? M.agentRows(s, ui, n) : [...M.toolchainRows(s, ui, n), ...M.packageRows(s, ui, n)];
+        if (rows.some((r) => r.updateAvailable)) actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="${route === 'agents' ? 'harness.updateAll' : 'tools.updateAll'}">${icon('circle-arrow-up')}Update all</button>`;
       } else if (route === 'ports') {
         actions = html`<span class="tc-small tc-muted">Same list as <code>t3-expose</code></span>`;
       } else if (route === 'environment') {
@@ -1446,6 +1490,361 @@
     });
   };
 
+  // ------------------------------------------------------------ add a tool --
+  // Finds any tool in mise's registry (or takes a backend spec such as
+  // npm:prettier), says where it comes from, what it provides and how its
+  // downloads are verified, and installs it pinned to an exact release: the
+  // newest, or one picked from what its backend offers. The same sheet picks a
+  // release for a tool already added ("Install a specific version…").
+  const registryLoad = { pending: null, error: null };
+  const loadRegistry = () => {
+    if (ui.registry) return Promise.resolve(ui.registry);
+    registryLoad.pending ??= api('/packages/registry').then((res) => {
+      registryLoad.pending = null;
+      if (res.ok && Array.isArray(res.data.tools)) {
+        ui.registry = res.data.tools;
+        registryLoad.error = null;
+      } else {
+        registryLoad.error = res.error || 'mise’s registry could not be read';
+      }
+      return ui.registry;
+    });
+    return registryLoad.pending;
+  };
+
+  const SECURITY = {
+    checksum: 'checksums', github_attestations: 'GitHub attestations', slsa: 'SLSA provenance',
+    cosign: 'Cosign signatures', minisign: 'Minisign signatures', gpg: 'GPG signatures',
+  };
+  const describeSecurity = (types) => (types && types.length
+    ? 'Verified with ' + M.listOf(types.map((t) => SECURITY[t] || t.replace(/_/g, ' ')))
+    : 'mise checks no checksum or signature for this source');
+
+  const toolSheet = { layer: null };
+  const spinnerNote = (text) => html`<div class="tc-combobox-note"><span class="tc-spinner tc-info" aria-hidden="true"></span>${text}</div>`;
+  const marked = (text, match) => match
+    ? raw(Kit.esc(text.slice(0, match[0])) + '<mark>' + Kit.esc(text.slice(match[0], match[1])) + '</mark>' + Kit.esc(text.slice(match[1])))
+    : text;
+
+  /** The picker's options: registry matches, and the query itself when it is a usable backend spec. */
+  const toolOptions = () => {
+    const q = toolSheet.query.trim();
+    const installed = new Map(((state.status && state.status.packages) || []).map((p) => [p.id, p]));
+    const options = M.searchRegistry(ui.registry || [], q, 30).map(({ entry, match }) => ({
+      kind: 'entry', entry, match, managed: M.managedOn(entry.name), installed: installed.get(entry.name) || null,
+    }));
+    const known = (ui.registry || []).some((e) => e.name === q || (e.aliases || []).includes(q));
+    if (q && M.isToolSpec(q) && !known && !M.managedOn(q)) {
+      // A spec reads as one ("npm:prettier"): offer it first. A bare word may
+      // be a typo of a registry name: offer it after the matches.
+      options[q.includes(':') ? 'unshift' : 'push']({ kind: 'spec', id: q });
+    }
+    return options;
+  };
+
+  const toolOption = (o, i) => {
+    const selected = String(i === toolSheet.active);
+    if (o.kind === 'spec') {
+      return html`<li class="tc-option tc-option--rich" role="option" id="tool-opt-${i}" data-index="${i}" aria-selected="${selected}">
+        <span class="tc-tile tc-tile--sm tc-tile--icon" aria-hidden="true">${icon('plus')}</span>
+        <span class="tc-option-text"><span class="tc-option-name">Use <code>${o.id}</code></span><span class="tc-option-desc">As a mise tool spec, installed from its backend</span></span></li>`;
+    }
+    const e = o.entry;
+    const bins = (e.bins || []).filter((b) => b !== e.name);
+    const meta = o.managed ? html`<span class="tc-option-meta">On ${o.managed}</span>`
+      : o.installed ? html`<span class="tc-option-meta">${icon('check', 'tc-icon--xs')}${o.installed.version || 'Added'}</span>`
+        : bins.length ? html`<span class="tc-option-meta tc-mono">${bins.slice(0, 2).join(' ')}</span>` : '';
+    return html`<li class="tc-option tc-option--rich" role="option" id="tool-opt-${i}" data-index="${i}" aria-selected="${selected}"${o.managed ? raw(' aria-disabled="true"') : ''}>
+      <span class="tc-tile tc-tile--sm" style="--_tile: var(--id-toolchain)" aria-hidden="true">${M.monogram(e.name)}</span>
+      <span class="tc-option-text"><span class="tc-option-name">${marked(e.name, o.match)}</span>${e.description ? html`<span class="tc-option-desc">${e.description}</span>` : ''}</span>${meta}</li>`;
+  };
+
+  const toolPicker = () => {
+    const options = toolOptions();
+    const q = toolSheet.query.trim();
+    const loading = !ui.registry && !registryLoad.error;
+    return html`
+      <div class="tc-combobox">
+        <div class="tc-palette-input">${icon('search', 'tc-muted')}<input id="tool-q" role="combobox" aria-expanded="true" aria-controls="tool-list" aria-autocomplete="list" aria-activedescendant="${options.length ? 'tool-opt-' + toolSheet.active : ''}" placeholder="kubectl, terraform, json, npm:prettier…" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
+        ${loading ? spinnerNote('Loading mise’s registry…')
+          : options.length ? html`<ul class="tc-listbox tc-listbox--rich" id="tool-list" role="listbox" aria-label="${q ? 'Matching tools' : 'Suggested tools'}">${options.map(toolOption)}</ul>`
+            : html`<div class="tc-combobox-note">Nothing in the registry matches. A backend spec works too: <code>npm:prettier</code>, <code>cargo:ripgrep</code>, <code>github:owner/repo</code>.</div>`}
+      </div>
+      <span class="tc-hint">${registryLoad.error ? registryLoad.error + '. A backend spec still works.'
+        : ui.registry ? (q ? '' : 'A few to start with. ') + 'Search ' + ui.registry.length.toLocaleString() + ' tools by name, command or what they do.' : ''}</span>`;
+  };
+
+  const toolDetails = (t) => {
+    const info = toolSheet.info;
+    const bins = (info && info.bins && info.bins.length ? info.bins : t.bins) || [];
+    const rows = [
+      ['Source', info ? html`<code>${info.backend || t.id}</code>` : toolSheet.infoError ? html`<span class="tc-muted">${toolSheet.infoError}</span>` : html`<span class="tc-muted"><span class="tc-spinner tc-info" aria-hidden="true"></span> Asking mise…</span>`],
+    ];
+    if (info) rows.push(['Downloads', describeSecurity(info.security)]);
+    if (bins.length) rows.push(['Provides', html`${bins.slice(0, 6).map((b, i) => html`${i ? ' ' : ''}<code>${b}</code>`)}${bins.length > 6 ? ' and ' + (bins.length - 6) + ' more' : ''}`]);
+    const installed = addedTool(t.id);
+    const shadows = (info && info.shadows) || [];
+    return html`
+      <dl class="tc-kv tc-kv--sheet">${rows.map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`)}</dl>
+      ${installed && installed.version && toolSheet.mode !== 'version' ? html`<span class="tc-hint">${t.name} ${installed.version} is already added. Installing switches it to the release below.</span>` : ''}
+      ${shadows.length ? html`<span class="tc-hint">The image already has ${M.listOf(shadows.map((b) => b))}. Once added, this one comes first in terminals and for agents.</span>` : ''}`;
+  };
+
+  const versionPicker = () => {
+    const list = toolSheet.versions;
+    const q = toolSheet.versionQuery.trim();
+    const current = addedTool(toolSheet.tool.id);
+    const filtered = list ? list.filter((v) => !q || v.startsWith(q) || v.includes(q)).slice(0, 80) : [];
+    const typed = q && !(list || []).includes(q);
+    return html`
+      <div class="tc-combobox">
+        <div class="tc-palette-input">${icon('history', 'tc-muted')}<input id="ver-q" class="tc-mono" role="combobox" aria-expanded="true" aria-controls="ver-list" aria-autocomplete="list" aria-activedescendant="${filtered.length ? 'ver-opt-' + toolSheet.versionActive : ''}" aria-label="Version" placeholder="1.8.2, or a prefix like 3.12" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
+        ${!list && !toolSheet.versionsError ? spinnerNote('Asking mise for releases…')
+          : toolSheet.versionsError ? html`<div class="tc-combobox-note">${toolSheet.versionsError}. Type a version instead.</div>`
+            : filtered.length ? html`<ul class="tc-listbox" id="ver-list" role="listbox" aria-label="Releases">${filtered.map((v, i) => html`
+              <li class="tc-option tc-mono" role="option" id="ver-opt-${i}" data-version="${v}" aria-selected="${String(i === toolSheet.versionActive)}">${v}${v === list[0] ? html`<span class="tc-option-meta">newest</span>` : current && current.version === v ? html`<span class="tc-option-meta">installed</span>` : ''}</li>`)}</ul>`
+              : ''}
+      </div>
+      <span class="${cx('tc-hint', ((q && !M.isVersionSpec(q)) || noSuchRelease(q)) && 'tc-hint--err')}">${q && !M.isVersionSpec(q) ? 'That is not a version mise can install.'
+        : noSuchRelease(q) ? (list && list[0] ? 'None of its releases starts with ' + q + '. The newest is ' + list[0] + '.' : 'None of its releases starts with ' + q + '.')
+        : typed && M.resolveRelease(list, q) ? 'Installs ' + M.resolveRelease(list, q) + ', the newest ' + q + ' release, recorded exactly.'
+          : (list ? list.length.toLocaleString() + ' releases. ' : '') + 'Pick one, or type a prefix to take the newest under it.'}</span>`;
+  };
+
+  /** A typed release or prefix that none of the tool's listed releases starts with. */
+  const noSuchRelease = (version) => Boolean(toolSheet.versions && version && !M.resolveRelease(toolSheet.versions, version));
+
+  /** The release the sheet would install now: '' for the newest, or what was picked or typed. */
+  const chosenVersion = () => (toolSheet.versionMode === 'pick' ? (toolSheet.version || toolSheet.versionQuery).trim() : '');
+
+  const toolSheetBody = () => {
+    const t = toolSheet.tool;
+    const editing = toolSheet.mode === 'version';
+    const mode = toolSheet.versionMode;
+    const newest = toolSheet.versions && toolSheet.versions[0];
+    const version = chosenVersion();
+    const canInstall = Boolean(t) && !toolSheet.saving && (mode === 'latest' || (M.isVersionSpec(version) && !noSuchRelease(version)));
+    // The button names the exact release: a typed prefix shows what it resolves to.
+    const exact = mode === 'pick' ? M.resolveRelease(toolSheet.versions, version) || version : newest;
+    const label = !t ? 'Install' : 'Install ' + t.name + (exact ? ' ' + exact : '');
+    return html`
+      <div class="tc-sheet-head">
+        ${t ? html`<span class="tc-tile tc-tile--lg" style="--_tile: var(--id-toolchain)" aria-hidden="true">${M.monogram(t.name)}</span>`
+          : html`<span class="tc-tile tc-tile--lg tc-tile--icon" aria-hidden="true">${icon('plus')}</span>`}
+        <div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="tool-title">${editing && t ? 'Install a specific version of ' + t.name : 'Add a tool'}</h2>
+          <span class="tc-small tc-muted">${editing ? 'Pinned to the exact release you pick' : 'From mise’s registry, pinned to an exact release'}</span></div>
+        <span class="tc-spacer"></span>
+        <button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button>
+      </div>
+      <div class="tc-sheet-body">
+        ${editing ? '' : html`<div class="tc-sheet-step" data-state="${t ? 'done' : 'active'}"><span class="tc-step-mark">${t ? icon('check') : '1'}</span><div class="tc-sheet-step-body">
+          ${t ? html`<span class="tc-sheet-step-title">Tool</span>
+            <div class="tc-tool-picked"><div class="tc-tool-picked-text"><span class="tc-row-name">${t.name}</span>${t.description ? html`<span class="tc-small tc-muted">${t.description}</span>` : ''}</div>
+              <button class="tc-btn tc-btn--ghost tc-btn--xs" type="button" data-sheet="change">Change</button></div>
+            ${toolDetails(t)}`
+          : html`<label class="tc-sheet-step-title" for="tool-q">Tool</label>${toolPicker()}`}
+        </div></div>`}
+        ${editing && t ? toolDetails(t) : ''}
+        ${t ? html`<div class="tc-sheet-step" data-state="active"><span class="tc-step-mark">${editing ? '1' : '2'}</span><div class="tc-sheet-step-body">
+          <span class="tc-sheet-step-title" id="ver-label">Version</span>
+          ${editing ? '' : html`<div class="tc-seg tc-seg--fill" role="group" aria-labelledby="ver-label">
+            <button type="button" aria-pressed="${String(mode === 'latest')}" data-sheet="ver-latest">Newest${newest ? html` <span class="tc-mono">${newest}</span>` : ''}</button>
+            <button type="button" aria-pressed="${String(mode === 'pick')}" data-sheet="ver-pick">Choose a version</button></div>`}
+          ${mode === 'pick' ? versionPicker()
+            : html`<span class="tc-hint">${newest ? 'mise’s newest release, recorded exactly; Update moves it on later.'
+              : toolSheet.versionsError ? 'mise resolves its newest release when it installs.' : 'Looking up the newest release…'}</span>`}
+        </div></div>` : ''}
+        ${toolSheet.error ? html`<p class="tc-hint tc-hint--err" role="alert">${toolSheet.error}</p>` : ''}
+      </div>
+      <div class="tc-sheet-foot">
+        <button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Cancel</button>
+        <button class="tc-btn tc-btn--primary" type="submit" data-key="tool-install"${canInstall ? '' : raw(' disabled')}>${toolSheet.saving ? html`<span class="tc-spinner" aria-hidden="true"></span>Starting` : html`${icon('download')}${label}`}</button>
+      </div>`;
+  };
+
+  const renderToolSheet = () => { if (toolSheet.layer) toolSheet.layer.render(); };
+  const focusIn = (selector) => {
+    const el = toolSheet.layer && toolSheet.layer.panel.querySelector(selector);
+    if (el) el.focus({ preventScroll: true });
+  };
+
+  /** Take a tool: look up where it comes from and what releases it has, in parallel. */
+  const selectTool = (tool) => {
+    Object.assign(toolSheet, {
+      tool, info: null, infoError: null, versions: null, versionsError: null,
+      versionMode: toolSheet.mode === 'version' ? 'pick' : 'latest', versionQuery: '', version: '', versionActive: 0, error: null,
+    });
+    renderToolSheet();
+    const id = tool.id;
+    api('/packages/info?id=' + encodeURIComponent(id)).then((res) => {
+      if (!toolSheet.tool || toolSheet.tool.id !== id) return;
+      if (res.ok) toolSheet.info = res.data;
+      else toolSheet.infoError = res.error;
+      renderToolSheet();
+    });
+    api('/packages/versions?id=' + encodeURIComponent(id)).then((res) => {
+      if (!toolSheet.tool || toolSheet.tool.id !== id) return;
+      if (res.ok) toolSheet.versions = res.data.versions || [];
+      else toolSheet.versionsError = res.error || 'mise could not list its releases';
+      renderToolSheet();
+    });
+    focusIn(toolSheet.mode === 'version' ? '#ver-q' : '[data-key="tool-install"]');
+  };
+
+  const toolFromEntry = (entry) => ({ id: entry.name, name: entry.name, description: entry.description || '', bins: entry.bins || [] });
+  const chooseOption = (index) => {
+    const option = toolOptions()[index];
+    if (!option || option.managed) return;
+    selectTool(option.kind === 'spec'
+      ? { id: option.id, name: M.toolName(option.id), description: '', bins: [] }
+      : toolFromEntry(option.entry));
+  };
+
+  const submitTool = async () => {
+    const t = toolSheet.tool;
+    if (!t || toolSheet.saving) return;
+    const version = chosenVersion();
+    if (toolSheet.versionMode === 'pick' && (!M.isVersionSpec(version) || noSuchRelease(version))) {
+      toolSheet.error = 'Pick a release, or type one such as 1.8.2 or a prefix such as 3.12.';
+      renderToolSheet();
+      focusIn('#ver-q');
+      return;
+    }
+    toolSheet.saving = true;
+    toolSheet.error = null;
+    renderToolSheet();
+    const res = await callLifecycle('package', 'install', t.id, version || undefined);
+    toolSheet.saving = false;
+    if (res.ok || res.status === 202) {
+      if (toolSheet.layer) toolSheet.layer.close('saved');
+      if (state.route !== 'toolchains') go('toolchains');
+      return;
+    }
+    // Refused before it started (a name managed elsewhere, a version mise
+    // does not have): say so here, where it can be fixed.
+    notices.delete('package:' + t.id);
+    toolSheet.error = res.error || 'Could not install ' + t.name;
+    renderToolSheet();
+  };
+
+  /**
+   * Open the sheet: empty, on a tool (`id`, from a suggestion or the palette),
+   * or on an added tool to pick another release (`mode: 'version'`).
+   */
+  const openToolSheet = ({ id, mode, trigger } = {}) => {
+    if (toolSheet.layer) return;
+    Object.assign(toolSheet, { mode: mode || 'add', query: '', active: 0, tool: null, saving: false, error: null, versionMode: 'latest' });
+    toolSheet.layer = Kit.open({
+      kind: 'sheet',
+      panel: { tag: 'form', class: 'tc-sheet ' + (Kit.isPhone() ? 'tc-sheet--bottom' : 'tc-sheet--inset'), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'tool-title', novalidate: true },
+      returnTo: trigger,
+      backdrop: 'ignore',
+      render: toolSheetBody,
+      focus: '#tool-q',
+      onClose: () => { toolSheet.layer = null; },
+    });
+    const panel = toolSheet.layer.panel;
+    // A tool already added needs nothing from the registry to be picked; a
+    // name from a suggestion or the palette is looked up there first.
+    const existing = id ? addedTool(id) : null;
+    if (existing) selectTool({ id, name: existing.name, description: existing.description || '', bins: existing.bins || [] });
+    loadRegistry().then(() => {
+      if (!toolSheet.layer) return;
+      if (id && !toolSheet.tool) {
+        const entry = (ui.registry || []).find((e) => e.name === id || (e.aliases || []).includes(id));
+        selectTool(entry ? toolFromEntry(entry) : { id, name: M.toolName(id), description: '', bins: [] });
+      } else {
+        renderToolSheet();
+      }
+    });
+
+    const moveActive = (field, count, delta) => {
+      if (!count) return;
+      toolSheet[field] = (toolSheet[field] + delta + count) % count;
+      renderToolSheet();
+      const id = field === 'active' ? '#tool-opt-' + toolSheet.active : '#ver-opt-' + toolSheet.versionActive;
+      const el = panel.querySelector(id);
+      if (el) el.scrollIntoView({ block: 'nearest' });
+    };
+    panel.addEventListener('input', (e) => {
+      if (e.target.id === 'tool-q') {
+        toolSheet.query = e.target.value;
+        toolSheet.active = 0;
+        renderToolSheet();
+        const list = panel.querySelector('#tool-list');
+        if (list) list.scrollTop = 0;
+      } else if (e.target.id === 'ver-q') {
+        toolSheet.versionQuery = e.target.value;
+        toolSheet.version = '';
+        toolSheet.versionActive = 0;
+        toolSheet.error = null;
+        renderToolSheet();
+      }
+    });
+    panel.addEventListener('keydown', (e) => {
+      if (e.target.id === 'tool-q') {
+        const count = panel.querySelectorAll('#tool-list .tc-option').length;
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); moveActive('active', count, e.key === 'ArrowDown' ? 1 : -1); }
+        else if (e.key === 'Enter') { e.preventDefault(); chooseOption(toolSheet.active); }
+      } else if (e.target.id === 'ver-q') {
+        const options = [...panel.querySelectorAll('#ver-list .tc-option')];
+        if (e.key === 'ArrowDown' || e.key === 'ArrowUp') { e.preventDefault(); moveActive('versionActive', options.length, e.key === 'ArrowDown' ? 1 : -1); }
+        else if (e.key === 'Enter') {
+          e.preventDefault();
+          // Enter takes the highlighted release, then a second Enter installs it.
+          const pick = options[toolSheet.versionActive];
+          const value = pick ? pick.getAttribute('data-version') : '';
+          if (pick && toolSheet.version !== value && (!toolSheet.versionQuery.trim() || value.startsWith(toolSheet.versionQuery.trim()))) {
+            toolSheet.version = value;
+            e.target.value = value;
+            toolSheet.versionQuery = value;
+            renderToolSheet();
+          } else {
+            submitTool();
+          }
+        }
+      }
+    });
+    panel.addEventListener('click', (e) => {
+      const option = e.target.closest('#tool-list .tc-option');
+      if (option) { chooseOption(Number(option.getAttribute('data-index'))); return; }
+      const release = e.target.closest('#ver-list .tc-option');
+      if (release) {
+        const value = release.getAttribute('data-version');
+        toolSheet.version = value;
+        toolSheet.versionQuery = value;
+        const input = panel.querySelector('#ver-q');
+        if (input) input.value = value;
+        toolSheet.error = null;
+        renderToolSheet();
+        focusIn('[data-key="tool-install"]');
+        return;
+      }
+      const action = e.target.closest('[data-sheet]');
+      if (!action) return;
+      const what = action.getAttribute('data-sheet');
+      if (what === 'close') toolSheet.layer.close('cancel');
+      else if (what === 'change') {
+        Object.assign(toolSheet, { tool: null, info: null, versions: null, error: null });
+        renderToolSheet();
+        const input = panel.querySelector('#tool-q');
+        if (input) { input.value = toolSheet.query; input.focus(); }
+      } else if (what === 'ver-latest') {
+        toolSheet.versionMode = 'latest';
+        toolSheet.error = null;
+        renderToolSheet();
+      } else if (what === 'ver-pick') {
+        toolSheet.versionMode = 'pick';
+        renderToolSheet();
+        focusIn('#ver-q');
+      }
+    });
+    panel.addEventListener('submit', (e) => {
+      e.preventDefault();
+      submitTool();
+    });
+  };
+
   // ------------------------------------------------------------- versions --
   const VERSION = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
   const openVersionDialog = (id, trigger) => {
@@ -1493,9 +1892,9 @@
   };
 
   // ------------------------------------------------------------- commands --
-  const rowFor = (target, id) => target === 'harness'
-    ? M.agentRows(state.status, ui, now()).find((r) => r.id === id)
-    : M.toolchainRows(state.status, ui, now()).find((r) => r.id === id);
+  const rowFor = (target, id) => (target === 'harness' ? M.agentRows(state.status, ui, now())
+    : target === 'package' ? M.packageRows(state.status, ui, now())
+      : M.toolchainRows(state.status, ui, now())).find((r) => r.id === id);
 
   const confirmRevoke = async (kind, id) => {
     const s = state.status || {};
@@ -1560,7 +1959,15 @@
     'toolchain.install': (a) => callLifecycle('toolchain', 'install', a.id),
     'toolchain.update': (a) => callLifecycle('toolchain', 'update', a.id),
     'toolchain.uninstall': (a) => confirmUninstall('toolchain', a.id),
-    'toolchain.updateAll': () => updateAll('toolchain'),
+    'toolchain.updateAll': () => updateAll('tools'),
+    'tools.updateAll': () => updateAll('tools'),
+    'package.add': (a, el) => openToolSheet({ id: a.id, trigger: el }),
+    'package.install': (a) => callLifecycle('package', 'install', a.id),
+    'package.update': (a) => callLifecycle('package', 'update', a.id),
+    'package.version': (a, el) => openToolSheet({ id: a.id, mode: 'version', trigger: el }),
+    'package.uninstall': (a) => confirmUninstall('package', a.id),
+    // A failed first install never reached the config: nothing to confirm.
+    'package.dismiss': (a) => callLifecycle('package', 'uninstall', a.id),
     'op.cancel': (a) => cancelOperation(a.target, a.id),
 
     'pair.start': () => {
@@ -1619,6 +2026,13 @@
     run(el.getAttribute('data-cmd'), args, el);
   });
 
+  // The added-tools filter: typing narrows the list as it goes.
+  document.addEventListener('input', (e) => {
+    if (e.target.id !== 'tool-filter') return;
+    state.toolFilter = e.target.value;
+    render();
+  });
+
   // Navigation links keep their hrefs (middle-click, copy link); keyboard
   // navigation from them moves focus to the page.
   document.addEventListener('keydown', (e) => {
@@ -1627,15 +2041,20 @@
   window.addEventListener('hashchange', () => { keyboardNav = false; });
 
   // -------------------------------------------------------------- palette --
-  const openPalette = () => Kit.palette({
-    items: () => M.paletteItems(state.status || {}, state.ports, ui, now()),
-    search: M.searchPalette,
-    run: (item) => {
-      const { cmd, ...args } = item.cmd;
-      if (cmd === 'goto') keyboardNav = true;
-      run(cmd, args, null);
-    },
-  });
+  const openPalette = () => {
+    const layer = Kit.palette({
+      items: () => M.paletteItems(state.status || {}, state.ports, ui, now()),
+      search: M.searchPalette,
+      run: (item) => {
+        const { cmd, ...args } = item.cmd;
+        if (cmd === 'goto') keyboardNav = true;
+        run(cmd, args, null);
+      },
+    });
+    // The registry makes "install kubectl" reachable from here; it loads the
+    // first time the palette opens and joins the results in place.
+    if (layer && !ui.registry) loadRegistry().then(() => layer.refresh && layer.refresh());
+  };
 
   // ------------------------------------------------------------ shortcuts --
   Kit.bind('mod+k', openPalette);
@@ -1647,6 +2066,7 @@
     if (pair.showForm || !pair.minted || pair.minted.outcome) run('pair.start');
     else run('pair.new');
   }, () => state.route === 'devices');
+  Kit.bind('n', () => run('package.add'), () => state.route === 'toolchains');
 
   // ------------------------------------------------------------------ boot --
   window.T3C.hydrateIcons(document);

@@ -492,3 +492,135 @@ test("settings an older image left behind flag Environment", () => {
   assert.deepEqual(plain(M.navBadges(statusWith({ legacyEnv: ["GOROOT"] }), null, ui()).more), { tone: "warn", count: 1 });
   assert.equal(M.navBadges(statusWith({ legacyEnv: [] }), null, ui()).environment, null);
 });
+
+// --------------------------------------------------------------- added tools --
+
+const pkg = (id, overrides = {}) => ({
+  id, name: id, configured: true, installed: true, version: "1.0.0", requestedVersion: "1.0.0", latestVersion: null,
+  failed: false, failure: null, operation: null, inProgress: false, adopted: false, managedVersions: ["1.0.0"], ...overrides,
+});
+const pkgRow = (status, id, extra) => M.packageRows(status, ui(extra), NOW).find((r) => r.id === id);
+
+test("an added tool reads like a toolchain row, under its own commands", () => {
+  const s = statusWith({ packages: [
+    pkg("ripgrep", { bins: ["rg"], latestVersion: "1.0.0", description: "searches directories" }),
+    pkg("jq", { bins: ["jq"], latestVersion: "1.1.0" }),
+    pkg("node", { bins: ["node", "npm", "npx", "corepack"] }),
+  ] });
+  const rg = pkgRow(s, "ripgrep");
+  assert.equal(rg.target, "package");
+  assert.equal(rg.mono, "Ri");
+  assert.equal(rg.status.text, "Provides rg · up to date");
+  assert.equal(rg.description, "searches directories");
+  assert.deepEqual(plain(rg.menu.map((m) => m.cmd || "sep")), ["package.version", "sep", "package.uninstall"]);
+  const jq = pkgRow(s, "jq");
+  assert.equal(jq.status.text, "Installed · 1.1.0 is available", "a command named like the tool goes unsaid");
+  assert.deepEqual(plain(jq.action), { cmd: "package.update", label: "Update" });
+  assert.equal(jq.menu[0].label, "Update to 1.1.0");
+  assert.equal(pkgRow(s, "node").status.text, "Provides node, npm, npx and 1 more");
+});
+
+test("a tool the config does not pin says what it follows", () => {
+  const s = statusWith({ packages: [pkg("yq", { requestedVersion: "latest", version: "4.44.1", adopted: true })] });
+  assert.equal(pkgRow(s, "yq").status.text, "Installed · follows latest");
+});
+
+test("a failed first install offers Retry, and taking it off the list", () => {
+  const s = statusWith({ packages: [pkg("terraform", { configured: false, installed: false, version: null, failed: true, failure: "404 Not Found", operation: "install" })] });
+  const row = pkgRow(s, "terraform");
+  assert.equal(row.state, "failed");
+  assert.deepEqual(plain(row.action), { cmd: "package.install", label: "Retry", icon: "refresh-cw", variant: "warning" });
+  assert.deepEqual(plain(row.menu.map((m) => m.cmd)), ["package.dismiss"]);
+  assert.deepEqual(plain(M.needsYou(s, null, ui()).map((r) => r.id)), ["terraform"]);
+  assert.deepEqual(plain(M.navBadges(s, null, ui()).toolchains), { tone: "warn", count: 1 });
+});
+
+test("an added tool's work shows with the rest, and its own operations name it", () => {
+  const s = statusWith({
+    packages: [pkg("jq", { latestVersion: "1.1.0" })],
+    operations: {
+      "package:jq": { kind: "update", state: "running", progress: { phase: "installing" } },
+      "package:npm:prettier": { kind: "install", state: "ok", finishedAt: NOW - 60_000 },
+    },
+  });
+  const row = pkgRow(s, "jq");
+  assert.equal(row.state, "running");
+  assert.equal(row.action.cmd, "op.cancel");
+  const act = M.activity(s, ui(), NOW);
+  assert.deepEqual(plain(act.running.map((r) => r.id)), ["jq"]);
+  assert.equal(act.finished[0].text, "Installed prettier");
+  assert.equal(M.summaries(s, null, ui(), NOW).toolchains.text, "5 of 5 installed · 1 added · through mise");
+});
+
+// The shape GET /packages/registry serves.
+const REGISTRY = [
+  { name: "jq", description: "Command-line JSON processor", kinds: ["aqua"], bins: ["jq"], aliases: [] },
+  { name: "jless", description: "A command-line JSON viewer", kinds: ["aqua"], bins: ["jless"], aliases: [] },
+  { name: "ripgrep", description: "Searches directories for a regex", kinds: ["aqua", "cargo"], bins: ["rg"], aliases: ["rg"] },
+  { name: "rgr", description: "Something else entirely", kinds: ["github"], bins: ["rgr"], aliases: [] },
+  { name: "kubectl", description: "kubectl cli", kinds: ["aqua"], bins: ["kubectl"], aliases: [] },
+  { name: "kubectx", description: "Switch contexts", kinds: ["aqua"], bins: ["kubectx", "kubens"], aliases: [] },
+  { name: "helm", description: "The Kubernetes package manager", kinds: ["aqua"], bins: ["helm"], aliases: [] },
+  { name: "claude", description: "Claude Code", kinds: ["aqua"], bins: ["claude"], aliases: ["claude-code"] },
+  { name: "go", description: "Go", kinds: ["core"], bins: ["go"], aliases: [] },
+];
+
+test("registry search ranks the name, then an alias or command, then the description", () => {
+  const names = (q) => plain(M.searchRegistry(REGISTRY, q).map((r) => r.entry.name));
+  assert.deepEqual(names("rg").slice(0, 2), ["ripgrep", "rgr"], "rg is ripgrep's command before it is a prefix");
+  assert.deepEqual(names("kube"), ["kubectl", "kubectx", "helm"], "names first, then a description that mentions it");
+  assert.deepEqual(names("json"), ["jq", "jless"]);
+  assert.deepEqual(plain(M.searchRegistry(REGISTRY, "ctl")[0].match), [4, 7]);
+  assert.deepEqual(names(""), ["kubectl", "helm"], "suggestions this registry has, before anything is typed");
+  assert.deepEqual(names("zzz"), []);
+  assert.equal(M.searchRegistry(REGISTRY, "k", 2).length, 2);
+});
+
+test("names owned by agents and toolchains are known, and tool names are checked like the server does", () => {
+  assert.equal(M.managedOn("claude-code"), "Agents");
+  assert.equal(M.managedOn("go"), "Toolchains");
+  assert.equal(M.managedOn("kubectl"), null);
+  for (const ok of ["kubectl", "npm:prettier", "github:cli/cli", "npm:@biomejs/biome"]) assert.equal(M.isToolSpec(ok), true, ok);
+  for (const bad of ["--help", "a b", "asdf:https://x/y", "x/"]) assert.equal(M.isToolSpec(bad), false, bad);
+  assert.equal(M.isVersionSpec("3.12"), true);
+  assert.equal(M.isVersionSpec("-1"), false);
+});
+
+test("the palette installs from the registry, but only when asked and never above the console's own actions", () => {
+  const s = statusWith({ packages: [pkg("jq")] });
+  const items = M.paletteItems(s, null, ui({ registry: REGISTRY }), NOW);
+  assert.ok(!M.searchPalette(items, "").some((i) => i.group === "Install from mise"), "nothing from the registry without a query");
+  const hits = M.searchPalette(items, "k");
+  const registryHits = hits.filter((i) => i.group === "Install from mise");
+  assert.ok(registryHits.length > 0 && registryHits.length <= 6);
+  assert.ok(hits.indexOf(registryHits[0]) > hits.findIndex((i) => i.group !== "Install from mise"), "after the console's own results");
+  assert.ok(!items.some((i) => i.label === "Install jq…"), "an installed tool is not offered again");
+  assert.ok(!items.some((i) => i.label === "Install claude…" || i.label === "Install go…"), "nor one managed elsewhere");
+  assert.equal(M.searchPalette(items, "kubectl").find((i) => i.group === "Install from mise").cmd.id, "kubectl");
+  assert.ok(M.searchPalette(items, "json viewer").some((i) => i.label === "Install jless…"), "found by its description");
+  assert.ok(items.some((i) => i.label === "Add a tool…" && i.shortcut === "N"));
+});
+
+test("a tool shows from the click on: in flight, then queued, before the server lists it", () => {
+  const s = statusWith({ packages: [], operations: { "package:npm:prettier": { kind: "install", state: "queued" } } });
+  const queued = pkgRow(s, "npm:prettier");
+  assert.equal(queued.name, "prettier");
+  assert.equal(queued.state, "queued");
+  assert.equal(queued.action.cmd, "op.cancel");
+  const inFlight = pkgRow(statusWith({ packages: [] }), "kubectl", { busy: new Map([["package:kubectl", "install"]]) });
+  assert.equal(inFlight.state, "running");
+  assert.equal(inFlight.badge.text, "Installing");
+  assert.equal(M.toolName("npm:@biomejs/biome"), "biome");
+  assert.equal(M.toolName("kubectl"), "kubectl");
+});
+
+test("a typed version resolves the way mise does, segment by segment", () => {
+  const releases = ["1.37.1", "1.37.0", "1.4.0", "1.3.10", "1.3.9", "1.3.0-rc.1", "1.3"];
+  assert.equal(M.resolveRelease(releases, "1.3"), "1.3", "an exact release wins");
+  assert.equal(M.resolveRelease(releases.filter((v) => v !== "1.3"), "1.3"), "1.3.10", "else the newest 1.3.x, not 1.37");
+  assert.equal(M.resolveRelease(releases, "1.37"), "1.37.1");
+  assert.equal(M.resolveRelease(releases, "1"), "1.37.1");
+  assert.equal(M.resolveRelease(releases, "2"), null);
+  assert.equal(M.resolveRelease(null, "1"), null);
+  assert.equal(M.resolveRelease(releases, ""), null);
+});

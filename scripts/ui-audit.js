@@ -305,6 +305,13 @@ const audit = () => {
       await page.waitForSelector(".tc-layer .tc-palette");
       await page.keyboard.type("pub");
     }],
+    ["add a tool", async (page) => {
+      await page.keyboard.press("Escape");
+      await page.evaluate(() => { location.hash = "toolchains"; });
+      await page.click("#page-toolchains [data-cmd='package.add'] >> nth=0");
+      await page.waitForSelector(".tc-layer #tool-list .tc-option, .tc-layer .tc-combobox-note", { timeout: 30000 });
+      await page.keyboard.type("kube");
+    }],
     ["pairing", async (page) => {
       await page.keyboard.press("Escape");
       await page.evaluate(() => { location.hash = "devices"; });

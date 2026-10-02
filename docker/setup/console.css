@@ -296,6 +296,41 @@ html.tc-locked { overflow: hidden; }
   .tc-signin-code .tc-btn { width: 100%; }
 }
 
+/* Added tools: the section's filter beside its button, the empty state's
+   suggestions, and the Add a tool sheet. */
+.tc-section-actions { gap: var(--space-2); }
+.tc-tool-filter { width: 160px; }
+.tc-tool-filter .tc-input { padding-left: 30px; }
+.tc-chips { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--space-2); margin-top: var(--space-3); }
+.tc-chip-btn { height: var(--control-sm); padding: 0 var(--space-3); border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--fg);
+  font: 400 13px/1 var(--font-mono); cursor: pointer; }
+.tc-chip-btn:hover { background: var(--hover); }
+.tc-chip-btn:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.tc-empty-cta { margin-top: var(--space-3); }
+/* A listbox is a flex column with a maximum height: its options keep their
+   own height and the list scrolls, rather than squeezing them together. */
+.tc-listbox > * { flex: none; }
+.tc-listbox--rich .tc-option { align-items: flex-start; padding-block: 8px; }
+.tc-sheet .tc-combobox .tc-listbox--rich { max-height: min(400px, 46vh); }
+.tc-option--rich > .tc-tile { margin-top: 1px; }
+.tc-option-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.tc-option-name { line-height: 20px; }
+.tc-option-desc { font-size: 12px; line-height: 16px; color: var(--fg-muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.tc-option[aria-disabled="true"] { cursor: default; opacity: 0.6; }
+.tc-option[aria-disabled="true"]:hover { background: none; }
+.tc-option-meta .tc-icon { width: 12px; height: 12px; }
+.tc-combobox-note { display: flex; align-items: center; gap: var(--space-2); padding: 10px 12px; border-top: 1px solid var(--hairline); font-size: 13px; color: var(--fg-muted); }
+.tc-tool-picked { display: flex; align-items: flex-start; gap: var(--space-3); }
+.tc-tool-picked-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.tc-kv--sheet { border: 1px solid color-mix(in srgb, var(--border) 60%, transparent); border-radius: var(--radius-lg); }
+.tc-kv--sheet > dt, .tc-kv--sheet > dd { padding: 8px 12px; font-size: 13px; }
+.tc-kv--sheet > dd { flex-wrap: wrap; overflow-wrap: anywhere; }
+.tc-seg--fill { width: 100%; }
+.tc-seg--fill > button { flex: 1 1 0; justify-content: center; }
+@media (max-width: 639.98px) {
+  .tc-tool-filter { width: 112px; }
+}
+
 /* Combobox (provider picker) inside a sheet. */
 .tc-combobox { border: 1px solid var(--border-strong); border-radius: var(--radius-lg); background: var(--bg); box-shadow: var(--shadow-xs); overflow: hidden; }
 [data-theme="dark"] .tc-combobox { background: oklch(1 0 0 / 0.0256); }

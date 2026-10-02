@@ -96,6 +96,20 @@ check("operations report their phase",
   has(SERVER, "onProgress") && has(MODEL, "progressOf"),
   "the row's progress line needs the manager's phases");
 
+check("any other mise tool is managed through the same manager, lock and queue",
+  has(path.join(ROOT, "docker/harness/manager.mjs"), "packages: {") && has(SERVER, '"/packages/install"')
+    && has(SERVER, "manager.packages") && has(SERVER, '"/packages/registry"') && has(SERVER, "lifecycleId"),
+  "added tools need manager.packages, the /packages routes and server-side name validation");
+check("added tools are validated and kept apart from agents and toolchains",
+  has(path.join(ROOT, "docker/harness/packages.mjs"), "parseToolSpec") && has(path.join(ROOT, "docker/harness/packages.mjs"), "managedElsewhere"),
+  "packages.mjs must validate tool names and refuse names owned elsewhere");
+check("the Toolchains page adds and manages any tool",
+  has(MODEL, "packageRows") && has(MODEL, "searchRegistry") && has(APP, "openToolSheet") && has(APP, "'package.add'"),
+  "the console needs package rows, registry search and the Add a tool sheet");
+check("t3-harness manages added tools too",
+  has(CLI, "packages [--json]") && has(CLI, "manager.packages"),
+  "the CLI must list and install added tools through the same manager");
+
 // -- 3. styles for the lifecycle controls -------------------------------------
 check("lifecycle controls wrap without squeezing the row",
   has(CSS, ".tc-row-actions--wrap") && has(CSS, ".tc-input--sm"),

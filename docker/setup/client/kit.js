@@ -545,17 +545,19 @@ const Kit = (() => {
   };
 
   /**
-   * The command palette. `items()` lists what it can reach right now and
-   * `search(items, query)` ranks them; choosing one calls `run(item)` after the
-   * palette has closed, so whatever it opens takes focus cleanly.
+   * The command palette. `items()` lists what it can reach right now (asked
+   * again on every search, so something that loads while it is open - the
+   * registry - shows up on the next keystroke) and `search(items, query)` ranks
+   * them; choosing one calls `run(item)` after the palette has closed, so
+   * whatever it opens takes focus cleanly. The returned layer's `refresh()`
+   * re-runs the current search.
    */
   const palette = ({ items, search, run }) => {
     const current = top();
     if (current && current.kind === 'palette') { current.close('toggle'); return; }
     closeAll('replaced');
-    const all = items();
     let query = '';
-    let results = search(all, '');
+    let results = search(items(), '');
     let selected = 0;
     const listId = 'palette-list';
     const optionId = (i) => 'palette-opt-' + i;
@@ -596,9 +598,17 @@ const Kit = (() => {
       layer.close('select');
       run(item);
     };
+    layer.refresh = () => {
+      if (layer.closed) return;
+      const id = results[selected] && results[selected].id;
+      results = search(items(), query);
+      const keep = results.findIndex((r) => r.id === id);
+      selected = keep === -1 ? 0 : keep;
+      layer.render();
+    };
     input.addEventListener('input', () => {
       query = input.value;
-      results = search(all, query);
+      results = search(items(), query);
       selected = 0;
       layer.render();
       const list = layer.panel.querySelector('.tc-listbox');
@@ -630,6 +640,7 @@ const Kit = (() => {
       const option = e.target.closest('.tc-option');
       if (option) choose(Number(option.getAttribute('data-index')));
     });
+    return layer;
   };
 
   return {

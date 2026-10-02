@@ -359,20 +359,46 @@ const T3Model = (() => {
   };
 
   // ------------------------------------------------------------ toolchains --
-  const toolchainRow = (t, status, ui, now) => {
-    const meta = TOOLCHAINS[t.id] || { name: t.name || t.id, mono: String(t.id || '?').slice(0, 2) };
-    const act = activityOf(status, 'toolchain', t.id, ui);
+  // The five toolchains the image installs and the tools added on top of them
+  // (any other mise tool in the global config) share one row model: the same
+  // states, verbs and menu, each under its own commands (toolchain.update,
+  // package.update, ...).
+
+  /** Two letters for a tile: "Jq", "Ri", "Ku". */
+  const monogram = (name) => {
+    const letters = String(name || '?').replace(/[^A-Za-z0-9]/g, '') || '?';
+    return letters[0].toUpperCase() + (letters[1] || '').toLowerCase();
+  };
+
+  /** "Provides rg", "Provides node, npm and npx": said only when the commands are not just the name. */
+  const providesText = (name, bins) => {
+    const list = (bins || []).filter(Boolean);
+    if (!list.length || (list.length === 1 && list[0] === name)) return null;
+    const shown = list.length > 3 ? list.slice(0, 3).concat(plural(list.length - 3, 'more', 'more')) : list;
+    return 'Provides ' + listOf(shown);
+  };
+
+  const toolRow = (t, target, status, ui, now) => {
+    const isPackage = target === 'package';
+    const meta = isPackage
+      ? { name: t.name || t.id, mono: monogram(t.name || t.id), detail: providesText(t.name || t.id, t.bins) }
+      : TOOLCHAINS[t.id] || { name: t.name || t.id, mono: String(t.id || '?').slice(0, 2) };
+    const cmd = (verb) => target + '.' + verb;
+    const act = activityOf(status, target, t.id, ui);
     const version = t.version || null;
     const latest = t.latestVersion || null;
     const updateAvailable = Boolean(t.installed && isNewer(latest, version));
     const runningKind = act.serverQueued ? null : (act.ownOp && act.ownOp.kind) || (act.pending && act.pending.kind)
       || (t.inProgress ? t.operation || 'install' : null) || (act.fromSetup ? 'install' : null) || act.busy;
     const planned = ((status.setup && status.setup.items) || []).some((i) => i.kind === 'toolchain' && i.id === t.id);
+    // What the global config asks for when it is not an exact version
+    // (`latest`, `3`): the row says so instead of implying a pin.
+    const follows = isPackage && t.requestedVersion && version && t.requestedVersion !== version ? t.requestedVersion : null;
 
     const row = {
       id: t.id,
       key: act.key,
-      target: 'toolchain',
+      target,
       name: meta.name,
       mono: meta.mono,
       hue: '--id-toolchain',
@@ -388,6 +414,8 @@ const T3Model = (() => {
       cancellable: false,
       attention: false,
       dim: false,
+      description: isPackage ? t.description || null : null,
+      bins: isPackage ? t.bins || [] : [],
     };
 
     if (runningKind) {
@@ -420,12 +448,15 @@ const T3Model = (() => {
         row.state = 'failed';
         row.attention = true;
         row.status = { dot: 'danger', text: (FAILED[t.operation] || 'Failed') + ': ' + t.failure };
-        row.action = { cmd: 'toolchain.install', label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
+        row.action = { cmd: cmd('install'), label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
+        // A first install that never reached the config has nothing to
+        // uninstall; it can only be retried, or taken off the list.
+        if (isPackage && !t.configured) row.menu.push({ cmd: 'package.dismiss', label: 'Remove from this list', icon: 'x' });
       } else {
         row.state = 'missing';
-        if (planned || !status.setup || status.setup.state === 'off') row.status.text = 'Not installed';
+        if (isPackage || planned || !status.setup || status.setup.state === 'off') row.status.text = 'Not installed';
         else row.status = { dot: null, text: 'Not installed · left out of', code: 'T3_PREINSTALL' };
-        row.action = { cmd: 'toolchain.install', label: 'Install', icon: 'download' };
+        row.action = { cmd: cmd('install'), label: 'Install', icon: 'download' };
       }
       row.notice = distinctNotice(notice, row.status);
       return row;
@@ -435,22 +466,141 @@ const T3Model = (() => {
       row.state = 'failed';
       row.attention = true;
       row.status = { dot: 'danger', text: (FAILED[t.operation] || 'Failed') + ': ' + t.failure };
-      row.action = { cmd: t.operation === 'uninstall' ? 'toolchain.uninstall' : 'toolchain.update', label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
+      row.action = { cmd: cmd(t.operation === 'uninstall' ? 'uninstall' : 'update'), label: 'Retry', icon: 'refresh-cw', variant: 'warning' };
     } else if (updateAvailable) {
       row.state = 'update';
       row.status.text = (meta.detail ? meta.detail + ' · ' : 'Installed · ') + latest + ' is available';
-      row.action = { cmd: 'toolchain.update', label: 'Update' };
+      row.action = { cmd: cmd('update'), label: 'Update' };
     } else {
-      row.status.text = (meta.detail ? meta.detail : 'Installed') + (latest ? ' · up to date' : '');
+      row.status.text = [meta.detail || 'Installed', follows ? 'follows ' + follows : latest ? 'up to date' : null].filter(Boolean).join(' · ');
     }
-    if (updateAvailable) row.menu.push({ cmd: 'toolchain.update', label: 'Update to ' + latest, icon: 'circle-arrow-up' });
-    else if (!latest) row.menu.push({ cmd: 'toolchain.update', label: 'Update to the latest', icon: 'circle-arrow-up' });
+    if (updateAvailable) row.menu.push({ cmd: cmd('update'), label: 'Update to ' + latest, icon: 'circle-arrow-up' });
+    else if (!latest) row.menu.push({ cmd: cmd('update'), label: 'Update to the latest', icon: 'circle-arrow-up' });
+    if (isPackage) row.menu.push({ cmd: 'package.version', label: 'Install a specific version…', icon: 'history' });
     row.menu.push({ sep: true });
-    row.menu.push({ cmd: 'toolchain.uninstall', label: 'Uninstall…', icon: 'trash-2', danger: true });
+    row.menu.push({ cmd: cmd('uninstall'), label: 'Uninstall…', icon: 'trash-2', danger: true });
     return row;
   };
 
-  const toolchainRows = (status, ui, now) => ((status && status.toolchains) || []).map((t) => toolchainRow(t, status, ui, now));
+  const toolchainRow = (t, status, ui, now) => toolRow(t, 'toolchain', status, ui, now);
+  const toolchainRows = (status, ui, now) => ((status && status.toolchains) || []).map((t) => toolRow(t, 'toolchain', status, ui, now));
+  /** The name a tool's row shows: its registry name, or the last part of a backend spec (npm:@biomejs/biome -> biome). */
+  const toolName = (id) => {
+    const spec = String(id || '');
+    const name = spec.slice(spec.indexOf(':') + 1);
+    return name.split('/').filter(Boolean).pop() || name || spec;
+  };
+
+  /**
+   * Tools added beyond the toolchains: any other mise tool in the global
+   * config. A tool still waiting in the queue (or whose request is in flight)
+   * is not in /status yet - the manager lists it once its job holds the lock -
+   * so it gets a row from the operation, and shows as queued from the click on.
+   */
+  const packageRows = (status, ui, now) => {
+    const s = status || {};
+    const list = [...(s.packages || [])];
+    const waiting = [
+      ...Object.entries(s.operations || {}).filter(([, op]) => op.state === 'queued' || op.state === 'running').map(([key]) => key),
+      ...((ui && ui.pending && [...ui.pending.keys()]) || []),
+      ...((ui && ui.busy && [...ui.busy.keys()]) || []),
+    ];
+    for (const key of waiting) {
+      if (!key.startsWith('package:')) continue;
+      const id = key.slice('package:'.length);
+      const busyKind = ui && ui.busy && ui.busy.get(key);
+      // An uninstall in flight is for a row that is already listed.
+      if (busyKind === 'uninstall' || list.some((p) => p.id === id)) continue;
+      list.push({ id, name: toolName(id), configured: false, installed: false, version: null });
+    }
+    return list.map((p) => toolRow(p, 'package', s, ui, now));
+  };
+
+  // ----------------------------------------------------------- added tools --
+  // Names an agent or a toolchain is managed under. The server refuses them as
+  // added tools; the Add a tool search shows them, but says where they live.
+  const MANAGED_ON = {
+    claude: 'Agents', 'claude-code': 'Agents', codex: 'Agents', opencode: 'Agents', grok: 'Agents', cursor: 'Agents',
+    'cursor-agent': 'Agents', 'cursor-cli': 'Agents',
+    go: 'Toolchains', rust: 'Toolchains', bun: 'Toolchains', deno: 'Toolchains', uv: 'Toolchains',
+  };
+  const managedOn = (name) => MANAGED_ON[String(name || '')] || null;
+
+  // A version as mise spells them; the server checks the same pattern.
+  const VERSION_SPEC = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
+  const isVersionSpec = (value) => VERSION_SPEC.test(String(value || '').trim());
+  // `[backend:]name`, mirroring the server's check (docker/harness/packages.mjs).
+  const TOOL_SPEC = /^(?:[a-z][a-z0-9-]{0,31}:)?[A-Za-z0-9@_][A-Za-z0-9@._/+-]{0,127}$/;
+  const isToolSpec = (value) => {
+    const id = String(value || '').trim();
+    return TOOL_SPEC.test(id) && !id.includes('..') && !id.endsWith('/');
+  };
+
+  /**
+   * The release mise installs for a typed version, from a newest-first list:
+   * the exact one, or the newest under it segment by segment, as `mise latest
+   * tool@1.3` does (1.3 -> 1.3.10, never 1.37.1). Null when none matches.
+   */
+  const resolveRelease = (versions, query) => {
+    const q = String(query || '').trim();
+    if (!q) return null;
+    const list = versions || [];
+    return list.find((v) => v === q) || list.find((v) => v.startsWith(q + '.') || v.startsWith(q + '-') || v.startsWith(q + '+')) || null;
+  };
+
+  // What the search offers before anything is typed: common picks that are
+  // not already in the image (which has git, gh, jq, ripgrep, fd, Node and
+  // Python), each kept only if this mise's registry has it.
+  const SUGGESTED_TOOLS = ['kubectl', 'helm', 'terraform', 'aws-cli', 'java', 'zig', 'pnpm', 'just', 'shellcheck', 'lazygit', 'k9s', 'duckdb'];
+  // Well-known tools win a tie between equally good matches, so "kube" finds
+  // kubectl before kubecm. Only a tie-break: a better match always comes first.
+  const PROMINENT = new Set([...SUGGESTED_TOOLS,
+    'node', 'python', 'ruby', 'php', 'dotnet', 'elixir', 'erlang', 'kotlin', 'lua', 'perl', 'gradle', 'maven', 'yarn',
+    'gcloud', 'azure-cli', 'flyctl', 'opentofu', 'pulumi', 'packer', 'vault', 'kind', 'minikube', 'kustomize', 'helmfile',
+    'argocd', 'stern', 'golangci-lint', 'ruff', 'prettier', 'biome', 'shfmt', 'hadolint', 'trivy', 'yq', 'fzf', 'bat',
+    'eza', 'delta', 'lazydocker', 'hyperfine', 'sops', 'age', 'direnv', 'watchexec', 'neovim', 'tmux', 'hugo', 'buf',
+    'protoc', 'bazel', 'cmake', 'task', 'mkcert', 'caddy', 'gh', 'glab', 'act', 'postgres', 'redis', 'sqlite']);
+
+  /**
+   * Rank registry entries for a query: the name itself, then an alias or a
+   * command it provides (rg finds ripgrep), then a name that starts with or
+   * contains it, then its description ("json" finds jq). The name's match is
+   * returned so the option can bold it.
+   */
+  const searchRegistry = (entries, query, limit) => {
+    const max = limit || 30;
+    const list = entries || [];
+    const q = String(query || '').trim().toLowerCase();
+    if (!q) {
+      const byName = new Map(list.map((e) => [e.name, e]));
+      return SUGGESTED_TOOLS.map((name) => byName.get(name)).filter(Boolean).slice(0, max).map((entry) => ({ entry, match: null, score: 0 }));
+    }
+    const words = q.split(/\s+/);
+    const scored = [];
+    for (const entry of list) {
+      const name = entry.name.toLowerCase();
+      const others = (entry.aliases || []).concat(entry.bins || []).map((x) => String(x).toLowerCase());
+      const at = name.indexOf(q);
+      let score = -1;
+      if (name === q) score = 0;
+      else if (others.includes(q)) score = 1;
+      else if (at === 0) score = 2;
+      else if (others.some((x) => x.startsWith(q))) score = 3;
+      else if (at > 0 && /[^a-z0-9]/.test(name[at - 1])) score = 4;
+      else if (at > 0) score = 5;
+      else {
+        const hay = name + ' ' + others.join(' ') + ' ' + String(entry.description || '').toLowerCase();
+        if (words.every((w) => new RegExp('(^|[^a-z0-9])' + w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).test(hay))) score = 6;
+        else if (words.every((w) => hay.includes(w))) score = 7;
+      }
+      if (score === -1) continue;
+      scored.push({ entry, match: at >= 0 ? [at, at + q.length] : null, score });
+    }
+    const prominent = (e) => (PROMINENT.has(e.name) ? 0 : 1);
+    scored.sort((a, b) => a.score - b.score || prominent(a.entry) - prominent(b.entry)
+      || a.entry.name.length - b.entry.name.length || a.entry.name.localeCompare(b.entry.name));
+    return scored.slice(0, max);
+  };
 
   // ---------------------------------------------------------------- ports --
   const looksLikeDatabase = (port, process) => DATABASE_PORTS.has(Number(port)) || DATABASE_PROCESSES.test(String(process || ''));
@@ -627,7 +777,7 @@ const T3Model = (() => {
   const needsYou = (status, ports, ui) => {
     const s = status || {};
     const agents = agentRows(s, ui, 0);
-    const tools = toolchainRows(s, ui, 0);
+    const tools = [...toolchainRows(s, ui, 0), ...packageRows(s, ui, 0)];
     const rank = { failed: 0, signin: 1, update: 2 };
     const items = [
       ...agents.filter((a) => a.state in rank),
@@ -647,7 +797,7 @@ const T3Model = (() => {
     const s = status || {};
     const running = [];
     const queued = [];
-    for (const row of [...agentRows(s, ui, now), ...toolchainRows(s, ui, now)]) {
+    for (const row of [...agentRows(s, ui, now), ...toolchainRows(s, ui, now), ...packageRows(s, ui, now)]) {
       if (row.state === 'running') running.push(row);
       else if (row.state === 'queued') queued.push(row);
     }
@@ -655,8 +805,12 @@ const T3Model = (() => {
     for (const [key, op] of Object.entries(s.operations || {})) {
       if (op.state === 'running' || !op.finishedAt) continue;
       if (now - op.finishedAt > 30 * 60 * 1000) continue;
-      const [target, id] = key.split(':');
-      const name = target === 'harness' ? (AGENTS[id] || {}).name || id : (TOOLCHAINS[id] || {}).name || id;
+      // On the first colon only: an added tool's id can carry its own (npm:prettier).
+      const target = key.slice(0, key.indexOf(':'));
+      const id = key.slice(key.indexOf(':') + 1);
+      const name = target === 'harness' ? (AGENTS[id] || {}).name || id
+        : target === 'toolchain' ? (TOOLCHAINS[id] || {}).name || id
+          : ((s.packages || []).find((p) => p.id === id) || {}).name || toolName(id);
       finished.push({
         key,
         ok: op.state === 'ok',
@@ -707,7 +861,7 @@ const T3Model = (() => {
   const navBadges = (status, ports, ui) => {
     const s = status || {};
     const agents = agentRows(s, ui, 0);
-    const tools = toolchainRows(s, ui, 0);
+    const tools = [...toolchainRows(s, ui, 0), ...packageRows(s, ui, 0)];
     const portList = ports ? portRows(ports, ui, 0) : [];
     const agentAttention = agents.filter((a) => a.attention).length;
     const toolsRunning = tools.filter((t) => t.state === 'running').length;
@@ -736,6 +890,7 @@ const T3Model = (() => {
     const installed = agents.filter((a) => a.version && a.state !== 'missing');
     const signed = agents.filter((a) => ['ok', 'update'].includes(a.state)).length;
     const tools = (s.toolchains || []);
+    const added = (s.packages || []).filter((p) => p.configured).length;
     const portList = ports ? portRows(ports, ui, now) : [];
     const sessions = (s.sessions || []).length;
     const links = (s.pairings || []).length;
@@ -743,7 +898,7 @@ const T3Model = (() => {
       overview: { text: hostOf(s.publicUrl) || host || '', mono: true },
       devices: { text: sessions || links ? [sessions + ' paired', links ? plural(links, 'link') + ' waiting' : null].filter(Boolean).join(' · ') : 'No devices yet' },
       agents: { text: installed.length ? signed + ' of ' + installed.length + ' signed in' : 'None installed yet' },
-      toolchains: { text: tools.filter((t) => t.installed).length + ' of ' + tools.length + ' installed · through mise' },
+      toolchains: { text: [tools.filter((t) => t.installed).length + ' of ' + tools.length + ' installed', added ? added + ' added' : null, 'through mise'].filter(Boolean).join(' · ') },
       ports: { text: ports ? (ports.available === false ? 'Publishing unavailable' : [portList.filter((p) => p.listening).length + ' listening', portList.filter((p) => p.state === 'open').length ? portList.filter((p) => p.state === 'open').length + ' published' : null].filter(Boolean).join(' · ')) : '' },
       environment: { text: 'Read from the container at boot' },
       more: { text: '' },
@@ -764,6 +919,8 @@ const T3Model = (() => {
       'harness.signin': 'login log in auth authenticate', 'harness.apikey': 'api key token credential provider',
       'harness.install': 'add download', 'harness.uninstall': 'remove delete', 'harness.update': 'upgrade',
       'toolchain.install': 'add download', 'toolchain.uninstall': 'remove delete', 'toolchain.update': 'upgrade',
+      'package.add': 'install new tool package mise registry', 'package.install': 'add download', 'package.uninstall': 'remove delete',
+      'package.update': 'upgrade', 'package.version': 'pin downgrade older release', 'tools.updateAll': 'upgrade',
       'port.publish': 'expose share tunnel open', 'port.stop': 'unpublish unexpose close tunnel', 'port.qr': 'scan phone',
       'device.revoke': 'remove delete unpair sign out', 'link.revoke': 'remove delete pairing',
       'pair.start': 'new add phone device qr', lock: 'log out logout sign out', theme: 'appearance mode colour color',
@@ -799,6 +956,29 @@ const T3Model = (() => {
       if (t.state === 'failed') add('Toolchains', 'Retry ' + t.name, 'refresh-cw', { cmd: t.action.cmd, id: t.id }, { meta: { text: 'failed', dot: 'danger' }, attention: true });
       if (t.version && t.state !== 'running') add('Toolchains', 'Uninstall ' + t.name + '…', 'trash-2', { cmd: 'toolchain.uninstall', id: t.id });
     }
+    add('Toolchains', 'Add a tool…', 'plus', { cmd: 'package.add' }, { shortcut: 'N' });
+    const installed = new Set();
+    for (const t of packageRows(s, ui, now)) {
+      installed.add(t.id);
+      const version = t.version ? { text: t.version, mono: true } : null;
+      if (t.updateAvailable) add('Toolchains', 'Update ' + t.name + ' to ' + t.latest, 'circle-arrow-up', { cmd: 'package.update', id: t.id }, { meta: version, attention: true });
+      if (t.state === 'failed') add('Toolchains', 'Retry ' + t.name, 'refresh-cw', { cmd: t.action.cmd, id: t.id }, { meta: { text: 'failed', dot: 'danger' }, attention: true });
+      if (t.version && t.state !== 'running') {
+        add('Toolchains', 'Install a specific version of ' + t.name + '…', 'history', { cmd: 'package.version', id: t.id }, { meta: version });
+        add('Toolchains', 'Uninstall ' + t.name + '…', 'trash-2', { cmd: 'package.uninstall', id: t.id });
+      }
+    }
+    // The registry, once loaded: anything mise can install, reachable by name,
+    // command or description. Only offered for a query; a thousand tools would
+    // bury everything else.
+    for (const entry of (ui && ui.registry) || []) {
+      if (installed.has(entry.name) || managedOn(entry.name)) continue;
+      add('Install from mise', 'Install ' + entry.name + '…', 'download', { cmd: 'package.add', id: entry.name }, {
+        meta: entry.bins && entry.bins.length && !(entry.bins.length === 1 && entry.bins[0] === entry.name) ? { text: entry.bins.slice(0, 2).join(' '), mono: true } : null,
+        keywords: [entry.description, ...(entry.aliases || []), ...(entry.bins || [])].join(' '),
+        searchOnly: true,
+      });
+    }
     if (ports && ports.available !== false) {
       for (const p of portRows(ports, ui, now)) {
         const meta = p.db ? { text: 'database', dot: 'warn' } : p.process ? { text: p.process, mono: true } : null;
@@ -818,7 +998,11 @@ const T3Model = (() => {
     const agentUpdates = agentRows(s, ui, now).filter((a) => a.updateAvailable).length;
     if (agentUpdates) add('Actions', 'Update all agents', 'circle-arrow-up', { cmd: 'harness.updateAll' }, { meta: { text: plural(agentUpdates, 'update') }, attention: true });
     const toolUpdates = toolchainRows(s, ui, now).filter((t) => t.updateAvailable).length;
-    if (toolUpdates) add('Actions', 'Update all toolchains', 'circle-arrow-up', { cmd: 'toolchain.updateAll' }, { meta: { text: plural(toolUpdates, 'update') } });
+    const packageUpdates = packageRows(s, ui, now).filter((t) => t.updateAvailable).length;
+    if (toolUpdates + packageUpdates) {
+      add('Actions', packageUpdates ? 'Update all toolchains and tools' : 'Update all toolchains', 'circle-arrow-up', { cmd: 'tools.updateAll' },
+        { meta: { text: plural(toolUpdates + packageUpdates, 'update') } });
+    }
     add('Actions', 'Check for updates now', 'refresh-cw', { cmd: 'updates.check' });
     add('Actions', 'Open T3 Code', 'external-link', { cmd: 'open.t3' });
     add('Actions', 'Theme: light', 'sun', { cmd: 'theme', mode: 'light' });
@@ -834,7 +1018,9 @@ const T3Model = (() => {
     return items;
   };
 
-  const GROUP_ORDER = ['Agents', 'Toolchains', 'Ports', 'Devices', 'Actions', 'Environment', 'Go to'];
+  const GROUP_ORDER = ['Agents', 'Toolchains', 'Ports', 'Devices', 'Actions', 'Environment', 'Go to', 'Install from mise'];
+  // Registry results are capped: the best few, after everything the console itself offers.
+  const SEARCH_ONLY_LIMIT = 6;
 
   /**
    * Filter and rank. An empty query lists what needs attention first, then
@@ -849,7 +1035,7 @@ const T3Model = (() => {
     const groupRank = (g) => { const i = GROUP_ORDER.indexOf(g); return i === -1 ? GROUP_ORDER.length : i; };
     if (!q) {
       const attention = items.filter((i) => i.attention).map((i) => Object.assign({}, i, { group: 'Needs you', match: null }));
-      const rest = items.filter((i) => !i.attention && i.group !== 'Devices').map((i) => Object.assign({}, i, { match: null }));
+      const rest = items.filter((i) => !i.attention && !i.searchOnly && i.group !== 'Devices').map((i) => Object.assign({}, i, { match: null }));
       rest.sort((a, b) => groupRank(a.group) - groupRank(b.group));
       return [...attention, ...rest];
     }
@@ -871,10 +1057,13 @@ const T3Model = (() => {
       scored.push({ item: Object.assign({}, item, { match }), score });
     }
     const best = new Map();
-    for (const s of scored) best.set(s.item.group, Math.min(best.get(s.item.group) ?? Infinity, s.score));
+    for (const s of scored) if (!s.item.searchOnly) best.set(s.item.group, Math.min(best.get(s.item.group) ?? Infinity, s.score));
+    // Search-only results (the registry) always come after the console's own.
+    for (const s of scored) if (s.item.searchOnly) best.set(s.item.group, 99);
     scored.sort((a, b) => best.get(a.item.group) - best.get(b.item.group)
-      || groupRank(a.item.group) - groupRank(b.item.group) || a.score - b.score);
-    return scored.map((s) => s.item);
+      || groupRank(a.item.group) - groupRank(b.item.group) || a.score - b.score || a.item.label.length - b.item.label.length);
+    let searchOnly = 0;
+    return scored.filter((s) => !s.item.searchOnly || ++searchOnly <= SEARCH_ONLY_LIMIT).map((s) => s.item);
   };
 
   // ----------------------------------------------------------- diagnostics --
@@ -896,7 +1085,8 @@ const T3Model = (() => {
     compareVersions, isNewer,
     relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs, imageLabel,
     progressOf, progressText,
-    agentRow, agentRows, toolchainRow, toolchainRows, portRows, looksLikeDatabase,
+    agentRow, agentRows, toolRow, toolchainRow, toolchainRows, packageRows, portRows, looksLikeDatabase,
+    monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind,
     readiness, readySummary, needsYou, activity, setupBanner,
     navBadges, summaries,
