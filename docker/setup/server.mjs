@@ -295,9 +295,9 @@ const latestCache = createLatestCache({
     const target = key.slice(0, cut);
     const id = key.slice(cut + 1);
     const manager = await loadHarness();
-    if (target === "harness") return manager.latest(id);
-    if (target === "package") return manager.packages.latest(id);
-    return manager.toolchains.latest(id);
+    if (target === "harness") return manager.latestRelease(id);
+    if (target === "package") return manager.packages.latestRelease(id);
+    return manager.toolchains.latestRelease(id);
   },
   read: async () => {
     const { readFile } = await import("node:fs/promises");
@@ -309,6 +309,9 @@ const latestCache = createLatestCache({
     await writeFile(LATEST_CACHE, text);
   },
 });
+/** mise's minimum release age in milliseconds, once read; null until then or when it is not a duration. */
+let releaseAgeMs = null;
+
 /** Each row with the newest release known for it (`latestVersion`, `latestCheckedAt`). */
 const withLatest = (target, rows) => rows.map((row) => ({ ...row, ...latestCache.get(`${target}:${row.id}`) }));
 
@@ -369,7 +372,8 @@ const ttlCache = (ttlMs, limit = 200) => {
     return value;
   };
 };
-const versionsCache = ttlCache(30 * 60 * 1000);
+// Short: which releases mise is still holding back changes as they age.
+const versionsCache = ttlCache(10 * 60 * 1000);
 const infoCache = ttlCache(6 * 60 * 60 * 1000);
 
 const storage = createStorageFacts({ volume: VOLUME, workspace: WORKSPACE });
@@ -676,6 +680,8 @@ const status = async () => {
       refreshing: harnessSnap?.cache?.refreshing ?? false,
     },
     toolchains: withLatest("toolchain", toolchainSnap?.toolchains ?? []),
+    // How long mise waits before offering a new release as the newest.
+    releaseAgeMs,
     // Every other tool in the global mise config, added here or with `mise use -g`.
     packages: withLatest("package", packageRows),
     // The background install of everything T3_PREINSTALL names, on a first
@@ -1486,7 +1492,7 @@ const cancelLifecycle = (target, rawId) => {
 
 const ROUTES = ["/login", "/logout", "/status", "/pair", "/revoke", "/ports",
   "/ports/expose", "/ports/unexpose",
-  "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses",
+  "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
   "/auth/apikey/remove", "/auth/apikey", "/auth/signin", "/auth/session", "/auth/code", "/auth/cancel",
   "/providers", "/updates/check",
@@ -1664,6 +1670,17 @@ const server = createServer(async (req, res) => {
         return sendJson(res, 503, { ok: false, error: `mise could not list its registry: ${String(error?.message ?? error)}` });
       }
     }
+    // An agent's releases, newest first, for "Install a specific version": each
+    // with when it was published and whether mise is still holding it back.
+    if (req.method === "GET" && route === "/harnesses/versions") {
+      const id = String(raw.searchParams.get("id") ?? "");
+      if (!HARNESS_IDS.has(id)) return sendJson(res, 404, { ok: false, code: "unknown-harness", error: `unknown harness: ${id}` });
+      const manager = await loadHarness();
+      const answer = await withTimeout(versionsCache(`harness:${id}`, () => manager.versions(id)), 20_000);
+      if (!answer.ok) return sendJson(res, 502, { ok: false, error: String(answer.error ?? "mise did not answer").slice(0, 300) });
+      return sendJson(res, 200, { ok: true, id, ...answer.value });
+    }
+
     // A tool's releases, newest first, and where it comes from. Both ask the
     // network through mise, so they are cached and bounded.
     if (req.method === "GET" && (route === "/packages/versions" || route === "/packages/info")) {
@@ -1671,7 +1688,7 @@ const server = createServer(async (req, res) => {
       const parsed = harnessModule.parseToolSpec(raw.searchParams.get("id"));
       if (!parsed.ok) return sendJson(res, 400, { ok: false, code: "invalid-tool", error: parsed.error });
       const work = route === "/packages/versions"
-        ? versionsCache(parsed.id, async () => ({ versions: await manager.packages.versions(parsed.id) }))
+        ? versionsCache(`package:${parsed.id}`, () => manager.packages.versions(parsed.id))
         : infoCache(parsed.id, async () => {
           const info = await manager.packages.info(parsed.id);
           const registry = await packageRegistry().catch(() => null);
@@ -1835,5 +1852,9 @@ server.listen(PORT, "0.0.0.0", () => {
   void storage.refresh();
   void latestCache.load();
   setTimeout(() => { void latestCache.refresh().catch(() => {}); }, 30_000).unref();
-  setInterval(() => { void latestCache.refresh().catch(() => {}); }, 30 * 60 * 1000).unref();
+  // A pass runs once the last is an hour old; looking every ten minutes keeps
+  // an answer from going much past that.
+  setInterval(() => { void latestCache.refresh().catch(() => {}); }, 10 * 60 * 1000).unref();
+  // How long mise holds a new release back, for "mise offers it in 21 hours".
+  void loadHarness().then((manager) => manager.releaseAge()).then((ms) => { releaseAgeMs = ms; }, () => {});
 });

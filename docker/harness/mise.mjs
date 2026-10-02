@@ -52,10 +52,15 @@ export async function listTools(ctx) {
  * floating selection is turned into an exact one; the result is recorded, not
  * kept as a moving target.
  */
-export async function latest(ctx, tool, { signal } = {}) {
+// mise holds a release back until it has been out for its minimum release age
+// (a day, docker/mise/config.toml). `anyAge` asks past that, for the newest
+// release published at all.
+const ANY_AGE = ["--minimum-release-age", "0s"];
+
+export async function latest(ctx, tool, { signal, anyAge = false } = {}) {
   // Normally well under two seconds. A network that drops packets instead of
   // refusing them would otherwise hold the lock for the whole mise timeout.
-  const result = await ctx.run(miseArgs(ctx, ["latest", tool]), {
+  const result = await ctx.run(miseArgs(ctx, ["latest", ...(anyAge ? ANY_AGE : []), tool]), {
     env: readEnv(ctx.env),
     cwd: ctx.home,
     timeoutMs: ctx.timeouts.latest ?? ctx.timeouts.mise,
@@ -141,14 +146,30 @@ export async function registry(ctx) {
 }
 
 /** The versions a tool's backend offers, as mise prints them (oldest first). Asks the network. */
-export async function lsRemote(ctx, tool) {
-  const result = await ctx.run(miseArgs(ctx, ["ls-remote", tool]), {
+/**
+ * `mise ls-remote`: oldest first, one per line, or with `json` a list of
+ * `{ version, created_at, release_url }`. `anyAge` includes the releases still
+ * inside the minimum release age.
+ */
+export async function lsRemote(ctx, tool, { json = false, anyAge = false } = {}) {
+  const result = await ctx.run(miseArgs(ctx, ["ls-remote", ...(json ? ["--json"] : []), ...(anyAge ? ANY_AGE : []), tool]), {
     env: readEnv(ctx.env),
     cwd: ctx.home,
     timeoutMs: ctx.timeouts.latest ?? ctx.timeouts.mise,
   });
   if (result.error || result.code !== 0) throw new Error(firstError(result) || `mise ls-remote ${tool} failed`);
   return result.stdout;
+}
+
+/** One mise setting as mise reads it (`mise settings get`), or null when it is not set. */
+export async function setting(ctx, name) {
+  const result = await ctx.run(miseArgs(ctx, ["settings", "get", name]), {
+    env: readEnv(ctx.env),
+    cwd: ctx.home,
+    timeoutMs: ctx.timeouts.mise,
+  });
+  if (result.error || result.code !== 0) return null;
+  return result.stdout.trim() || null;
 }
 
 /** `mise tool <tool> --json`: the backend it resolves to and how downloads are verified. */

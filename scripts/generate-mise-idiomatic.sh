@@ -113,6 +113,12 @@ fi
 #   pin                          \`mise use\` records the resolved exact version
 #                                instead of a floating selector, so an installed
 #                                personal tool never updates on its own.
+#   minimum_release_age          a release counts as the newest once it has been
+#                                out for a day, so one pulled or compromised
+#                                within hours of publishing is never picked for
+#                                you. mise already waits this long by default;
+#                                it is set here so the setup page can say so.
+#                                Naming an exact version installs it at once.
 #   idiomatic_version_file_enable_tools
 #                                the exact allowlist of tools in this release's
 #                                registry that declare an idiomatic version
@@ -123,6 +129,7 @@ fi
 auto_install = true
 not_found_system_fallback = false
 pin = true
+minimum_release_age = "24h"
 idiomatic_version_file_enable_tools = [
 EOF
   printf '%s\n' "$TOOLS" | sed 's/^/  "/; s/$/",/'

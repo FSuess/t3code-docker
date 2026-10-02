@@ -26,7 +26,7 @@ export {
 } from "./catalogue.mjs";
 export { parsePreinstall, readPreinstall, runPreinstall } from "./preinstall.mjs";
 export {
-  canonicalTool, displayName, indexRegistry, isReservedTool, isVersionSpec, managedElsewhere,
-  parseRegistry, parseToolInfo, parseToolSpec, parseVersions,
+  canonicalTool, displayName, indexRegistry, isPreview, isReservedTool, isVersionSpec, managedElsewhere,
+  parseDuration, parseRegistry, parseReleases, parseToolInfo, parseToolSpec,
 } from "./packages.mjs";
 export { compareVersions, meetsMinimum } from "./version.mjs";

@@ -137,7 +137,12 @@ function createWorld(fs, { arch = "x64" } = {}) {
       yq: ["4.44.1", "4.45.1"],
       terraform: ["1.9.0", "1.10.2"],
       "npm:prettier": ["3.3.3", "3.4.2"],
+      claude: ["2.1.270", "2.1.271", "2.1.273"],
+      opencode: ["1.14.0", "1.18.31"],
     },
+    // Published, but younger than mise's minimum release age: listed and
+    // resolved only when a call asks past it (`--minimum-release-age 0s`).
+    waiting: {},
     registry: [
       { short: "jq", backends: ["aqua:jqlang/jq"], bins: ["jq"], description: "Command-line JSON processor" },
       { short: "ripgrep", backends: ["aqua:BurntSushi/ripgrep", "cargo:ripgrep"], bins: ["rg"], description: "Searches directories", aliases: ["rg"] },
@@ -177,6 +182,8 @@ function createWorld(fs, { arch = "x64" } = {}) {
       }
       return ok(`${JSON.stringify(ordered)}\n`);
     }
+    const anyAge = argv.includes("--minimum-release-age");
+    const published = (name) => [...(world.versions[name] ?? []), ...(anyAge ? world.waiting[name] ?? [] : [])];
     if (command === "latest") {
       // `tool@prefix` resolves to the newest release under the prefix (or the
       // exact one); a bare tool to its newest.
@@ -184,16 +191,25 @@ function createWorld(fs, { arch = "x64" } = {}) {
       if (at > 0 && tool[at - 1] !== ":") {
         const name = tool.slice(0, at);
         const prefix = tool.slice(at + 1);
-        const hit = (world.versions[name] ?? []).filter((v) => v === prefix || v.startsWith(`${prefix}.`)).pop();
+        const hit = published(name).filter((v) => v === prefix || v.startsWith(`${prefix}.`)).pop();
         return hit ? ok(`${hit}\n`) : fail(`mise ERROR no version of ${name} matches ${prefix}`);
       }
-      const latest = world.latest[tool] ?? (world.versions[tool] ?? []).at(-1);
+      const held = anyAge ? (world.waiting[tool] ?? []).at(-1) : null;
+      const latest = held ?? world.latest[tool] ?? published(tool).at(-1);
       return latest ? ok(`${latest}\n`) : fail(`mise ERROR ${tool} not found in mise tool registry`);
     }
     if (command === "registry") return ok(`${JSON.stringify(world.registry)}\n`);
+    if (command === "settings") return argv.includes("minimum_release_age") ? ok("24h\n") : fail("mise ERROR Setting is not set");
     if (command === "ls-remote") {
-      const list = world.versions[tool];
-      return list ? ok(`${list.join("\n")}\n`) : fail(`mise ERROR ${tool} not found in mise tool registry`);
+      if (!world.versions[tool]) return fail(`mise ERROR ${tool} not found in mise tool registry`);
+      const list = published(tool);
+      if (!argv.includes("--json")) return ok(`${list.join("\n")}\n`);
+      // Oldest first, a day apart, the waiting ones today.
+      const waiting = new Set(world.waiting[tool] ?? []);
+      return ok(`${JSON.stringify(list.map((version, index) => ({
+        version,
+        created_at: waiting.has(version) ? "2026-10-02T20:00:00.0Z" : new Date(Date.UTC(2026, 8, 1 + index)).toISOString(),
+      })))}\n`);
     }
     if (command === "tool") {
       const name = argv[4];
@@ -1103,7 +1119,7 @@ test("a version prefix resolves to the newest release under it, and an exact one
   assert.equal((await manager.packages.install("python", { version: "latest" })).package.version, "3.13.0");
   const missing = await manager.packages.install("python", { version: "2.7" });
   assert.equal(missing.ok, false);
-  assert.match(missing.error, /no version of python matches 2\.7/);
+  assert.match(missing.error, /no release of python matches 2\.7/);
 });
 
 test("an alias is configured under its registry name, so a tool is never there twice", async () => {
@@ -1226,7 +1242,10 @@ test("the registry, a tool's versions and its details come from mise, read-only"
   assert.deepEqual(registry.find((entry) => entry.name === "ripgrep").kinds, ["aqua", "cargo"]);
   await manager.packages.registry();
   assert.equal(world.calls.filter((call) => call.endsWith("registry --json --hide-aliased")).length, 1, "parsed once per process");
-  assert.deepEqual(await manager.packages.versions("jq"), ["1.8.2", "1.8.1", "1.8.0", "1.7.1", "1.7"]);
+  const jq = await manager.packages.versions("jq");
+  assert.equal(jq.latest, "1.8.2");
+  assert.deepEqual(jq.releases.map((r) => r.version), ["1.8.2", "1.8.1", "1.8.0", "1.7.1", "1.7"]);
+  assert.equal(jq.releases.every((r) => r.waiting === false && r.releasedAt), true);
   const info = await manager.packages.info("ripgrep");
   assert.equal(info.backend, "aqua:BurntSushi/ripgrep");
   assert.deepEqual(info.security, ["checksum"]);
@@ -1245,6 +1264,58 @@ test("a package operation takes the same lock as everything else", async () => {
   const busy = await manager.packages.install("jq");
   assert.equal(busy.code, "busy");
   assert.deepEqual(world.useSpecs, []);
+});
+
+test("an agent's releases list newest first, marking the ones mise still holds back", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  world.waiting.claude = ["2.1.274"];
+  const { latest, releases } = await manager.versions("claude");
+  assert.equal(latest, "2.1.273", "what mise offers today");
+  assert.deepEqual(releases.map((r) => r.version), ["2.1.274", "2.1.273", "2.1.271", "2.1.270"]);
+  assert.deepEqual(releases.map((r) => r.waiting), [true, false, false, false]);
+  assert.equal(releases[0].releasedAt, "2026-10-02T20:00:00.000Z");
+  assert.ok(world.calls.some((call) => call.includes("ls-remote --json --minimum-release-age 0s claude")), "asks past the release age");
+  // OpenCode's releases below T3's minimum are listed, and say so.
+  const opencode = await manager.versions("opencode");
+  assert.deepEqual(opencode.releases.map((r) => [r.version, r.supported]), [["1.18.31", true], ["1.14.0", false]]);
+  await assert.rejects(manager.versions("nope"), /unknown harness/);
+});
+
+test("the newest-release check says what mise offers and what it is still holding back", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  assert.equal(await manager.releaseAge(), 86_400_000, "mise's minimum_release_age, read once");
+  await manager.releaseAge();
+  assert.equal(world.calls.filter((call) => call.includes("settings get minimum_release_age")).length, 1);
+  assert.deepEqual(await manager.latestRelease("claude"), { version: "2.1.273", newest: null, newestAt: null });
+  world.waiting.claude = ["2.1.274"];
+  assert.deepEqual(await manager.latestRelease("claude"), { version: "2.1.273", newest: "2.1.274", newestAt: "2026-10-02T20:00:00.000Z" });
+  world.waiting.jq = ["1.8.3"];
+  assert.deepEqual(await manager.packages.latestRelease("jq"), { version: "1.8.2", newest: "1.8.3", newestAt: "2026-10-02T20:00:00.000Z" });
+  assert.deepEqual(await manager.toolchains.latestRelease("go"), { version: "1.27.1", newest: null, newestAt: null }, "a tool mise cannot list still answers");
+});
+
+test("an added tool's release named in full installs while mise still holds it back; a prefix waits", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  world.waiting.jq = ["1.8.3", "1.9.0"];
+  const exact = await manager.packages.install("jq", { version: "1.8.3" });
+  assert.equal(exact.ok, true, exact.error);
+  assert.equal(exact.package.version, "1.8.3");
+  // A prefix resolves among the releases mise offers: 1.8 is 1.8.2 today.
+  const prefix = await manager.packages.install("jq", { version: "1.8" });
+  assert.equal(prefix.package.version, "1.8.2");
+  // A prefix whose every release is still waiting names the one to ask for.
+  const early = await manager.packages.install("jq", { version: "1.9" });
+  assert.equal(early.ok, false);
+  assert.equal(early.code, "invalid-version");
+  assert.match(early.error, /no 1\.9 release mise offers yet.*1\.9\.0/);
+  const missing = await manager.packages.install("jq", { version: "7" });
+  assert.match(missing.error, /no release of jq matches 7/);
 });
 
 test("a status read that straddles a package install starting does not call it interrupted", async () => {

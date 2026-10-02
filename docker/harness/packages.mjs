@@ -139,13 +139,45 @@ export function canonicalTool(id, registry) {
   return entry ? entry.name : String(id ?? "");
 }
 
-/** `mise ls-remote` prints oldest first, one per line; the console wants newest first. */
-export function parseVersions(text) {
-  return String(text ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !/\s/.test(line) && /^[0-9A-Za-z]/.test(line))
-    .reverse();
+// Release names that are previews by their own say, for backends whose
+// listing does not flag them (`prerelease`).
+const PREVIEW = /[-.+_](?:alpha|beta|rc|pre|preview|dev|canary|nightly|next|snapshot|insiders)\b/i;
+
+/** Whether a release is a preview, by its listing's flag or its name. */
+export const isPreview = (release) => Boolean(release?.prerelease) || PREVIEW.test(String(release?.version ?? ""));
+
+/**
+ * `mise ls-remote --json` -> releases newest first, each with when it was
+ * published where the backend says (`releasedAt`, ISO) and whether it is a
+ * preview. Anything that is not a version mise could install is dropped.
+ */
+export function parseReleases(text) {
+  let list;
+  try {
+    list = JSON.parse(String(text ?? ""));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const item of list) {
+    const version = typeof item?.version === "string" ? item.version.trim() : "";
+    if (!isVersionSpec(version)) continue;
+    const at = typeof item.created_at === "string" && !Number.isNaN(Date.parse(item.created_at)) ? new Date(item.created_at).toISOString() : null;
+    out.push({ version, releasedAt: at, prerelease: isPreview(item) });
+  }
+  return out.reverse();
+}
+
+const UNIT_MS = { s: 1e3, m: 6e4, h: 36e5, d: 864e5, w: 6048e5, y: 31536e6 };
+
+/**
+ * A mise duration setting ("24h", "1d", "90m", "0s") in milliseconds, or null
+ * for anything else - an absolute date, or nothing set.
+ */
+export function parseDuration(text) {
+  const match = /^(\d+(?:\.\d+)?)\s*([smhdwy])$/i.exec(String(text ?? "").trim());
+  return match ? Math.round(Number(match[1]) * UNIT_MS[match[2].toLowerCase()]) : null;
 }
 
 /** `mise tool <id> --json` -> where it comes from and how its downloads are verified. */

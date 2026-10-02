@@ -9,8 +9,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  canonicalTool, displayName, indexRegistry, isReservedTool, isVersionSpec, managedElsewhere,
-  parseRegistry, parseToolInfo, parseToolSpec, parseVersions,
+  canonicalTool, displayName, indexRegistry, isPreview, isReservedTool, isVersionSpec, managedElsewhere,
+  parseDuration, parseRegistry, parseReleases, parseToolInfo, parseToolSpec,
 } from "../docker/harness/packages.mjs";
 
 // The shape `mise registry --json --hide-aliased` prints (2026.9.10).
@@ -89,12 +89,35 @@ test("an alias becomes its registry name; specs and unknown names stay as typed"
   assert.equal(canonicalTool("rg", null), "rg");
 });
 
-test("ls-remote reads newest first; tool details read their backend and verification", () => {
-  assert.deepEqual(parseVersions("1.7\n1.7.1\n\n1.8.2\nmise WARN noise here\n"), ["1.8.2", "1.7.1", "1.7"]);
+test("ls-remote reads newest first, with dates and previews; tool details read their backend and verification", () => {
+  const releases = parseReleases(JSON.stringify([
+    { version: "1.7", created_at: "2023-09-07T00:00:00.0Z", release_url: "https://github.com/jqlang/jq/releases/tag/jq-1.7" },
+    { version: "1.8.0-rc.1" },
+    { version: "1.8.0-beta", prerelease: false },
+    { version: "--force" },
+    { nonsense: true },
+    { version: "1.8.2", created_at: "2026-06-20T14:11:27.0Z", prerelease: false },
+  ]));
+  assert.deepEqual(releases.map((r) => r.version), ["1.8.2", "1.8.0-beta", "1.8.0-rc.1", "1.7"], "newest first; nothing argv-shaped");
+  assert.equal(releases[0].releasedAt, "2026-06-20T14:11:27.000Z");
+  assert.equal(releases[2].releasedAt, null, "a backend that does not date its releases");
+  assert.deepEqual(releases.map((r) => r.prerelease), [false, true, true, false], "a preview by its flag or its name");
+  assert.equal(isPreview({ version: "2.0.0", prerelease: true }), true);
+  assert.equal(isPreview({ version: "2026.10.01-e373342" }), false, "a build suffix is not a preview");
+  assert.deepEqual(parseReleases("1.7\n1.8"), [], "plain text is not the JSON listing");
   const info = parseToolInfo(JSON.stringify({
     backend: "aqua:BurntSushi/ripgrep", description: "rg", installed_versions: ["15.0.0"],
     security: [{ type: "checksum", algorithm: "sha256" }, { type: "github_attestations" }, { type: "checksum", algorithm: "sha512" }],
   }));
   assert.deepEqual(info, { backend: "aqua:BurntSushi/ripgrep", description: "rg", security: ["checksum", "github_attestations"], installedVersions: ["15.0.0"] });
   assert.equal(parseToolInfo("nope"), null);
+});
+
+test("mise's release age reads as milliseconds, or nothing when it is not a duration", () => {
+  assert.equal(parseDuration("24h"), 86_400_000);
+  assert.equal(parseDuration(" 1d "), 86_400_000);
+  assert.equal(parseDuration("90m"), 5_400_000);
+  assert.equal(parseDuration("0s"), 0);
+  assert.equal(parseDuration("1.5h"), 5_400_000);
+  for (const value of ["", null, "2024-06-01", "soon", "24 hours", "-1h"]) assert.equal(parseDuration(value), null, String(value));
 });

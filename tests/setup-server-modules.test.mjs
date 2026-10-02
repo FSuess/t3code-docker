@@ -133,11 +133,24 @@ const latestWorld = ({ answers = {}, saved = null } = {}) => {
 
 test("a pass looks every tool up once and remembers the answers", async () => {
   const world = latestWorld({ answers: { "harness:claude": "2.1.290", "toolchain:go": "1.27.1" } });
-  assert.deepEqual(world.cache.get("harness:claude"), { latestVersion: null, latestCheckedAt: null });
+  assert.deepEqual(world.cache.get("harness:claude"), { latestVersion: null, latestCheckedAt: null, newestVersion: null, newestReleasedAt: null });
   assert.equal(await world.cache.refresh(), true);
-  assert.deepEqual(world.cache.get("harness:claude"), { latestVersion: "2.1.290", latestCheckedAt: 1_000_000 });
+  assert.deepEqual(world.cache.get("harness:claude"), { latestVersion: "2.1.290", latestCheckedAt: 1_000_000, newestVersion: null, newestReleasedAt: null });
   assert.deepEqual(world.lookups, ["harness:claude", "toolchain:go"]);
   assert.deepEqual(JSON.parse(world.written).versions["toolchain:go"], { version: "1.27.1", at: 1_000_000 });
+});
+
+test("a release mise is still holding back is kept beside the one it offers", async () => {
+  const world = latestWorld({ answers: {
+    "harness:claude": { version: "2.1.287", newest: "2.1.288", newestAt: "2026-10-02T20:19:57.000Z" },
+    "harness:codex": { version: "0.160.0", newest: null, newestAt: null },
+  } });
+  await world.cache.refresh();
+  assert.deepEqual(world.cache.get("harness:claude"), {
+    latestVersion: "2.1.287", latestCheckedAt: 1_000_000, newestVersion: "2.1.288", newestReleasedAt: "2026-10-02T20:19:57.000Z",
+  });
+  assert.equal(world.cache.get("harness:codex").newestVersion, null);
+  assert.deepEqual(JSON.parse(world.written).versions["harness:codex"], { version: "0.160.0", at: 1_000_000 }, "nothing held back, nothing stored");
 });
 
 test("a fresh pass is not repeated, unless someone asks", async () => {
