@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Manage the five supported agent harnesses through the shared manager.
 #
 # The setup console's Agents card and this CLI are thin surfaces over one
@@ -24,6 +24,12 @@
 # 2 usage (bad args, unknown harness); 4 the manager module could not load.
 set -euo pipefail
 
+# Root runs nothing through the PATH it was handed: under `docker exec` that is
+# the container's own, which a container recreated from an older image may have
+# carried over (see the entrypoint). The step-down gives it back to t3.
+inherited_path="$PATH"
+[ "$EUID" -ne 0 ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 : "${T3_INFRA_NODE:=/usr/local/bin/node}"
 : "${T3_HARNESS_MODULE:=/opt/t3-harness/index.mjs}"
 : "${T3_PROVIDER_MODULE:=/opt/t3-provider/index.mjs}"
@@ -31,8 +37,8 @@ set -euo pipefail
 # `docker exec` lands as root (the image sets no USER so the entrypoint can
 # remap uids). Step down so installs land in the user's persistent home and
 # nothing here leaves root-owned files in the state directory.
-if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
-  exec gosu t3 "$0" "$@"
+if [ "$EUID" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec env PATH="$inherited_path" "$(command -v gosu)" t3 "$0" "$@"
 fi
 
 # Managed harnesses live in the persistent user tool environment. Source it so

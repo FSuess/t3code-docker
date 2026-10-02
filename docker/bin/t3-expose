@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Publish a port from inside this container to a public https URL.
 #
 # A dev server started here listens on a port nothing outside the container can
@@ -15,8 +15,14 @@
 # you do here shows up there, and whatever you do there shows up here.
 set -euo pipefail
 
-if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
-  exec gosu t3 "$0" "$@"
+# Root runs nothing through the PATH it was handed: under `docker exec` that is
+# the container's own, which a container recreated from an older image may have
+# carried over (see the entrypoint). The step-down gives it back to t3.
+inherited_path="$PATH"
+[ "$EUID" -ne 0 ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ "$EUID" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec env PATH="$inherited_path" "$(command -v gosu)" t3 "$0" "$@"
 fi
 
 SETUP_PORT="${T3_SETUP_PORT:-3774}"

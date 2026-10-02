@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Mint a pairing link for this container that points at a reachable address.
 #
 # T3 Code's own startup banner builds its pairing URL from the first
@@ -8,14 +8,20 @@
 # URL you actually serve on.
 set -euo pipefail
 
+# Root runs nothing through the PATH it was handed: under `docker exec` that is
+# the container's own, which a container recreated from an older image may have
+# carried over (see the entrypoint). The step-down gives it back to t3.
+inherited_path="$PATH"
+[ "$EUID" -ne 0 ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 # T3 runs through the immutable image infrastructure, never a PATH resolution.
 : "${T3_INFRA_LAUNCHER:=/usr/local/bin/t3-admin}"
 
 # `docker exec` lands as root (the image sets no USER so the entrypoint can
 # remap uids). Step down so nothing here leaves root-owned files in the
 # state directory.
-if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
-  exec gosu t3 "$0" "$@"
+if [ "$EUID" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec env PATH="$inherited_path" "$(command -v gosu)" t3 "$0" "$@"
 fi
 
 base_url="${T3_PUBLIC_URL:-}"

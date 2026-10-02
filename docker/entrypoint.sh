@@ -1,8 +1,18 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Container entrypoint: normalise ownership, drop privileges, start T3 Code.
 set -euo pipefail
 
 log() { printf '[t3code] %s\n' "$*" >&2; }
+
+# The root half below resolves commands only through the image's own system
+# directories. The PATH it inherits is the container's, and a container
+# recreated from an older image can carry that image's PATH, which listed
+# directories the t3 user can write ahead of the system ones. The inherited PATH
+# is handed back to the unprivileged half.
+inherited_path="$PATH"
+if [ "$EUID" -eq 0 ]; then
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+fi
 
 T3_USER=t3
 T3_HOME=/home/t3
@@ -158,7 +168,8 @@ if [ "$(id -u)" -eq 0 ]; then
     rm -f /etc/sudoers.d/t3code
   fi
 
-  exec gosu "$T3_USER" "$0" "$@"
+  # gosu by absolute path: env resolves its command with the PATH it sets.
+  exec env PATH="$inherited_path" "$(command -v gosu)" "$T3_USER" "$0" "$@"
 fi
 
 # --- unprivileged half -------------------------------------------------------

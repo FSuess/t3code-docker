@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Wire a headless browser into the agent harnesses over MCP.
 #
 # T3 Code has its own preview_* browser tools, but the server only brokers
@@ -10,11 +10,17 @@
 # launches), so install the agents first - the first start does by default.
 set -euo pipefail
 
+# Root runs nothing through the PATH it was handed: under `docker exec` that is
+# the container's own, which a container recreated from an older image may have
+# carried over (see the entrypoint). The step-down gives it back to t3.
+inherited_path="$PATH"
+[ "$EUID" -ne 0 ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 # `docker exec` lands as root (the image sets no USER so the entrypoint can
 # remap uids). Step down so nothing here leaves root-owned files in the
 # state directory.
-if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
-  exec gosu t3 "$0" "$@"
+if [ "$EUID" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec env PATH="$inherited_path" "$(command -v gosu)" t3 "$0" "$@"
 fi
 
 # Managed harnesses live in the persistent user tool environment, and the MCP

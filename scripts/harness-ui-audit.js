@@ -116,8 +116,11 @@ check("CLI documents its exit codes",
   has(CLI, "Exit codes"),
   "document 0 ok / 1 failed / 2 usage / 4 no module");
 check("CLI drops privileges and sources the user environment",
-  has(CLI, "gosu t3") && has(CLI, "t3-user-env.sh"),
+  has(CLI, '"$(command -v gosu)" t3') && has(CLI, "t3-user-env.sh"),
   "docker exec as root must step down to t3 with MISE_* set");
+check("CLI resolves nothing through the PATH root was handed",
+  has(CLI, "#!/bin/bash") && has(CLI, '[ "$EUID" -ne 0 ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'),
+  "bash by absolute path, and the system PATH for the root step");
 
 // -- 5. live schema (optional) --------------------------------------------------
 const [baseUrl, setupKey] = process.argv.slice(2);

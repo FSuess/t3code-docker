@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # The agent CLIs by name, for `docker exec` and anything else that does not
 # have the t3 user's shell environment.
 #
@@ -13,6 +13,12 @@
 # directory from the server's PATH, and login shells never add it.
 set -euo pipefail
 
+# Root runs nothing through the PATH it was handed: under `docker exec` that is
+# the container's own, which a container recreated from an older image may have
+# carried over (see the entrypoint). The step-down gives it back to t3.
+inherited_path="$PATH"
+[ "$EUID" -ne 0 ] || PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 name="$(basename "$0")"
 case "$name" in
   claude|codex|opencode|grok) harness="$name" ;;
@@ -20,8 +26,8 @@ case "$name" in
   *) echo "t3-agent: run this as claude, codex, opencode, grok or cursor-agent" >&2; exit 2 ;;
 esac
 
-if [ "$(id -u)" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
-  exec gosu t3 "$0" "$@"
+if [ "$EUID" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1; then
+  exec env PATH="$inherited_path" "$(command -v gosu)" t3 "$0" "$@"
 fi
 
 : "${T3_INFRA_NODE:=/usr/local/bin/node}"

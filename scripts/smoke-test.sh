@@ -944,9 +944,15 @@ rm -f "$SETUP_JAR"
 
 printf '\nStartup pairing link\n'
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
+# With the PATH every image up to v0.4 declared, which a container recreated by a
+# tool that copies the old container's environment keeps: the entrypoint and the
+# helpers run their root step from the system directories only, whatever PATH
+# the container hands them.
+LEGACY_PATH=/usr/local/bun/bin:/usr/local/deno/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/t3/go/bin:/opt/cursor/.local/bin:/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 docker run -d --name "${NAME}-boot" -e T3_PREINSTALL=none \
   -e "T3_PUBLIC_URL=${PUBLIC_URL}" \
   -e T3_PRINT_PAIRING_ON_START=1 \
+  -e "PATH=${LEGACY_PATH}" \
   "$IMAGE" >/dev/null
 boot_ok=0
 for _ in $(seq 1 40); do
@@ -963,6 +969,8 @@ else
   no "T3_PRINT_PAIRING_ON_START logs a usable pairing link"
   docker logs "${NAME}-boot" 2>&1 | tail -15
 fi
+check "a helper run as root under that PATH steps down and works" \
+  "docker exec ${NAME}-boot t3-harness list 2>/dev/null | grep -q '^claude'"
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
 
 printf '\n%d passed, %d failed\n\n' "$pass" "$fail"

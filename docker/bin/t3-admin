@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Run T3 Code through the image's own immutable infrastructure.
 #
 # T3 must always execute the root-owned platform binary under $T3_INFRA_PREFIX
