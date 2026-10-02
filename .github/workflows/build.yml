@@ -28,6 +28,9 @@ jobs:
             shellcheck -S warning "$f"
           done
           bash tests/image-profile.test.sh
+          for f in docker/setup/app.js docker/setup/client/*.js docker/setup/design/ui.js; do
+            node --check "$f"
+          done
           node --test tests/*.test.mjs
           node scripts/harness-ui-audit.js
           scripts/generate-mise-idiomatic.sh --check

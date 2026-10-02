@@ -11,6 +11,10 @@
  *
  *   node scripts/ui-audit.js [url] [key]
  *
+ * Every route is measured at every viewport, and so are the overlays a person
+ * opens most: a row's menu (a bottom sheet on a phone), the uninstall dialog,
+ * the command palette and the pairing ceremony.
+ *
  * Exits non-zero when it finds something.
  */
 // Runs from a checkout with playwright installed, or inside the browser image,
@@ -99,7 +103,7 @@ const audit = () => {
   }
 
   // -- 3. glyphs that are not optically centred in a fixed box --------------
-  for (const el of document.querySelectorAll(".tc-step-mark, .tc-tile, .tc-iconbtn")) {
+  for (const el of document.querySelectorAll(".tc-step-mark, .tc-check-mark, .tc-tile:not(.tc-tile--icon)")) {
     if (!visible(el)) continue;
     const node = [...el.childNodes].find((n) => n.nodeType === 3 && n.textContent.trim());
     if (!node) continue;
@@ -120,8 +124,9 @@ const audit = () => {
   // -- 4. siblings that should match but do not ----------------------------
   const groups = [
     [".tc-step-mark", "step marks"],
-    [".tc-tile", "agent tiles"],
-    [".tc-iconbtn", "icon buttons"],
+    [".tc-check-mark", "checklist marks"],
+    [".tc-tile:not(.tc-tile--port)", "tiles"],
+    [".tc-btn--icon", "icon buttons"],
   ];
   for (const [sel, label] of groups) {
     // Compare only within a shared parent: a 22px copy affordance in the status
@@ -154,7 +159,7 @@ const audit = () => {
   // -- 4b. same-class siblings in one list with different padding ----------
   // "The padding around X is off" is usually one element in a list disagreeing
   // with its neighbours rather than the whole scale being wrong.
-  for (const list of document.querySelectorAll(".tc-list, .tc-deck-col, .tc-details")) {
+  for (const list of document.querySelectorAll(".tc-list, .tc-checklist, .tc-readouts, .tc-sheet-actions")) {
     const kids = [...list.children].filter(visible);
     if (kids.length < 2) continue;
     const pad = (e) => {
@@ -178,7 +183,7 @@ const audit = () => {
   }
 
   // -- 5. buttons in one action group with different heights ---------------
-  for (const group of document.querySelectorAll(".tc-row-actions, .tc-dialog-foot")) {
+  for (const group of document.querySelectorAll(".tc-row-actions, .tc-dialog-foot, .tc-sheet-foot, .tc-topbar-actions")) {
     const btns = [...group.querySelectorAll(".tc-btn")].filter(visible);
     if (btns.length < 2) continue;
     const hs = new Set(btns.map((b) => Math.round(box(b).height * 100) / 100));
@@ -190,7 +195,15 @@ const audit = () => {
     // per visual line: buttons that share a line must share a top, and a
     // button on the next line is the intended layout rather than a defect.
     // Every other group must still stay on one line.
-    if (group.classList.contains("tc-row-actions--wrap")) {
+    // A group laid out as a column stacks its buttons on purpose (a dialog's
+    // foot on a phone): they must line up down the left and share a width.
+    if (/^column/.test(getComputedStyle(group).flexDirection)) {
+      const lefts = new Set(btns.map((b) => Math.round(box(b).left)));
+      const widths = new Set(btns.map((b) => Math.round(box(b).width)));
+      if (lefts.size > 1 || widths.size > 1) {
+        add("uneven-stack", `lefts ${[...lefts].join(", ")} / widths ${[...widths].join(", ")}`, group);
+      }
+    } else if (group.classList.contains("tc-row-actions--wrap")) {
       const lines = [];
       for (const b of btns) {
         const top = box(b).top;
@@ -208,10 +221,10 @@ const audit = () => {
     }
   }
 
-  // -- 6. a row's text baseline vs its chip ---------------------------------
-  for (const line of document.querySelectorAll(".tc-row-nameline")) {
+  // -- 6. a row's text baseline vs its badge ---------------------------------
+  for (const line of document.querySelectorAll(".tc-row-title")) {
     const name = line.querySelector(".tc-row-name");
-    const chip = line.querySelector(".tc-chip");
+    const chip = line.querySelector(".tc-badge");
     if (!name || !chip || !visible(name) || !visible(chip)) continue;
     const a = box(name), c = box(chip);
     // A nameline that wrapped puts the chip on its own line on purpose; only
@@ -219,7 +232,22 @@ const audit = () => {
     if (Math.abs(c.top - a.top) > a.height) continue;
     const dy = (c.top + c.height / 2) - (a.top + a.height / 2);
     if (Math.abs(dy) > 1.5) {
-      add("chip-misaligned", `chip centre is ${dy.toFixed(2)}px off the name centre`, line);
+      add("chip-misaligned", `badge centre is ${dy.toFixed(2)}px off the name centre`, line);
+    }
+  }
+
+  // -- 7. nothing wider than the screen -------------------------------------
+  // A page that scrolls sideways on a phone is broken whatever else is right.
+  if (document.documentElement.scrollWidth > window.innerWidth + 1) {
+    add("horizontal-scroll", `page is ${document.documentElement.scrollWidth}px wide in a ${window.innerWidth}px viewport`, document.body);
+  }
+
+  // -- 8. overlays inside the viewport ---------------------------------------
+  for (const panel of document.querySelectorAll(".tc-layer > :not(.tc-backdrop)")) {
+    if (!visible(panel)) continue;
+    const r = box(panel);
+    if (r.left < -0.5 || r.top < -0.5 || r.right > window.innerWidth + 0.5 || r.bottom > window.innerHeight + 0.5) {
+      add("overlay-offscreen", `${Math.round(r.left)},${Math.round(r.top)} ${Math.round(r.width)}x${Math.round(r.height)} in ${window.innerWidth}x${window.innerHeight}`, panel);
     }
   }
 
@@ -232,6 +260,45 @@ const audit = () => {
     args: ["--no-sandbox"],   // there is no user namespace inside the image
   });
   let total = 0;
+
+  // What to measure at each size: every route, then the overlays.
+  const ROUTES = ["overview", "devices", "agents", "toolchains", "ports", "environment", "more"];
+  const settle = async (page) => {
+    // Text metrics decide the boxes this audit compares, so wait for fonts,
+    // then let the browser render two frames of the settled layout.
+    await page.evaluate(() => document.fonts.ready);
+    await page.evaluate(() => new Promise((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(resolve));
+    }));
+    await page.waitForTimeout(300);
+  };
+  const STATES = [
+    ...ROUTES.map((route) => [route, async (page) => {
+      await page.evaluate((r) => { location.hash = r; }, route);
+      await page.waitForSelector(`#page-${route}:not([hidden]) .tc-section, #page-${route}:not([hidden]) .tc-group`, { timeout: 60000 });
+    }]),
+    ["row menu", async (page) => {
+      await page.evaluate(() => { location.hash = "agents"; });
+      await page.click("#page-agents [data-cmd='row.menu'] >> nth=0");
+      await page.waitForSelector(".tc-layer .tc-menu, .tc-layer .tc-sheet");
+    }],
+    ["uninstall dialog", async (page) => {
+      await page.click(".tc-layer .tc-menu-item--danger");
+      await page.waitForSelector(".tc-layer .tc-dialog");
+    }],
+    ["palette", async (page) => {
+      await page.keyboard.press("Escape");
+      await page.keyboard.press("Control+k");
+      await page.waitForSelector(".tc-layer .tc-palette");
+      await page.keyboard.type("pub");
+    }],
+    ["pairing", async (page) => {
+      await page.keyboard.press("Escape");
+      await page.evaluate(() => { location.hash = "devices"; });
+      await page.click("#page-devices [data-cmd='pair.start']");
+      await page.waitForSelector("#page-devices .tc-steps, #page-devices .tc-hint--err", { timeout: 30000 });
+    }],
+  ];
 
   for (const [width, height] of VIEWPORTS) {
     // Measure a settled page: reduced motion disables the transitions and
@@ -247,34 +314,33 @@ const audit = () => {
     await page.goto(URL, { waitUntil: "domcontentloaded" });
     await page.fill("input[type=password]", KEY);
     await page.click("button[type=submit]");
-    await page.waitForSelector("#agents .tc-row-name", { timeout: 60000 });
-    // A container with nothing listening renders the empty state, not a row;
-    // either means the card has finished its first paint.
-    await page.waitForSelector("#ports .tc-row, #ports .tc-empty", { timeout: 60000 });
-    // The pairing panel is where the tracker lives, so open it.
-    await page.click("#mint");
-    await page.waitForSelector("#out .tc-steps", { timeout: 30000 });
-    // Text metrics decide the boxes this audit compares, so wait for fonts
-    // before measuring, then let the browser render two frames of the settled
-    // layout.
-    await page.evaluate(() => document.fonts.ready);
-    await page.evaluate(() => new Promise((resolve) => {
-      requestAnimationFrame(() => requestAnimationFrame(resolve));
-    }));
-    await page.waitForTimeout(400);
+    await page.waitForSelector("#page-overview .tc-check, #page-overview .tc-ready-line", { timeout: 60000 });
 
-    const findings = await page.evaluate(audit);
     const label = `${width}x${height}`;
-    if (!findings.length) {
-      console.log(`  ${label.padEnd(10)} clean`);
-    } else {
-      console.log(`  ${label.padEnd(10)} ${findings.length} finding(s)`);
+    let found = 0;
+    for (const [state, reach] of STATES) {
+      await reach(page);
+      await settle(page);
+      const findings = await page.evaluate(audit);
+      if (!findings.length) continue;
+      found += findings.length;
+      console.log(`  ${label.padEnd(10)} ${state}: ${findings.length} finding(s)`);
       for (const f of findings) {
         console.log(`      ${f.kind}: ${f.detail}`);
         if (f.where) console.log(`        at ${f.where}`);
       }
-      total += findings.length;
     }
+    if (!found) console.log(`  ${label.padEnd(10)} clean (${STATES.length} states)`);
+    total += found;
+    // The link this made is not for anyone; leave no unused link behind.
+    await page.evaluate(async () => {
+      const button = document.querySelector("#page-devices .tc-card-foot [data-cmd='link.revoke']");
+      if (!button) return;
+      await fetch((window.__T3_SETUP_BASE__ || "") + "/revoke", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ kind: "pairing", id: button.dataset.id }),
+      });
+    });
     await ctx.close();
   }
 

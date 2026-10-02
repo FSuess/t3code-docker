@@ -343,13 +343,17 @@ start_setup_service() {
   [ "$T3_SETUP_ENABLED" = "1" ] || return 0
   [ -f /opt/t3-setup/server.mjs ] || return 0
 
+  # The console says whether its key survives a recreate, so it needs to know
+  # which kind it has.
+  T3_SETUP_KEY_GENERATED=0
   if [ -z "${T3_SETUP_KEY:-}" ]; then
     T3_SETUP_KEY="$("$T3_INFRA_NODE" -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')"
+    T3_SETUP_KEY_GENERATED=1
     log "T3_SETUP_KEY was not set; generated one for this container:"
     log "    ${T3_SETUP_KEY}"
     log "    Set T3_SETUP_KEY yourself to keep it stable across recreates."
   fi
-  export T3_SETUP_KEY
+  export T3_SETUP_KEY T3_SETUP_KEY_GENERATED
   # `docker exec` and the terminals T3 Code opens inherit the image environment,
   # not this shell's exports, so a generated key would be invisible to t3-expose
   # and friends. Drop it where they can read it - same directory, same owner,

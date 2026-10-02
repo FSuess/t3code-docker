@@ -62,7 +62,7 @@ retry() { local n=$1; shift; local i; for i in $(seq 1 "$n"); do
 
 STATE_MOUNT=""
 PAGE_HTML=""
-CLIENT_JS_COPY=""
+SETUP_COPY=""
 # The layout audit runs with its output discarded, so record it here and print
 # it with the failure summary.
 UI_AUDIT_LOG="${UI_AUDIT_LOG:-}"
@@ -72,7 +72,8 @@ if [ -z "$UI_AUDIT_LOG" ]; then
 fi
 cleanup() {
   docker rm -f "$NAME" "${NAME}-mount" "${NAME}-boot" "${NAME}-anon" "${NAME}-env" >/dev/null 2>&1 || true
-  rm -f "$PAGE_HTML" "$CLIENT_JS_COPY" 2>/dev/null || true
+  rm -f "$PAGE_HTML" 2>/dev/null || true
+  [ -n "$SETUP_COPY" ] && rm -rf "$SETUP_COPY" 2>/dev/null || true
   [ "${UI_AUDIT_LOG_CREATED:-0}" = 1 ] && rm -f "$UI_AUDIT_LOG" 2>/dev/null || true
   if [ -n "$STATE_MOUNT" ]; then
     sudo rm -rf "$STATE_MOUNT" 2>/dev/null || rm -rf "$STATE_MOUNT" 2>/dev/null || true
@@ -353,6 +354,54 @@ case "$setup_pair" in
 esac
 check "the minted link is live on the running server" \
   "docker exec -u t3 $NAME t3 auth pairing list --json 2>/dev/null | grep -q orchestration:operate"
+
+# A wrong key comes back to the form saying so, without JavaScript too: the
+# redirect carries the failure for the unlock page to show.
+wrong_key_is_reported() {
+  docker exec "$NAME" curl -sS -o /dev/null -w '%{redirect_url}' \
+    -d 'key=not-the-key' http://127.0.0.1:3774/login | grep -q '?error=1'
+}
+check "a wrong key is reported on the unlock page" wrong_key_is_reported
+
+# The page runs only the scripts it was served with: every response carries a
+# Content-Security-Policy with a fresh nonce, and nothing may load from elsewhere.
+page_has_policy() {
+  local headers
+  headers="$(docker exec "$NAME" curl -sS -o /dev/null -D - -b /tmp/jar http://127.0.0.1:3774/)" || return 1
+  case "$headers" in
+    *"content-security-policy: default-src 'none'; script-src 'nonce-"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+check "the console is served under a nonce-based CSP" page_has_policy
+
+# What the redesigned console reads beyond the original fields. Each may be
+# null (an update not checked yet, a size not measured yet) but never absent.
+status_has_console_fields() {
+  docker exec "$NAME" sh -c \
+    "curl -sS --max-time 25 -b /tmp/jar http://127.0.0.1:3774/status" | python3 -c "
+import json, sys
+s = json.load(sys.stdin)
+assert isinstance(s.get('events'), list), 'events'
+assert s.get('platform', '').startswith('linux/'), 'platform'
+assert s.get('setupKeySource') in ('env', 'generated'), 'setupKeySource'
+assert 'uptimeSeconds' in s['server'], 'uptimeSeconds'
+assert all('latestVersion' in h for h in s['harnesses']), 'harness latestVersion'
+assert all('latestVersion' in t for t in s['toolchains']), 'toolchain latestVersion'
+assert 'volumeKind' in s['paths'] and 'volumeBytes' in s['paths'], 'storage facts'
+"
+}
+check "status carries what the console reads" status_has_console_fields
+
+# Lock console: the session ends here and the key is needed again.
+lock_signs_out() {
+  docker exec "$NAME" sh -c \
+    "curl -sS -c /tmp/lockjar -d 'key=$SETUP_KEY' -o /dev/null http://127.0.0.1:3774/login && \
+     curl -fsS -b /tmp/lockjar -o /dev/null http://127.0.0.1:3774/status && \
+     curl -sS -b /tmp/lockjar -c /tmp/lockjar -X POST -o /dev/null http://127.0.0.1:3774/logout && \
+     [ \"\$(curl -sS -b /tmp/lockjar -o /dev/null -w '%{http_code}' http://127.0.0.1:3774/status)\" = 401 ]"
+}
+check "Lock console signs the browser out" lock_signs_out
 
 # The setup console is the front door for a fresh install, but T3 Code's own
 # UI does not link to it - the pill injected into the client shell is the only
@@ -709,18 +758,21 @@ check "install from the page answers at once and finishes in the background" ins
 # the result, so parsing it proves nothing; assert instead that what the
 # browser receives is byte-for-byte the file on disk.
 client_script_is_verbatim() {
-  PAGE_HTML="$(mktemp)"; CLIENT_JS_COPY="$(mktemp)"
+  PAGE_HTML="$(mktemp)"; SETUP_COPY="$(mktemp -d)"
   docker exec "$NAME" sh -c \
     "curl -sS -c /tmp/j3 -d 'key=$SETUP_KEY' -o /dev/null http://127.0.0.1:3774/login && \
      curl -sS -b /tmp/j3 http://127.0.0.1:3774/" > "$PAGE_HTML" || return 1
-  docker exec "$NAME" cat /opt/t3-setup/app.js > "$CLIENT_JS_COPY" || return 1
-  python3 - "$PAGE_HTML" "$CLIENT_JS_COPY" <<'PYEOF'
-import re, sys
+  docker cp "$NAME:/opt/t3-setup/." "$SETUP_COPY" >/dev/null 2>&1 || return 1
+  # Every inlined script names its file; each must arrive byte for byte.
+  python3 - "$PAGE_HTML" "$SETUP_COPY" <<'PYEOF'
+import os, re, sys
 page = open(sys.argv[1], encoding="utf-8").read()
-blocks = re.findall(r"<script>(.*?)</script>", page, re.S)
-if not blocks:
+blocks = re.findall(r'<script nonce="[^"]*" data-src="([^"]+)">(.*?)</script>', page, re.S)
+if [src for src, _ in blocks] != ["client/base.js", "design/ui.js", "client/model.js", "client/kit.js", "app.js"]:
     sys.exit(1)
-sys.exit(0 if blocks[-1].strip() == open(sys.argv[2], encoding="utf-8").read().strip() else 1)
+for src, code in blocks:
+    if code != open(os.path.join(sys.argv[2], src), encoding="utf-8").read():
+        sys.exit(1)
 PYEOF
 }
 printf '\nPorts\n'
@@ -752,7 +804,9 @@ fi
 # device this project assumes you have. These assert the plumbing that fixes
 # that; they deliberately do not open a tunnel, since CI should not depend on
 # reaching Cloudflare's edge.
-docker exec -d "$NAME" sh -c \
+# As t3, like a dev server started from a T3 Code terminal: the setup service
+# runs as t3 too, and can name only processes it is allowed to see.
+docker exec -d -u t3 "$NAME" sh -c \
   'cd /tmp && python3 -m http.server 3000 --bind 127.0.0.1 >/dev/null 2>&1' || true
 sleep 2
 
@@ -770,10 +824,14 @@ expose_api() {
     -d "{\"port\":$1}" "http://127.0.0.1:3774/ports/expose"
 }
 port_3000_listed() { ports_api | tr -d " " | grep -q "\"listening\":\[3000"; }
+# The page names what listens: the command line says http.server where ss
+# would only say python3.
+port_3000_named() { ports_api | tr -d " " | grep -q '"port":3000,"process":"http.server"'; }
 reserved_port_refused() { expose_api 3774 | grep -q "T3 Code itself"; }
 bad_port_refused() { expose_api 99999 | grep -q "between 1 and 65535"; }
 
 check "a listening port is discovered" port_3000_listed
+check "and named for what it runs" port_3000_named
 
 # T3 Code's own agent probes open short-lived listeners on kernel-assigned
 # ports. Listing them made the panel churn every few seconds and buried the dev
@@ -820,8 +878,8 @@ console_layout_is_clean() {
 check "the console has no layout defects" console_layout_is_clean
 
 check "the browser gets the client script verbatim" client_script_is_verbatim
-check "and that script parses" \
-  "docker exec $NAME node --check /opt/t3-setup/app.js"
+check "and those scripts parse" \
+  "docker exec $NAME sh -c 'for f in /opt/t3-setup/app.js /opt/t3-setup/client/*.js /opt/t3-setup/design/ui.js; do node --check \"\$f\" || exit 1; done'"
 
 # A proxy routing a path prefix here forwards it intact. Serving the page only
 # at / turned that into a bare "unauthorized", which reads as a wrong password.
@@ -851,7 +909,7 @@ check "honours X-Forwarded-Prefix when the proxy strips the path" \
 # The client's own fallback for proxies that strip and say nothing: the page
 # knows where it was loaded from even when the server does not.
 check "the page falls back to its own path when no mount is known" \
-  "docker exec $NAME grep -q 'pageBase()' /opt/t3-setup/app.js"
+  "docker exec $NAME grep -q 'pageBase()' /opt/t3-setup/client/base.js"
 
 # This is the assertion that should have caught the mount going missing: the
 # old one only proved a page came back under a prefix, not that the page was

@@ -20,6 +20,9 @@ import { fileURLToPath } from "node:url";
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SERVER = path.join(ROOT, "docker/setup/server.mjs");
 const APP = path.join(ROOT, "docker/setup/app.js");
+// What each row says and offers is decided in the view model; app.js renders it.
+const MODEL = path.join(ROOT, "docker/setup/client/model.js");
+const KIT = path.join(ROOT, "docker/setup/client/kit.js");
 const CSS = path.join(ROOT, "docker/setup/console.css");
 const CLI = path.join(ROOT, "docker/bin/t3-harness");
 
@@ -45,7 +48,7 @@ check("server exposes install/update/uninstall mutations",
   has(SERVER, "/harnesses/install") && has(SERVER, "/harnesses/update") && has(SERVER, "/harnesses/uninstall"),
   "lifecycle POST routes are missing");
 check("mutations are backed only by the shared manager",
-  has(SERVER, "loadHarness()") && has(SERVER, "manager.toolchains") && has(SERVER, "ops[kind](id, options)"),
+  has(SERVER, "loadHarness()") && has(SERVER, "manager.toolchains") && has(SERVER, "ops[job.kind](job.id, options)"),
   "lifecycle must call the shared manager, not a second installer");
 check("status is read-only and mutations sync providers",
   has(SERVER, "syncManagedProviders") && has(SERVER, "harnessLifecycleStatus"),
@@ -63,19 +66,21 @@ check("prefixed routes include the lifecycle surface",
   has(SERVER, '"/harnesses/install"') && has(SERVER, "ROUTES"),
   "ROUTES must list /harnesses/* for prefix inference");
 
-// -- 2. Agents card states ----------------------------------------------------
-check("card distinguishes progress, failure and runnable state",
-  has(APP, "agentChip") && has(APP, "agentMeta") && has(APP, "h.runnable"),
-  "renderAgents must branch on inProgress/failed/runnable");
-check("card shows the exact version",
-  has(APP, "installedVersion") || has(APP, "h.version"),
-  "the card must render the recorded exact version");
-check("card offers explicit versions and lifecycle actions",
-  has(APP, "h-install") && has(APP, "h-update") && has(APP, "h-uninstall") && has(APP, "hv-version"),
-  "Install/Update/Uninstall plus a version field are required");
+// -- 2. Agents rows -------------------------------------------------------------
+check("rows distinguish progress, failure and runnable state",
+  has(MODEL, "agentRow") && has(MODEL, "h.runnable") && has(MODEL, "h.inProgress") && has(MODEL, "h.failed"),
+  "the view model must branch on inProgress/failed/runnable");
+check("rows show the exact version",
+  has(MODEL, "installedVersion"),
+  "the row must render the recorded exact version");
+check("rows offer explicit versions and every lifecycle action",
+  has(MODEL, "'harness.install'") && has(MODEL, "'harness.update'") && has(MODEL, "'harness.uninstall'")
+    && has(MODEL, "'harness.version'") && has(APP, "hv-version"),
+  "Install/Update/Uninstall plus an exact-version dialog are required");
 check("polling preserves version drafts and in-flight work",
-  has(APP, "versionDrafts") && has(APP, "lifecycleBusy") && has(APP, "pendingOps"),
-  "the poll must not erase version input or busy rows");
+  has(APP, "versionDrafts") && has(APP, "lifecycleBusy") && has(APP, "pendingOps")
+    && has(KIT, "morphChildren"),
+  "the poll must not erase version input or busy rows (app.js state, kit.js morphing patch)");
 check("lifecycle failures stay visible",
   has(APP, "notices.set(key"),
   "POST errors and background failures must render inline, not only as a toast");
@@ -83,11 +88,22 @@ check("lifecycle answers before the download finishes",
   has(SERVER, "Promise.race([started, done])") && has(SERVER, "operations: Object.fromEntries(")
     && has(APP, "res.status === 202"),
   "an install must not hold the request open for the length of a download");
+check("page operations queue instead of failing as busy, and can be cancelled",
+  has(SERVER, "cancelLifecycle") && has(SERVER, '"/harnesses/cancel"') && has(SERVER, "enqueue(job")
+    && has(MODEL, "op.cancel"),
+  "a second click must queue, and the row must offer Cancel for work this page started");
+check("operations report their phase",
+  has(SERVER, "onProgress") && has(MODEL, "progressOf"),
+  "the row's progress line needs the manager's phases");
 
 // -- 3. styles for the lifecycle controls -------------------------------------
 check("lifecycle controls wrap without squeezing the row",
   has(CSS, ".tc-row-actions--wrap") && has(CSS, ".tc-input--sm"),
   "console.css must carry the wrap and small-input rules");
+check("the console is built from the vendored design system",
+  existsSync(path.join(ROOT, "docker/setup/design/components.css")) && existsSync(path.join(ROOT, "docker/setup/design/tokens.css"))
+    && existsSync(path.join(ROOT, "docker/setup/design/ui.js")),
+  "docker/setup/design/ must hold tokens.css, components.css and ui.js");
 
 // -- 4. CLI contract -----------------------------------------------------------
 check("t3-harness lists the five lifecycle commands",

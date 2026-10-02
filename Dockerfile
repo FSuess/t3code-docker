@@ -364,6 +364,9 @@ RUN set -eux; \
     chmod -R go-w /opt/t3-mcp; \
     playwright-mcp --help >/dev/null; \
     chrome-devtools-mcp --version
+# The setup console's Environment page reports these as built.
+ENV T3_PLAYWRIGHT_MCP_VERSION=${PLAYWRIGHT_MCP_VERSION} \
+    T3_CHROME_DEVTOOLS_MCP_VERSION=${CHROME_DEVTOOLS_MCP_VERSION}
 
 # Stamped last so a version change reuses every layer above it. IMAGE_VERSION is
 # the release tag in CI and "dev" for a local build; the setup page shows both so

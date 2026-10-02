@@ -13,27 +13,26 @@ import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import { promisify } from "node:util";
+import { gzip as gzipCallback } from "node:zlib";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import {
   withTimeout,
   createProviderCache,
   createHarnessCache,
 } from "./cache.mjs";
+import { loadAssets, renderConsole, renderUnlock, contentSecurityPolicy } from "./page.mjs";
+import { parseListeners, processLabel, looksLikeDatabase } from "./ports.mjs";
+import { createStorageFacts } from "./storage.mjs";
+import { createLatestCache } from "./latest.mjs";
 
 const run = promisify(execFile);
+const gzip = promisify(gzipCallback);
 
-// Read verbatim rather than embedded in a template literal: see the note at the
-// top of app.js for what that cost twice.
-const CLIENT_JS = readFileSync(new URL("./app.js", import.meta.url), "utf8");
-const CONSOLE_CSS = readFileSync(new URL("./console.css", import.meta.url), "utf8");
-
-// Resolve the theme before first paint. Left to the client script, the page
-// flashes light for as long as it takes to parse, which on a phone over a
-// tunnel is long enough to see. Kept tiny and inline for that reason.
-const THEME_BOOT = `(function(){try{var m=localStorage.getItem("t3-console-theme")||"system";` +
-  `var d=m==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):m;` +
-  `document.documentElement.setAttribute("data-theme",d);` +
-  `document.documentElement.setAttribute("data-theme-mode",m);}catch(e){}})();`;
+// Every stylesheet and script the page inlines, read verbatim once: see the
+// note at the top of app.js for what embedding them in template literals cost.
+// A file that could not be inlined safely stops the service here, loudly,
+// rather than shipping a page whose script ends early.
+const ASSETS = loadAssets();
 
 const PORT = Number(process.env.T3_SETUP_PORT ?? 3774);
 const KEY = process.env.T3_SETUP_KEY ?? "";
@@ -43,6 +42,13 @@ const COOKIE = "t3setup";
 // Lets a single public hostname route a path prefix here instead of needing a
 // second subdomain: e.g. Cloudflare Tunnel sending /__setup* to this port.
 const BASE_PATH = (process.env.T3_SETUP_BASE_PATH ?? "").replace(/\/+$/, "");
+// Where T3 Code keeps its state; the volume a user mounts is the home around it.
+const STATE_DIR = process.env.T3CODE_HOME || `${process.env.HOME || "/home/t3"}/.t3`;
+const VOLUME = STATE_DIR.replace(/\/\.t3\/?$/, "") || STATE_DIR;
+const WORKSPACE = process.env.T3_WORKSPACE || "/workspace";
+// The entrypoint generates a key when T3_SETUP_KEY is empty and says so; a
+// generated key changes on every recreate, which the Environment page warns of.
+const SETUP_KEY_SOURCE = process.env.T3_SETUP_KEY_GENERATED === "1" ? "generated" : "env";
 
 if (!KEY) {
   console.error("[setup] T3_SETUP_KEY is empty; refusing to start");
@@ -237,7 +243,81 @@ const toPublicHarness = (facts) => ({
   canSignIn: Boolean(AGENTS[facts.id]?.signin),
   canSetKey: Boolean(AGENTS[facts.id]?.apiKey),
   keyKind: AGENTS[facts.id]?.apiKey?.kind ?? null,
+  authMethod: authMethodOf(facts),
 });
+
+// How an agent is signed in, where that can be told without asking it: a key
+// in the environment, or Codex's stored API key against its browser sign-in.
+// Null means "the agent's usual way", which the page already knows how to say.
+const authMethodOf = (facts) => {
+  if ((facts.credentials?.env ?? []).length) return "env";
+  if (facts.id !== "codex" || !facts.credentials?.present) return null;
+  try {
+    const home = process.env.CODEX_HOME || `${process.env.HOME}/.codex`;
+    const auth = JSON.parse(readFileSync(`${home}/auth.json`, "utf8"));
+    if (auth?.OPENAI_API_KEY) return "apikey";
+    if (auth?.tokens) return "oauth";
+  } catch { /* unreadable: say nothing */ }
+  return null;
+};
+
+// --- recent events ----------------------------------------------------------
+//
+// The last few things worth knowing since this service started, newest first,
+// for the Overview's Recent list. Everything here already passes through this
+// process - a device appearing in the session list, a tunnel opening, an
+// operation finishing - so nothing is polled for it. Memory only: a restart
+// starts the list again, which the page says ("since the setup service started").
+const EVENT_LIMIT = 20;
+const events = [];
+const recordEvent = (kind, text, detail = null) => {
+  events.unshift({ at: Date.now(), kind, text, ...(detail ? { detail } : {}) });
+  if (events.length > EVENT_LIMIT) events.length = EVENT_LIMIT;
+};
+
+// --- background facts --------------------------------------------------------
+//
+// Two things a row wants that are far too slow for a poll: the newest release
+// of each tool (a registry round trip each) and how much the volume holds (a
+// `du` over every toolchain). Both refresh in the background and are served
+// from memory; a poll never waits on either.
+const LATEST_CACHE = `${STATE_DIR}/setup/latest-versions.json`;
+const latestCache = createLatestCache({
+  keys: () => [
+    ...[...HARNESS_IDS].map((id) => `harness:${id}`),
+    ...[...TOOLCHAIN_IDS].map((id) => `toolchain:${id}`),
+  ],
+  lookup: async (key) => {
+    const [target, id] = key.split(":");
+    const manager = await loadHarness();
+    return target === "harness" ? manager.latest(id) : manager.toolchains.latest(id);
+  },
+  read: async () => {
+    const { readFile } = await import("node:fs/promises");
+    return readFile(LATEST_CACHE, "utf8");
+  },
+  write: async (text) => {
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    await mkdir(LATEST_CACHE.replace(/\/[^/]+$/, ""), { recursive: true });
+    await writeFile(LATEST_CACHE, text);
+  },
+});
+/** Each row with the newest release known for it (`latestVersion`, `latestCheckedAt`). */
+const withLatest = (target, rows) => rows.map((row) => ({ ...row, ...latestCache.get(`${target}:${row.id}`) }));
+
+const storage = createStorageFacts({ volume: VOLUME, workspace: WORKSPACE });
+
+// The browser image's agent browser, as built: the versions are build args the
+// Dockerfile bakes into the environment. Absent on the core image.
+const BROWSER = (() => {
+  const chromium = existsSync(process.env.CHROME_PATH || "/usr/bin/chromium");
+  if (!chromium && process.env.T3_IMAGE_VARIANT !== "browser") return null;
+  return {
+    chromium,
+    playwrightMcp: process.env.T3_PLAYWRIGHT_MCP_VERSION || null,
+    devtoolsMcp: process.env.T3_CHROME_DEVTOOLS_MCP_VERSION || null,
+  };
+})();
 
 // --- offline-safe status ------------------------------------------------------
 //
@@ -312,6 +392,7 @@ const lifecycleHttpStatus = (code) => {
     case "busy": return 409;
     case "unknown-harness":
     case "unknown-toolchain": return 404;
+    case "cancelled": return 409;
     case "invalid-version":
     case "version-below-minimum":
     case "not-installed":
@@ -392,12 +473,37 @@ const configuredProviders = async () => {
 // cache does not hear about an agent it just installed. Any change in its
 // progress drops the cache, and the next poll shows the agent as it lands.
 let lastSetupProgress = null;
+let lastSetupState = null;
 const noticeSetupProgress = (setup) => {
   const progress = setup ? JSON.stringify([setup.state, setup.items?.map((item) => item.state)]) : null;
+  if (setup?.state === "finished" && lastSetupState === "running") {
+    const done = (setup.items ?? []).filter((item) => item.state === "done");
+    const agents = done.filter((item) => item.kind === "agent").length;
+    const tools = done.length - agents;
+    const what = [agents ? `${agents} agent${agents === 1 ? "" : "s"}` : null, tools ? `${tools} toolchain${tools === 1 ? "" : "s"}` : null]
+      .filter(Boolean).join(" and ");
+    recordEvent("setup.finished", what ? `First start finished: ${what}` : "First start finished");
+  }
+  lastSetupState = setup?.state ?? lastSetupState;
   if (progress === lastSetupProgress) return;
   const first = lastSetupProgress === null;
   lastSetupProgress = progress;
   if (!first) void harnessCache.invalidate().catch(() => {});
+};
+
+// A session the last read did not have is a device that just paired. The
+// first read is the baseline, and a failed read changes nothing.
+let knownSessions = null;
+const noticeSessions = (sessions) => {
+  if (!Array.isArray(sessions)) return;
+  if (knownSessions) {
+    for (const session of sessions) {
+      if (!knownSessions.has(session.sessionId)) {
+        recordEvent("device.paired", `Paired ${session.client?.label || session.subject || "a device"}`);
+      }
+    }
+  }
+  knownSessions = new Set(sessions.map((session) => session.sessionId));
 };
 
 const status = async () => {
@@ -430,7 +536,7 @@ const status = async () => {
       cache: { at: null, stale: true, source: "unavailable", refreshing: false },
     }),
     attemptTimed("pairing links", () => listJson(["auth", "pairing", "list", "--json"]), T3_LIST_BUDGET_MS, []),
-    attemptTimed("paired devices", () => listJson(["auth", "session", "list", "--json"]), T3_LIST_BUDGET_MS, []),
+    attemptTimed("paired devices", () => listJson(["auth", "session", "list", "--json"]), T3_LIST_BUDGET_MS, null),
     // One local `mise ls`: cheap enough to read on every poll.
     attemptTimed("toolchains", async () => (await loadHarness()).toolchains.status(), HARNESS_BUDGET_MS,
       { toolchains: [], degraded: [] }),
@@ -440,29 +546,43 @@ const status = async () => {
     }, null),
   ]);
   noticeSetupProgress(setup);
+  noticeSessions(sessions);
   const harnesses = harnessSnap?.harnesses ?? [];
+  const disk = storage.snapshot();
   for (const entry of harnessSnap?.degraded ?? []) {
     degraded.push({ what: `harness ${entry.what}`, error: String(entry.error ?? "").slice(0, 200) });
   }
 
   return {
-    server,
+    // uptimeSeconds is this service's: it starts with the container and is
+    // only restarted by its own loop, which is rare and logged.
+    server: { ...server, uptimeSeconds: Math.round(process.uptime()) },
     image: {
       version: process.env.T3_IMAGE_VERSION || null,
       variant: process.env.T3_IMAGE_VARIANT || null,
     },
+    platform: `${process.platform}/${process.arch}`,
     publicUrl: PUBLIC_URL || null,
-    // The footer states where things live. Read them rather than printing a
+    t3: { port: Number(T3_PORT), bind: `${process.env.T3CODE_HOST || "0.0.0.0"}:${T3_PORT}` },
+    setupPort: PORT,
+    setupKeySource: SETUP_KEY_SOURCE,
+    // Environment states where things live. Read them rather than printing a
     // plausible-looking default: a wrong path here is worse than no path.
     paths: {
       // What you mount is the home directory; the state dir lives inside it.
-      volume: STATE_DIR.replace(/\/\.t3\/?$/, "") || STATE_DIR,
+      volume: VOLUME,
       state: STATE_DIR,
-      workspace: process.env.T3_WORKSPACE || "/workspace",
+      workspace: WORKSPACE,
       agents: `${STATE_DIR}/agents`,
       pairTtl: process.env.T3_PAIR_TTL || "30d",
+      // From the background storage check; null until its first pass lands.
+      volumeKind: disk.volumeKind,
+      workspaceKind: disk.workspaceKind,
+      volumeBytes: disk.volumeBytes,
+      workspaceProjects: disk.workspaceProjects,
     },
-    harnesses,
+    browser: BROWSER,
+    harnesses: withLatest("harness", harnesses),
     // Freshness of the harness facts above: `live` completed on this request,
     // `cache`/`cheap` are local or last-known state served because the
     // authenticated refresh exceeded its budget (it keeps running and warms
@@ -474,16 +594,17 @@ const status = async () => {
       source: harnessSnap?.cache?.source ?? "unavailable",
       refreshing: harnessSnap?.cache?.refreshing ?? false,
     },
-    toolchains: toolchainSnap?.toolchains ?? [],
+    toolchains: withLatest("toolchain", toolchainSnap?.toolchains ?? []),
     // The background install of everything T3_PREINSTALL names, on a first
     // start: what it planned, where it is, and what failed (retried on the
     // next start, or from the row's own Install button).
     setup,
     // How the operations this page started ended, so a click that returned
     // 202 can still end in a toast or an error on the row.
-    operations: Object.fromEntries([...operations].map(([key, { token: _token, ...op }]) => [key, op])),
+    operations: Object.fromEntries([...operations].map(([key, { token: _token, controller: _controller, ...op }]) => [key, op])),
     pairings,
-    sessions,
+    sessions: sessions ?? [],
+    events,
     degraded,
   };
 };
@@ -662,6 +783,7 @@ const startSignin = async (agentId) => {
     // someone they were signed in when they had just been turned away.
     if (TERMINAL_STATES.has(session.state)) return;
     session.state = code === 0 ? "done" : "failed";
+    if (session.state === "done") recordEvent("signin.ok", `Signed in ${agent.name}`);
     if (code !== 0 && !session.error) {
       session.error = session.output.trim().split("\n").slice(-3).join(" ").slice(0, 300)
         || `exited with code ${code}`;
@@ -701,6 +823,7 @@ const startSignin = async (agentId) => {
     if (wasSignedIn !== true && (await probeManagedAuth()) === true) {
       try { live.child.kill(); } catch {}
       live.state = "done";
+      recordEvent("signin.ok", `Signed in ${agent.name}`);
       forgetSignInState(agentId);
       return;
     }
@@ -718,6 +841,8 @@ const startSignin = async (agentId) => {
 const publicSession = (s) => ({
   id: s.id, agent: s.agentId, state: s.state, url: s.url, code: s.code, qr: s.qr ?? null,
   needsCode: s.needsCode, error: s.error,
+  // When the wait for the browser step gives up, for the device code's countdown.
+  startedAt: s.startedAt, expiresAt: s.startedAt + SESSION_TTL_MS,
   tail: s.output.trim().split("\n").slice(-4).join("\n"),
 });
 
@@ -743,6 +868,7 @@ const setApiKey = async (agentId, key, providerId) => {
       child.stdin.end(`${key}\n`);
     });
     await refreshSignInState(agentId);
+    recordEvent("signin.ok", `Saved an API key for ${agent.name}`);
     return { ok: true };
   }
 
@@ -751,18 +877,45 @@ const setApiKey = async (agentId, key, providerId) => {
   if (agent.apiKey.kind === "opencode") {
     // Dots are in the catalog too (wafer.ai), and this only ever becomes a key
     // in a JSON object, never a path segment.
-    if (!/^[a-z0-9][a-z0-9._-]{0,39}$/.test(String(providerId ?? "")))
+    if (!OPENCODE_PROVIDER.test(String(providerId ?? "")))
       throw new Error("Choose a provider (e.g. anthropic, openai, deepseek)");
     const dir = `${process.env.HOME}/.local/share/opencode`;
     await mkdir(dir, { recursive: true });
     let current = {};
     try { current = JSON.parse(await readFile(`${dir}/auth.json`, "utf8")); } catch {}
     current[providerId] = { type: "api", key };
-    await writeFile(`${dir}/auth.json`, JSON.stringify(current, null, 2), { mode: 0o600 });
+    await writeOpenCodeAuth(dir, current);
     await refreshSignInState(agentId);
+    recordEvent("signin.ok", `Added a ${providerId} key to OpenCode`);
     return { ok: true };
   }
   throw new Error("unsupported");
+};
+
+const OPENCODE_PROVIDER = /^[a-z0-9][a-z0-9._-]{0,39}$/;
+
+// Written whole to a temporary file and renamed over the old one, so a reader
+// - OpenCode itself, mid-request - never sees half a file.
+const writeOpenCodeAuth = async (dir, value) => {
+  const file = `${dir}/auth.json`;
+  const tmp = `${file}.${randomBytes(4).toString("hex")}.tmp`;
+  await writeFile(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  const { rename } = await import("node:fs/promises");
+  await rename(tmp, file);
+};
+
+/** Delete one provider's entry from OpenCode's auth.json; the rest stay. */
+const removeApiKey = async (agentId, providerId) => {
+  if (agentId !== "opencode") throw new Error(`${agentId} keeps no per-provider keys here`);
+  if (!OPENCODE_PROVIDER.test(String(providerId ?? ""))) throw new Error("Choose a provider to remove");
+  const dir = `${process.env.HOME}/.local/share/opencode`;
+  let current = {};
+  try { current = JSON.parse(await readFile(`${dir}/auth.json`, "utf8")); } catch { return { ok: true, removed: false }; }
+  if (!current || typeof current !== "object" || !(providerId in current)) return { ok: true, removed: false };
+  delete current[providerId];
+  await writeOpenCodeAuth(dir, current);
+  await refreshSignInState(agentId);
+  return { ok: true, removed: true };
 };
 
 const send = (res, code, body, headers = {}) => {
@@ -789,145 +942,6 @@ const readBody = async (req) => {
   return Buffer.concat(chunks).toString("utf8");
 };
 
-const page = (authed, mount) => `<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark">
-<title>T3 Code setup</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111'/%3E%3Ctext x='16' y='22' font-family='ui-monospace,monospace' font-size='16' font-weight='700' fill='%23fff' text-anchor='middle'%3ET3%3C/text%3E%3C/svg%3E">
-<style>${CONSOLE_CSS}</style>
-<script>window.__T3_SETUP_BASE__ = ${JSON.stringify(mount)};</script>
-<script>${THEME_BOOT}</script>
-</head><body>
-<div class="console-top">
-<header class="tc-chrome">
-  <div class="tc-wrap tc-wrap--wide tc-chrome-in">
-    <div class="tc-brand">
-      <span class="tc-mark" aria-hidden="true"></span>
-      <span class="tc-brand-name">T3 Code</span>
-      <span class="tc-brand-sub">setup</span>
-    </div>
-    <div class="tc-chrome-spacer"></div>
-    ${authed ? `<span class="tc-tag tc-tag--mono tc-tag--build" id="build"
-      title="Image this container was built from">&mdash;</span>
-    <span class="tc-health" id="health" role="status" aria-live="polite">Checking&hellip;</span>` : ""}
-    <button type="button" class="tc-iconbtn" id="theme-btn"
-      title="Switch color theme" aria-label="Switch color theme"></button>
-  </div>
-</header>
-${authed ? `<div class="tc-strip"><div class="tc-wrap tc-wrap--wide tc-strip-in" id="strip"></div></div>` : ""}
-</div>
-<main class="tc-wrap tc-wrap--wide tc-main">
-${authed ? `<div id="degraded"></div><div id="setup-progress" aria-live="polite"></div>` : ""}
-${
-  authed
-    ? `<h1 class="tc-sr">T3 Code setup console</h1>
-<div class="tc-deck">
-  <div class="tc-deck-col">
-
-    <section class="tc-card tc-card--hero">
-      <div class="tc-cardhead">
-        <h2 class="tc-eyebrow">Pair a device</h2>
-        <div class="tc-cardhead-spacer"></div>
-        <p class="tc-cardhead-note" id="paircount"></p>
-      </div>
-      <div class="tc-cardbody">
-        <p class="tc-lede">Creates a single-use link for one device. Scan it with the
-        T3 Code app, or open it in a browser.</p>
-        <div class="pair-controls">
-          <div class="tc-seg" id="ttl" role="group" aria-label="How long the link stays valid">
-            <button type="button" data-ttl="1h">1 hour</button>
-            <button type="button" data-ttl="7d">7 days</button>
-            <button type="button" data-ttl="30d" aria-pressed="true">30 days</button>
-          </div>
-          <input id="label" class="tc-input grow" placeholder="Label, e.g. my phone"
-            aria-label="Device label" />
-          <button type="button" class="tc-btn tc-btn--primary" id="mint">Create pairing link</button>
-        </div>
-        <div id="out" aria-live="polite"></div>
-      </div>
-    </section>
-
-    <section class="tc-card">
-      <div class="tc-cardhead">
-        <h2 class="tc-eyebrow">Agents</h2>
-        <div class="tc-cardhead-spacer"></div>
-        <p class="tc-cardhead-note" id="agent-count"></p>
-      </div>
-      <div class="tc-list" id="agents"><div class="tc-row"><span class="tc-skel"
-        style="width:44%"></span></div><div class="tc-row"><span class="tc-skel"
-        style="width:33%"></span></div></div>
-    </section>
-
-    <section class="tc-card">
-      <div class="tc-cardhead">
-        <h2 class="tc-eyebrow">Toolchains</h2>
-        <div class="tc-cardhead-spacer"></div>
-        <p class="tc-cardhead-note" id="toolchain-count"></p>
-      </div>
-      <div class="tc-list" id="toolchains"><div class="tc-row"><span class="tc-skel"
-        style="width:36%"></span></div></div>
-      <div class="tc-cardfoot">Available in every directory. A project that pins its own
-        version in mise.toml or .tool-versions gets that one instead.</div>
-    </section>
-
-  </div>
-  <div class="tc-deck-col">
-
-    <section class="tc-card">
-      <div class="tc-cardhead">
-        <h2 class="tc-eyebrow">Ports</h2>
-        <div class="tc-cardhead-spacer"></div>
-        <p class="tc-cardhead-note" id="portnote"></p>
-      </div>
-      <div class="tc-list" id="ports"><div class="tc-row"><span class="tc-skel"
-        style="width:38%"></span></div></div>
-      <div class="tc-cardfoot" id="portfoot">A published URL is public while it is up.
-        Take it down when you are done.</div>
-    </section>
-
-    <section class="tc-card">
-      <div class="tc-cardhead">
-        <h2 class="tc-eyebrow">Sessions</h2>
-        <div class="tc-cardhead-spacer"></div>
-        <p class="tc-cardhead-note" id="sessioncount"></p>
-      </div>
-      <div class="tc-grouphead">Devices</div>
-      <div class="tc-list" id="clients"><div class="tc-row"><span class="tc-skel"
-        style="width:56%"></span></div></div>
-      <div class="tc-grouphead">Unused links</div>
-      <div class="tc-list" id="links"><div class="tc-row"><span class="tc-skel"
-        style="width:40%"></span></div></div>
-    </section>
-
-  </div>
-</div>
-<div class="tc-details" id="details"></div>`
-    : `<section class="tc-card tc-card--pad" style="max-width:34rem;margin:8vh auto 0">
-  <h2 style="font-size:22px;letter-spacing:-.02em;margin:0 0 6px">Unlock the console</h2>
-  <p class="tc-lede" style="margin-bottom:20px">The key is
-  <span class="tc-mono">T3_SETUP_KEY</span> from this container's environment: set by you,
-  or generated at boot and printed to the container log.</p>
-  <form method="POST" action="${mount}/login" class="tc-stack" id="loginform">
-    <div class="tc-field">
-      <label class="tc-label" for="key">Setup key</label>
-      <input class="tc-input tc-input--mono" id="key" name="key" type="password"
-        placeholder="Paste the setup key" autofocus autocomplete="current-password" />
-      <span class="tc-hint">This key mints pairing links. Treat it like a password.</span>
-    </div>
-    <button class="tc-btn tc-btn--primary tc-btn--lg tc-btn--block" type="submit">Unlock console</button>
-  </form>
-</section>
-<div class="tc-details" style="max-width:34rem;margin:20px auto 0;border:0;padding-top:0">
-  <div class="tc-details-item"><span class="tc-details-value tc-mono">port ${
-    process.env.T3_SETUP_PORT ?? 3774} · setup</span></div>
-  <div class="tc-details-item"><span class="tc-details-value">Credentials never leave
-    this container.</span></div>
-</div>`
-}
-</main>
-<script>${CLIENT_JS}</script></body></html>`;
-
 // ---------------------------------------------------------------------------
 // Ports
 //
@@ -943,7 +957,6 @@ ${
 // ---------------------------------------------------------------------------
 
 const CLOUDFLARED = process.env.T3CODE_CLOUDFLARED_PATH || "cloudflared";
-const STATE_DIR = process.env.T3CODE_HOME || `${process.env.HOME || "/home/t3"}/.t3`;
 const EXPOSED_FILE = `${STATE_DIR}/exposed-ports.json`;
 
 // Ports that belong to the container's own plumbing rather than to anything a
@@ -966,26 +979,24 @@ const ephemeralRange = () => {
 
 const EPHEMERAL = ephemeralRange();
 
-/** Ports currently in LISTEN state, whatever interface they bound to. */
-const listeningPorts = async () => {
+/**
+ * What is in LISTEN state, whatever interface it bound to: one entry per port
+ * with the owning process and bind address (ports.mjs does the parsing).
+ */
+const listeners = async () => {
   // A dev server bound to 127.0.0.1 is the normal case and the one that most
   // needs a tunnel, so loopback-only listeners are included deliberately.
   // -p names the owning process, which is how cloudflared's own metrics
   // listener gets filtered out: publishing a port opened a second "port" in
   // this list, which is confusing and not something anyone would want to expose.
   const { stdout } = await run("ss", ["-H", "-l", "-t", "-n", "-p"]).catch(() => ({ stdout: "" }));
-  const found = new Map();
-  for (const line of stdout.split("\n")) {
-    if (/"cloudflared"/.test(line)) continue;
-    const local = line.trim().split(/\s+/)[3];
-    if (!local) continue;
-    const port = Number(local.slice(local.lastIndexOf(":") + 1));
-    if (!Number.isInteger(port) || port <= 0 || RESERVED.has(port)) continue;
-    if (port >= EPHEMERAL[0] && port <= EPHEMERAL[1]) continue;
-    // ss lists one row per bound address; a server on :: and 0.0.0.0 is one port.
-    found.set(port, (found.get(port) ?? 0) + 1);
-  }
-  return [...found.keys()].sort((a, b) => a - b);
+  return parseListeners(stdout, { reserved: RESERVED, ephemeral: EPHEMERAL }).map(({ pid, ...entry }) => {
+    // The command line names a dev server far better than ss does.
+    let argv = null;
+    try { if (pid) argv = readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0"); } catch { /* gone, or not ours */ }
+    const process = processLabel(argv, entry.process);
+    return { ...entry, process, looksLikeDatabase: entry.looksLikeDatabase || looksLikeDatabase(entry.port, process) };
+  });
 };
 
 /** port -> { port, state, url, error, startedAt, child } */
@@ -1053,6 +1064,7 @@ const startTunnel = (rawPort) => {
     if (tunnel.url && tunnel.registered && tunnel.state !== "open") {
       tunnel.state = "open";
       persistExposed();
+      recordEvent("port.published", `Published port ${port} to`, tunnel.url.replace(/^https:\/\//, ""));
       // Rendered here rather than in the browser for the same reason pairing
       // does it: qrencode is already in the image, and the device that needs
       // to scan this is rarely the one showing the page.
@@ -1108,16 +1120,23 @@ const stopTunnel = (rawPort) => {
   tunnels.delete(port);
   try { tunnel.child.kill("SIGTERM"); } catch { /* already gone */ }
   persistExposed();
+  if (tunnel.state === "open") recordEvent("port.stopped", `Stopped publishing port ${port}`);
   return { ok: true, port };
 };
 
-const portsStatus = async () => ({
-  // `available` means cloudflared can run at all; the page says so plainly
-  // rather than letting every Expose click fail with the same opaque error.
-  available: existsSync(CLOUDFLARED) || CLOUDFLARED === "cloudflared",
-  listening: await listeningPorts(),
-  tunnels: [...tunnels.values()].map(publicTunnel),
-});
+const portsStatus = async () => {
+  const found = await listeners();
+  return {
+    // `available` means cloudflared can run at all; the page says so plainly
+    // rather than letting every Expose click fail with the same opaque error.
+    available: existsSync(CLOUDFLARED) || CLOUDFLARED === "cloudflared",
+    // Plain numbers: this is what t3-expose reads.
+    listening: found.map((entry) => entry.port),
+    // The same ports with what the page shows beside them.
+    details: found,
+    tunnels: [...tunnels.values()].map(publicTunnel),
+  };
+};
 
 // --- harness lifecycle ------------------------------------------------------
 //
@@ -1156,8 +1175,145 @@ const syncWarning = (id, sync) => {
 // lock, and the work finishes in the background. `operations` is what the page
 // polls to learn how its own clicks ended; work started elsewhere (preinstall,
 // `t3-harness`) shows up through the manager's inProgress facts instead.
-const operations = new Map(); // "harness:claude" -> { kind, state, error, ... }
+const operations = new Map(); // "harness:claude" -> { kind, state, error, progress, ... }
 const TOOLCHAIN_IDS = new Set(["go", "rust", "bun", "deno", "uv"]);
+const TOOLCHAIN_NAMES = { go: "Go", rust: "Rust", bun: "Bun", deno: "Deno", uv: "uv" };
+const lifecycleName = (target, id) => (target === "harness" ? AGENTS[id]?.name : TOOLCHAIN_NAMES[id]) ?? id;
+
+// The manager runs one operation at a time under its lock. Rather than turn a
+// second click into "busy", the page's operations queue here and run in order:
+// "Update all" is a row of clicks, and Install pressed while the first start is
+// still installing simply waits its turn. A lock held by someone else - the
+// first-start install, `t3-harness` in a terminal - is waited out the same
+// way, from the front of the queue, for as long as is reasonable.
+const queue = [];      // jobs not started yet, in order
+let active = null;     // the job taking, or holding, the lock
+const BUSY_RETRY_MS = 5000;
+const BUSY_GIVE_UP_MS = 30 * 60 * 1000;
+const PAST = { install: "installed", update: "updated", uninstall: "uninstalled" };
+const DONE_TEXT = { install: "Installed", update: "Updated", uninstall: "Uninstalled" };
+
+/** Only the job that owns a row reports into it; a newer request owns it next. */
+const setOperation = (job, patch) => {
+  const current = operations.get(job.key);
+  if (current && current.token !== job.token && (current.state === "running" || current.state === "queued")) return;
+  operations.set(job.key, {
+    ...(current?.token === job.token ? current : {}),
+    ...patch,
+    kind: job.kind,
+    token: job.token,
+    controller: job.controller,
+  });
+  job.reported = true;
+};
+
+const enqueue = (job, { front = false } = {}) => {
+  if (front) queue.unshift(job);
+  else queue.push(job);
+  setOperation(job, { state: "queued", error: null, warning: null, progress: null, queuedAt: job.queuedAt, startedAt: null, finishedAt: null });
+};
+
+/** Start the next queued job once nothing on this side holds the lock. */
+const drain = () => {
+  if (active || !queue.length) return;
+  void runJob(queue.shift());
+};
+
+/** How a job ended: the row's state, a sentence for Recent, and nothing for a refusal nobody queued. */
+const finishJob = (job, { result, sync }) => {
+  const cancelled = result?.code === "cancelled";
+  if (!job.reported) return;
+  setOperation(job, {
+    state: result?.ok ? "ok" : cancelled ? "cancelled" : "failed",
+    error: result?.ok || cancelled ? null : String(result?.error ?? "failed").slice(0, 300),
+    warning: result?.ok ? syncWarning(job.id, sync) : null,
+    progress: null,
+    finishedAt: Date.now(),
+  });
+  const name = lifecycleName(job.target, job.id);
+  if (result?.ok) {
+    const facts = result.harness ?? result.toolchain ?? null;
+    const version = job.kind === "uninstall" ? null : facts?.installedVersion ?? facts?.version ?? null;
+    recordEvent(`${job.target}.${PAST[job.kind]}`, `${DONE_TEXT[job.kind]} ${name}${version && job.kind === "update" ? " to" : ""}`, version);
+  } else if (!cancelled) {
+    recordEvent(`${job.target}.failed`, `Could not ${job.kind} ${name}`);
+  }
+};
+
+/**
+ * Run one job. Resolves with null as soon as it holds the lock (the work goes
+ * on in the background), with `{ queued: true }` when someone else's lock sent
+ * it back to wait, or with the finished `{ result, sync }` when it ended (or was
+ * refused) before ever starting.
+ */
+const runJob = async (job) => {
+  active = job;
+  let manager;
+  try {
+    manager = await loadHarness();
+  } catch (error) {
+    const outcome = { result: { ok: false, code: "failed", error: String(error?.message ?? error) }, sync: null };
+    finishJob(job, outcome);
+    active = null;
+    drain();
+    return outcome;
+  }
+  const ops = job.target === "harness" ? manager : manager.toolchains;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const options = {
+    ...(job.version ? { version: job.version } : {}),
+    signal: job.controller.signal,
+    onStarted: () => {
+      setOperation(job, { state: "running", error: null, warning: null, progress: null, startedAt: Date.now(), finishedAt: null });
+      markStarted(null);
+      // Let the next poll see the lock instead of the facts from before it.
+      void harnessCache.invalidate().catch(() => {});
+    },
+    onProgress: (progress) => {
+      const op = operations.get(job.key);
+      if (op?.token === job.token && op.state === "running") op.progress = progress;
+    },
+  };
+
+  const work = ops[job.kind](job.id, options).then(async (result) => {
+    let sync = null;
+    if (result?.ok && job.target === "harness") {
+      try {
+        sync = await syncManagedProviders();
+      } catch (error) {
+        sync = { ok: false, error: String(error?.message ?? error).slice(0, 200) };
+      }
+    }
+    // Refresh the card's facts before reporting the result, so the poll that
+    // sees "ok" also sees the agent installed.
+    forgetSignInState(job.id);
+    try { await harnessCache.invalidate(); } catch { /* the next poll refreshes */ }
+    return { result, sync };
+  }, (error) => ({ result: { ok: false, code: "failed", error: String(error?.message ?? error) }, sync: null }));
+
+  const done = work.then((outcome) => {
+    const aborted = job.controller.signal.aborted;
+    if (outcome.result?.code === "busy" && !aborted && Date.now() - job.queuedAt < BUSY_GIVE_UP_MS) {
+      active = null;
+      enqueue(job, { front: true });
+      setTimeout(drain, BUSY_RETRY_MS).unref?.();
+      return { queued: true };
+    }
+    const settled = aborted && !outcome.result?.ok
+      ? { result: { ok: false, code: "cancelled", error: "cancelled" }, sync: null }
+      : outcome;
+    finishJob(job, settled);
+    active = null;
+    drain();
+    return settled;
+  });
+
+  // Whichever comes first: the lock (answer now, finish in the background), or
+  // the whole operation (refused before it started - a bad version - or simply
+  // quick, like an uninstall).
+  return Promise.race([started, done]);
+};
 
 const startLifecycle = async (target, kind, input) => {
   const ids = target === "harness" ? HARNESS_IDS : TOOLCHAIN_IDS;
@@ -1172,64 +1328,23 @@ const startLifecycle = async (target, kind, input) => {
     ? undefined
     : String(rawVersion).trim();
 
-  const manager = await loadHarness();
-  const ops = target === "harness" ? manager : manager.toolchains;
   const key = `${target}:${id}`;
-  // Only the request that actually took the lock reports into `operations`.
-  // A second click refused as busy must not overwrite the one still running.
-  const token = randomBytes(6).toString("hex");
-  const mine = () => operations.get(key)?.token === token && operations.get(key)?.state === "running";
-  let markStarted;
-  const started = new Promise((resolve) => { markStarted = resolve; });
-  const options = {
-    ...(version ? { version } : {}),
-    onStarted: () => {
-      operations.set(key, { kind, state: "running", token, error: null, warning: null, startedAt: Date.now(), finishedAt: null });
-      markStarted(null);
-      // Let the next poll see the lock instead of the facts from before it.
-      void harnessCache.invalidate().catch(() => {});
-    },
-  };
-
-  const done = ops[kind](id, options).then(async (result) => {
-    let sync = null;
-    if (result?.ok && target === "harness") {
-      try {
-        sync = await syncManagedProviders();
-      } catch (error) {
-        sync = { ok: false, error: String(error?.message ?? error).slice(0, 200) };
-      }
-    }
-    // Refresh the card's facts before reporting the result, so the poll that
-    // sees "ok" also sees the agent installed.
-    forgetSignInState(id);
-    try { await harnessCache.invalidate(); } catch { /* the next poll refreshes */ }
-    if (mine()) {
-      operations.set(key, {
-        ...operations.get(key),
-        state: result?.ok ? "ok" : "failed",
-        error: result?.ok ? null : String(result?.error ?? "failed").slice(0, 300),
-        warning: result?.ok ? syncWarning(id, sync) : null,
-        finishedAt: Date.now(),
-      });
-    }
-    return { result, sync };
-  }, (error) => {
-    if (mine()) {
-      operations.set(key, {
-        ...operations.get(key), state: "failed", error: String(error?.message ?? error).slice(0, 300), finishedAt: Date.now(),
-      });
-    }
-    return { result: { ok: false, code: "failed", error: String(error?.message ?? error) }, sync: null };
-  });
-
-  // Whichever comes first: the lock (answer now, finish in the background), or
-  // the whole operation (refused before it started - busy, a bad version - or
-  // simply quick, like an uninstall).
-  const first = await Promise.race([started, done]);
-  if (first === null) {
-    return { http: 202, body: { ok: true, code: "started", id, kind, target } };
+  const existing = operations.get(key);
+  if (existing && (existing.state === "running" || existing.state === "queued")) {
+    return {
+      http: 409,
+      body: { ok: false, code: "busy", error: `${lifecycleName(target, id)} already has an operation ${existing.state === "queued" ? "waiting" : "running"}` },
+    };
   }
+  const job = { key, target, kind, id, version, token: randomBytes(6).toString("hex"), controller: new AbortController(), queuedAt: Date.now(), reported: false };
+  if (active || queue.length) {
+    enqueue(job);
+    return { http: 202, body: { ok: true, code: "queued", id, kind, target } };
+  }
+
+  const first = await runJob(job);
+  if (first === null) return { http: 202, body: { ok: true, code: "started", id, kind, target } };
+  if (first.queued) return { http: 202, body: { ok: true, code: "queued", id, kind, target } };
   const { result, sync } = first;
   const body = {
     ok: Boolean(result?.ok),
@@ -1242,12 +1357,60 @@ const startLifecycle = async (target, kind, input) => {
   return { http: lifecycleHttpStatus(result?.code ?? "failed"), body };
 };
 
-const ROUTES = ["/login", "/status", "/pair", "/revoke", "/ports",
+/** Take a job out of the queue, or stop the one running (its mise run included). */
+const cancelLifecycle = (target, rawId) => {
+  const key = `${target}:${String(rawId ?? "").trim()}`;
+  const index = queue.findIndex((job) => job.key === key);
+  if (index !== -1) {
+    const [job] = queue.splice(index, 1);
+    job.controller.abort();
+    setOperation(job, { state: "cancelled", error: null, progress: null, finishedAt: Date.now() });
+    return { http: 200, body: { ok: true, code: "cancelled" } };
+  }
+  if (active?.key === key) {
+    active.controller.abort();
+    return { http: 202, body: { ok: true, code: "cancelling" } };
+  }
+  return { http: 404, body: { ok: false, code: "not-running", error: "Nothing is running or waiting for that row." } };
+};
+
+const ROUTES = ["/login", "/logout", "/status", "/pair", "/revoke", "/ports",
   "/ports/expose", "/ports/unexpose",
-  "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses",
-  "/toolchains/install", "/toolchains/update", "/toolchains/uninstall",
-  "/auth/apikey", "/auth/signin", "/auth/session", "/auth/code", "/auth/cancel",
-  "/providers"];
+  "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses",
+  "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
+  "/auth/apikey/remove", "/auth/apikey", "/auth/signin", "/auth/session", "/auth/code", "/auth/cancel",
+  "/providers", "/updates/check"];
+
+// The session cookie. Secure when the request reached us over HTTPS (directly
+// or through a proxy that says so); a plain-http LAN address must still work.
+const cookie = (req, mount, value, maxAge) => {
+  const secure = req.socket.encrypted || /^https$/i.test(String(req.headers["x-forwarded-proto"] ?? "").split(",")[0].trim());
+  return `${COOKIE}=${value}; HttpOnly; SameSite=Strict; Path=${mount || "/"}; Max-Age=${maxAge}${secure ? "; Secure" : ""}`;
+};
+
+/**
+ * The one HTML document, under a Content-Security-Policy that lets only this
+ * response's scripts run. Compressed when the browser accepts it: the page
+ * inlines its whole design system, and it is often fetched over a tunnel.
+ */
+const sendPage = async (req, res, render) => {
+  const nonce = randomBytes(16).toString("base64");
+  const html = render(nonce);
+  const headers = {
+    "content-type": "text/html; charset=utf-8",
+    "content-security-policy": contentSecurityPolicy(nonce),
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    vary: "accept-encoding, cookie",
+  };
+  if (/\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""))) {
+    return send(res, 200, await gzip(html), { ...headers, "content-encoding": "gzip" });
+  }
+  return send(res, 200, html, headers);
+};
+
+const wantsJson = (req) => /application\/json/.test(String(req.headers.accept ?? ""));
 
 /**
  * Work out which prefix this request arrived under, and which route it wants.
@@ -1302,21 +1465,36 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 404, { error: "not found" });
     }
 
+    // The unlock form posts here. Without JavaScript it is a plain form post
+    // answered with a redirect (carrying ?error=1 when the key was wrong); the
+    // page's own script asks for JSON instead, so it can say so in place.
     if (req.method === "POST" && route === "/login") {
       const body = new URLSearchParams(await readBody(req));
       if (!keyMatches(body.get("key"))) {
         await throttle(ip);
-        return send(res, 303, "", { location: `${mount}/` });
+        if (wantsJson(req)) return sendJson(res, 401, { ok: false, error: "That key was not accepted." });
+        return send(res, 303, "", { location: `${mount}/?error=1` });
       }
       failures.delete(ip);
-      return send(res, 303, "", {
-        location: `${mount}/`,
-        "set-cookie": `${COOKIE}=${encodeURIComponent(KEY)}; HttpOnly; SameSite=Strict; Path=${mount || "/"}; Max-Age=86400`,
-      });
+      const setCookie = cookie(req, mount, encodeURIComponent(KEY), 86400);
+      if (wantsJson(req)) return sendJson(res, 200, { ok: true }, { "set-cookie": setCookie });
+      return send(res, 303, "", { location: `${mount}/`, "set-cookie": setCookie });
+    }
+
+    // Lock console: forget this browser. Needs no key - signing out is never
+    // something to refuse - and the cookie is SameSite=Strict, so another site
+    // cannot do it for you either.
+    if (req.method === "POST" && route === "/logout") {
+      return send(res, 303, "", { location: `${mount}/`, "set-cookie": cookie(req, mount, "", 0) });
     }
 
     if (route === "/") {
-      return send(res, 200, page(authed, mount), { "content-type": "text/html; charset=utf-8" });
+      if (authed) return sendPage(req, res, (nonce) => renderConsole({ assets: ASSETS, nonce, mount }));
+      // The host the browser asked for, for the card's eyebrow; escaped by the template.
+      const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? "").split(",")[0].trim().slice(0, 200);
+      return sendPage(req, res, (nonce) => renderUnlock({
+        assets: ASSETS, nonce, mount, host, publicUrl: PUBLIC_URL, error: raw.searchParams.get("error") === "1",
+      }));
     }
 
     if (!authed) {
@@ -1334,26 +1512,36 @@ const server = createServer(async (req, res) => {
           && url.searchParams.get("authenticate") !== "0";
         const snap = await harnessLifecycleStatus(authenticate);
         const cache = snap.cache;
+        const harnesses = withLatest("harness", snap.harnesses);
         if (only) {
-          const found = snap.harnesses.find((h) => h.id === only);
+          const found = harnesses.find((h) => h.id === only);
           if (!found) return sendJson(res, 404, { ok: false, code: "unknown-harness", error: `unknown harness: ${only}` });
           return sendJson(res, 200, { harness: found, degraded: snap.degraded, harnessCache: cache });
         }
-        return sendJson(res, 200, { harnesses: snap.harnesses, degraded: snap.degraded, harnessCache: cache });
+        return sendJson(res, 200, { harnesses, degraded: snap.degraded, harnessCache: cache });
       } catch (error) {
         return sendJson(res, 500, { error: String(error?.message ?? error) });
       }
     }
-    const lifecycle = /^\/(harnesses|toolchains)\/(install|update|uninstall)$/.exec(route);
+    const lifecycle = /^\/(harnesses|toolchains)\/(install|update|uninstall|cancel)$/.exec(route);
     if (req.method === "POST" && lifecycle) {
       try {
         const target = lifecycle[1] === "harnesses" ? "harness" : "toolchain";
         const input = JSON.parse((await readBody(req)) || "{}");
-        const { http, body } = await startLifecycle(target, lifecycle[2], input);
+        const { http, body } = lifecycle[2] === "cancel"
+          ? cancelLifecycle(target, input?.id)
+          : await startLifecycle(target, lifecycle[2], input);
         return sendJson(res, http, body);
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }
+    }
+
+    // "Check for updates now": a fresh pass in the background; rows pick the
+    // answers up on the next poll.
+    if (req.method === "POST" && route === "/updates/check") {
+      void latestCache.refresh({ force: true }).catch(() => {});
+      return sendJson(res, 202, { ok: true, code: "checking" });
     }
 
     if (req.method === "GET" && route === "/ports") {
@@ -1385,6 +1573,14 @@ const server = createServer(async (req, res) => {
         configured: await configuredProviders(),
         cache: { at: snap.at, stale: snap.stale, source: snap.source, refreshing: snap.refreshing },
       });
+    }
+    if (req.method === "POST" && route === "/auth/apikey/remove") {
+      try {
+        const input = JSON.parse((await readBody(req)) || "{}");
+        return sendJson(res, 200, await removeApiKey(input.agent, input.provider));
+      } catch (error) {
+        return sendJson(res, 400, { error: String(error?.message ?? error) });
+      }
     }
     if (req.method === "POST" && route === "/auth/apikey") {
       try {
@@ -1461,6 +1657,32 @@ const server = createServer(async (req, res) => {
   }
 });
 
+// Children belong to this process: a sign-in CLI waiting on a browser, a
+// tunnel. Left behind by a restart they would keep running with nothing
+// tracking them - a sign-in nobody can finish, a URL nobody can stop - so
+// they go when the service does, however it goes.
+const stopChildren = () => {
+  for (const session of sessions.values()) {
+    if (!TERMINAL_STATES.has(session.state)) {
+      try { session.child.kill(); } catch { /* already gone */ }
+    }
+  }
+  for (const tunnel of tunnels.values()) {
+    try { tunnel.child.kill("SIGTERM"); } catch { /* already gone */ }
+  }
+};
+process.on("exit", stopChildren);
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.on(signal, () => process.exit(0));
+}
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`[setup] listening on 0.0.0.0:${PORT}`);
+  // Background facts: the storage check now, release lookups shortly after
+  // (a first start is busy downloading; the cache on the volume answers until
+  // then) and every half hour after that, each pass skipped while fresh.
+  void storage.refresh();
+  void latestCache.load();
+  setTimeout(() => { void latestCache.refresh().catch(() => {}); }, 30_000).unref();
+  setInterval(() => { void latestCache.refresh().catch(() => {}); }, 30 * 60 * 1000).unref();
 });

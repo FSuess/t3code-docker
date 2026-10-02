@@ -1,4 +1,4 @@
-// The setup console's client script.
+// The setup console.
 //
 // It lives in its own file, not inside a template literal in server.mjs, and
 // that is deliberate: a template literal eats backslashes on the way out, so
@@ -7,1128 +7,1655 @@
 // because the corrupted result still parses. Kept as a real file, nothing
 // rewrites it between here and the browser.
 //
-// Markup here is the `tc-*` component system from docker/setup/console.css;
-// the two are one design and should be changed together.
+// Four scripts share one scope, in this order: client/base.js (BASE, where the
+// API lives), design/ui.js (window.T3C: icons and copy), client/model.js
+// (T3Model: what every row, badge and step should say, as pure functions) and
+// client/kit.js (Kit: markup, patching, overlays, toasts, keys). This file is
+// the console on top of them:
 //
-// Where to send API calls.
+//   data      /status every 15s (3s while work runs), /ports every 4s, paused
+//             while the tab is hidden
+//   routes    #overview #devices #agents #toolchains #ports #environment #more
+//   pages     one renderer per route, markup in, Kit.patch out
+//   commands  every button carries data-cmd; the palette runs the same table
+//   flows     pairing, sign-in, API keys, versions, confirmations
 //
-// The server infers its own mount from the path a request arrives on, and
-// passes it here. That works while a reverse proxy forwards the prefix intact;
-// a proxy that *strips* it - Cloudflare and nginx both do this routinely -
-// leaves the server seeing "/" and reporting no mount, and the page then calls
-// /status at the origin root, which the proxy does not route back here. The
-// browser still knows the real path, so fall back to it: the page's own
-// directory is the right base whether the prefix survived the hop or not.
-const pageBase = () => {
-  const path = location.pathname.replace(/\/+$/, '');
-  // A page served at /__setup answers its API at /__setup/status; one served
-  // at the root answers at /status.
-  return /\.[a-z0-9]{1,5}$/i.test(path) ? path.replace(/\/[^/]*$/, '') : path;
-};
-const BASE = window.__T3_SETUP_BASE__ || pageBase();
+// The page keeps a few facts the server cannot know: a click still in flight
+// (lifecycleBusy), an operation it is waiting to hear the end of
+// (pendingOps), the error a row should keep showing (notices), a version typed
+// but not yet installed (versionDrafts). Polling never repaints an overlay,
+// and patching never undoes typing, focus or an expanded row.
+(() => {
+  'use strict';
+  if (!document.getElementById('app')) return;
 
-const $ = (id) => document.getElementById(id);
-const esc = (v) => String(v ?? '').replace(/[&<>"]/g,
-  (c) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+  const M = T3Model;
+  const { html, raw, icon, cx, patch } = Kit;
+  const $ = (id) => document.getElementById(id);
+  const now = () => Date.now();
 
-// ---------------------------------------------------------------- unlock --
-// The form is server-rendered, so its action carries whatever mount the server
-// could work out. Behind a proxy that strips the prefix that is the origin
-// root, which the proxy does not route back here - you cannot even sign in.
-// Post it ourselves against the base the browser can see, and reload rather
-// than follow a redirect the server would aim at the same wrong root.
-const loginForm = $('loginform');
-if (loginForm) {
-  loginForm.action = BASE + '/login';
-  loginForm.onsubmit = async (event) => {
-    event.preventDefault();
-    const body = new URLSearchParams(new FormData(loginForm));
+  // ------------------------------------------------------------------ api --
+  let locked = false;
+  /**
+   * One request to the setup API. Never throws: the answer carries `ok`,
+   * `status`, the parsed body and a sentence for the user when it failed.
+   */
+  const api = async (path, { body, method } = {}) => {
+    let res;
     try {
-      await fetch(BASE + '/login', {
-        method: 'POST', body,
-        headers: {'content-type': 'application/x-www-form-urlencoded'},
-        redirect: 'manual',
+      res = await fetch(BASE + path, {
+        method: method || (body === undefined ? 'GET' : 'POST'),
+        headers: body === undefined ? { accept: 'application/json' } : { accept: 'application/json', 'content-type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+        cache: 'no-store',
+        credentials: 'same-origin',
       });
-    } catch { /* fall through to the reload, which will show the form again */ }
-    location.reload();
-  };
-}
-
-// ---------------------------------------------------------------- theme --
-// Three modes, not two: "system" is the default and keeps following the OS.
-// The inline boot script in the page has already applied the stored mode, so
-// this only has to keep the icon honest and cycle on click.
-const THEME_KEY = 't3-console-theme';
-const SUN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
-  + ' stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/>'
-  + '<path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2'
-  + 'M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
-const MOON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
-  + ' stroke-linecap="round" stroke-linejoin="round">'
-  + '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg>';
-
-const themeMode = () => {
-  try { return localStorage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; }
-};
-const systemDark = () => window.matchMedia('(prefers-color-scheme: dark)').matches;
-const applyTheme = (mode) => {
-  const resolved = mode === 'system' ? (systemDark() ? 'dark' : 'light') : mode;
-  document.documentElement.setAttribute('data-theme', resolved);
-  document.documentElement.setAttribute('data-theme-mode', mode);
-  const button = $('theme-btn');
-  if (button) {
-    button.innerHTML = resolved === 'dark' ? SUN : MOON;
-    button.title = mode === 'system'
-      ? 'Following the system theme' : 'Theme: ' + mode;
-  }
-};
-if ($('theme-btn')) {
-  $('theme-btn').onclick = () => {
-    const next = {system: 'light', light: 'dark', dark: 'system'}[themeMode()];
-    try { localStorage.setItem(THEME_KEY, next); } catch { /* session only */ }
-    applyTheme(next);
-  };
-  window.matchMedia('(prefers-color-scheme: dark)')
-    .addEventListener('change', () => { if (themeMode() === 'system') applyTheme('system'); });
-  applyTheme(themeMode());
-}
-
-// ---------------------------------------------------------------- toasts --
-const CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"'
-  + ' stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
-
-const toast = (message, icon) => {
-  let stack = document.querySelector('.tc-toasts');
-  if (!stack) {
-    stack = document.createElement('div');
-    stack.className = 'tc-toasts';
-    document.body.appendChild(stack);
-  }
-  const node = document.createElement('div');
-  node.className = 'tc-toast';
-  node.setAttribute('role', 'status');
-  node.innerHTML = (icon || '') + '<span>' + esc(message) + '</span>';
-  stack.appendChild(node);
-  setTimeout(() => {
-    node.classList.add('tc-toast--out');
-    setTimeout(() => node.remove(), 200);
-  }, 1900);
-};
-
-// execCommand is the fallback because clipboard.writeText needs a secure
-// context, and this page is often served over plain http on a LAN.
-const copy = (text, message) => {
-  const done = () => toast(message || 'Copied to clipboard', CHECK);
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done, () => fallbackCopy(text, done));
-  } else {
-    fallbackCopy(text, done);
-  }
-};
-const fallbackCopy = (text, done) => {
-  const area = document.createElement('textarea');
-  area.value = text;
-  area.setAttribute('readonly', '');
-  area.style.cssText = 'position:fixed;opacity:0';
-  document.body.appendChild(area);
-  area.select();
-  try { document.execCommand('copy'); done(); }
-  catch { toast('Press ⌘C to copy'); }
-  area.remove();
-};
-
-// Any element carrying data-copy copies it, so a new copy button needs no wiring.
-document.addEventListener('click', (event) => {
-  const target = event.target.closest('[data-copy]');
-  if (target) copy(target.dataset.copy, target.dataset.copyMsg);
-});
-
-// --------------------------------------------------------------- dialogs --
-// Revoking cuts a device off. The design makes that a decision rather than a
-// twitch, so it goes through a dialog with the name of what is about to break.
-const confirmDialog = ({title, body, confirmLabel, onConfirm}) => {
-  const backdrop = document.createElement('div');
-  backdrop.className = 'tc-backdrop';
-  backdrop.innerHTML =
-    '<div class="tc-dialog" role="dialog" aria-modal="true" aria-label="' + esc(title) + '">'
-    + '<h3>' + esc(title) + '</h3><p>' + body + '</p>'
-    + '<div class="tc-dialog-foot">'
-    + '<button type="button" class="tc-btn tc-btn--ghost" data-close>Cancel</button>'
-    + '<button type="button" class="tc-btn tc-btn--danger-solid" data-go>'
-    + esc(confirmLabel) + '</button></div></div>';
-  document.body.appendChild(backdrop);
-
-  const close = () => { backdrop.remove(); document.removeEventListener('keydown', onKey); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
-  document.addEventListener('keydown', onKey);
-  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) close(); });
-  backdrop.querySelector('[data-close]').onclick = close;
-  backdrop.querySelector('[data-go]').onclick = () => { close(); onConfirm(); };
-  backdrop.querySelector('[data-go]').focus();
-};
-
-// ---------------------------------------------------------------- format --
-const when = (v) => {
-  if (!v) return '—';
-  const d = new Date(v);
-  return isNaN(d) ? '—' : d.toLocaleString(undefined, {dateStyle: 'medium', timeStyle: 'short'});
-};
-// "in 29 days" is what you want to know about a device; the exact stamp stays
-// on hover for when you need it.
-const ago = (v) => {
-  const d = new Date(v);
-  if (!v || isNaN(d)) return '—';
-  const secs = Math.round((Date.now() - d.getTime()) / 1000);
-  const past = secs >= 0, n = Math.abs(secs);
-  const [amount, unit] = n < 60 ? [n, 'second'] : n < 3600 ? [Math.round(n / 60), 'minute']
-    : n < 86400 ? [Math.round(n / 3600), 'hour'] : [Math.round(n / 86400), 'day'];
-  return new Intl.RelativeTimeFormat(undefined, {numeric: 'auto'})
-    .format(past ? -amount : amount, unit);
-};
-// Two letters that tell the five apart: word initials where there are words,
-// and camel-case counts as words - OpenCode reads OC, not OP.
-const initials = (name) => {
-  const parts = String(name).trim().split(/\s+/)
-    .flatMap((w) => w.split(/(?=[A-Z])/).filter(Boolean));
-  return (parts.length > 1 ? parts[0][0] + parts[1][0] : String(name).slice(0, 2)).toUpperCase();
-};
-
-const dot = '<span class="tc-dot"></span>';
-const chip = (kind, text) =>
-  '<span class="tc-chip tc-chip--' + kind + '">'
-  + (kind === 'idle' ? '' : dot) + esc(text) + '</span>';
-
-const COPY_ICON = '<svg viewBox="0 0 24 24" width="12" height="12" fill="none"'
-  + ' stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">'
-  + '<rect x="9" y="9" width="12" height="12" rx="2.5"/>'
-  + '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-
-// Everything below drives the console; the unlock screen has none of it.
-if ($('mint')) {
-  // Both a sign-in and a key form render into the agent's row, and the periodic
-  // refresh rebuilds that list. It has to leave the row alone while either is
-  // open, or the URL, the QR, the code field - or the key you are halfway
-  // through pasting - vanish under you a few seconds after they appear.
-  let panelActive = null;
-
-  // A minted pairing link, tracked until the device it was made for shows up.
-  // The sessions that existed at mint time are the baseline; a new one is what
-  // proves the scan landed. Held here, not in the DOM, so the periodic refresh
-  // can advance the tracker without repainting the QR panel underneath it.
-  let minted = null;
-  let lastSessions = null;
-
-  // ------------------------------------------------------------ pairing --
-  let ttl = '30d';
-  for (const button of $('ttl').querySelectorAll('button')) {
-    button.onclick = () => {
-      ttl = button.dataset.ttl;
-      for (const other of $('ttl').querySelectorAll('button')) {
-        other.setAttribute('aria-pressed', String(other === button));
-      }
-    };
-  }
-
-  const TICK = '<svg viewBox="0 0 24 24" width="10" height="10" fill="none"'
-    + ' stroke="currentColor" stroke-width="3.4" stroke-linecap="round"'
-    + ' stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>';
-
-  const STEPS = (active) => {
-    const label = ['Link created', 'Device connects', 'Paired'];
-    return '<div class="tc-steps">' + label.map((text, i) => {
-      const cls = i < active ? ' tc-step--done' : i === active ? ' tc-step--active' : '';
-      return (i ? '<span class="tc-step-line"></span>' : '')
-        + '<span class="tc-step' + cls + '"><span class="tc-step-mark">'
-        + (i < active ? TICK : String(i + 1)) + '</span>' + text + '</span>';
-    }).join('') + '</div>';
-  };
-
-  $('mint').onclick = async (event) => {
-    const button = event.currentTarget;
-    button.disabled = true;
-    $('out').innerHTML = '<div class="tc-panel"><span class="tc-skel" style="width:70%"></span></div>';
-    try {
-      const res = await fetch(BASE + '/pair', {
-        method: 'POST', headers: {'content-type': 'application/json'},
-        body: JSON.stringify({ttl, label: $('label').value}),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Could not create a link');
-      // Baseline the session list before the panel goes up. lastSessions is
-      // null only if no status read has finished yet, in which case the next
-      // load captures the baseline instead.
-      minted = {
-        id: data.id,
-        expiresAt: data.expiresAt,
-        baseline: lastSessions ? new Set(lastSessions) : null,
-        paired: false,
-        seen: false,
-      };
-      $('out').innerHTML =
-        // The tracker spans the panel rather than sharing a column with the QR:
-        // beside a 168px code it never had the width to stay on one line, and a
-        // connector that spans a line break points at nothing.
-        '<div class="tc-panel">' + STEPS(1)
-        + '<div class="tc-split"><div class="tc-stack">'
-        + '<p class="tc-hint">Single use · expires ' + esc(when(data.expiresAt))
-        + '. The token lives in the link fragment — treat it as a credential.</p>'
-        + '<div class="tc-copyrow">'
-        + '<div class="tc-linkbox">' + esc(data.pairUrl) + '</div>'
-        + '<button type="button" class="tc-btn tc-btn--outline" data-copy="'
-        + esc(data.pairUrl) + '" data-copy-msg="Pairing link copied">Copy</button>'
-        + '<a class="tc-btn tc-btn--outline" href="' + esc(data.pairUrl)
-        + '" target="_blank" rel="noopener">Open</a>'
-        + '</div>'
-        // Desktop clients that add a remote environment ask for the server URL
-        // and the code as separate fields, so the token is offered on its own
-        // rather than only inside the link fragment.
-        + (data.credential
-          ? '<div class="tc-field"><label class="tc-label">Pair code</label>'
-            + '<div class="tc-copyrow">'
-            + '<div class="tc-linkbox">' + esc(data.credential) + '</div>'
-            + '<button type="button" class="tc-btn tc-btn--outline" data-copy="'
-            + esc(data.credential) + '" data-copy-msg="Pair code copied">Copy</button>'
-            + '</div>'
-            + '<span class="tc-hint">For clients that ask for a server URL and a code '
-            + 'separately. The server URL is the public URL above.</span></div>'
-          : '')
-        + '</div>'
-        + (data.qr ? '<div class="tc-qr">' + data.qr + '</div>' : '')
-        + '</div></div>';
-      $('label').value = '';
-      load();
     } catch (error) {
-      $('out').innerHTML = '<div class="tc-notice tc-notice--err">' + esc(error.message) + '</div>';
+      return { ok: false, status: 0, data: {}, error: 'Could not reach the setup service (' + (error.message || error) + ')' };
     }
-    button.disabled = false;
+    // The key changed (a recreated container generates a new one) or the
+    // cookie expired. The page itself asks for the key again.
+    if (res.status === 401 && !locked) {
+      locked = true;
+      location.replace(BASE + '/' + location.hash);
+    }
+    const data = await res.json().catch(() => ({}));
+    const ok = res.ok && data.ok !== false;
+    return { ok, status: res.status, data, error: ok ? null : (data.error || 'HTTP ' + res.status) };
   };
 
-  // ------------------------------------------------------------- strip --
-  const readout = (label, value) =>
-    '<div class="tc-readout"><span class="tc-readout-label">' + label
-    + '</span><span class="tc-readout-value">' + value + '</span></div>';
-
-  const renderStrip = (s) => {
-    const build = s.image && s.image.version
-      ? s.image.version + (s.image.variant ? ' · ' + s.image.variant : '')
-      : 'unversioned';
-    $('strip').innerHTML =
-      readout('Server', s.server.ok
-        ? '<span class="tc-dot tc-dot--live" style="color:var(--ok-fg)"></span>Running '
-          + esc(s.server.version)
-        : '<span class="tc-dot" style="background:var(--err-fg)"></span>' + esc(s.server.detail))
-      + readout('Image', '<span class="tc-mono">' + esc(build) + '</span>')
-      + readout('Public URL', s.publicUrl
-        ? '<a class="tc-mono tc-truncate tc-urllink" style="max-width:210px" href="'
-          + esc(s.publicUrl) + '" target="_blank" rel="noopener">' + esc(s.publicUrl)
-          + '</a><button type="button" class="tc-iconbtn" style="width:22px;height:22px"'
-          + ' data-copy="' + esc(s.publicUrl) + '" data-copy-msg="Public URL copied"'
-          + ' aria-label="Copy public URL">' + COPY_ICON + '</button>'
-        : '<span class="tc-chip tc-chip--warn" style="height:auto;padding:1px 8px">Not set</span>')
-      + readout('Devices', '<span class="tc-mono">' + s.sessions.length + '</span> paired');
+  // ---------------------------------------------------------------- state --
+  const state = {
+    status: null,
+    statusError: null,
+    ports: null,
+    portsAt: 0,
+    providers: null,
+    route: 'overview',
+    agentFilter: 'all',
+  };
+  // What the page knows that /status cannot: see the header comment.
+  const versionDrafts = new Map();   // agent id -> version typed in the dialog
+  const lifecycleBusy = new Map();   // "harness:claude" -> kind, while the POST is in flight
+  const pendingOps = new Map();      // accepted (202), waiting on /status for the end
+  const notices = new Map();         // the last error or warning per row: {tone, text}
+  const portsBusy = new Set();       // ports with a publish request in flight
+  const expandedPorts = new Set();   // published ports showing their QR
+  const ui = {
+    busy: lifecycleBusy,
+    pending: pendingOps,
+    notices,
+    portsBusy,
+    expandedPorts,
+    providerNames: [],
+    signingIn: null,
   };
 
-  const renderDetails = (s) => {
-    const item = (label, value) =>
-      '<div class="tc-details-item"><span class="tc-details-label">' + label
-      + '</span><span class="tc-details-value">' + value + '</span></div>';
-    $('details').innerHTML =
-      item('State volume', '<span class="tc-mono">' + esc(s.paths?.volume || '—') + '</span>')
-      + item('Workspace', '<span class="tc-mono">' + esc(s.paths?.workspace || '—') + '</span>')
-      + item('Pair TTL', '<span class="tc-mono">' + esc(s.paths?.pairTtl || '30d')
-        + '</span> default')
-      + item('Agent credentials', '<span class="tc-mono">'
-        + esc(s.paths?.agents || '—') + '</span>')
-      + (s.publicUrl ? '' : item('Pairing',
-          '<span style="color:var(--warn-fg)">Without T3_PUBLIC_URL, links point at this '
-          + "container's own address and no device can reach them</span>"));
+  const harness = (id) => ((state.status && state.status.harnesses) || []).find((h) => h.id === id) || null;
+  const toolchain = (id) => ((state.status && state.status.toolchains) || []).find((t) => t.id === id) || null;
+  const nameOf = (target, id) => target === 'harness'
+    ? (M.AGENTS[id] || {}).name || (harness(id) || {}).name || id
+    : (M.TOOLCHAINS[id] || {}).name || (toolchain(id) || {}).name || id;
+
+  /** Where "Open T3 Code" goes: the public URL, else T3 Code beside this page. */
+  const t3Url = () => {
+    const s = state.status;
+    if (s && s.publicUrl) return s.publicUrl;
+    if (BASE) return '/';
+    const port = (s && s.t3 && s.t3.port) || 3773;
+    return location.protocol + '//' + location.hostname + ':' + port + '/';
   };
 
-  // ------------------------------------------------------------ agents --
-  // The Agents and Toolchains cards are thin surfaces over the shared harness
-  // manager (via /status): exact versions, runnable state, the operation in
-  // flight, and how the last one ended. Lifecycle POSTs answer as soon as the
-  // work holds the lock and finish in the background, so a click is tracked
-  // here by key ("harness:claude", "toolchain:rust") until /status says how
-  // it ended.
-  const versionDrafts = new Map();
-  const lifecycleBusy = new Set();   // POST in flight
-  const pendingOps = new Map();      // accepted (202), waiting on /status
-  const notices = new Map();         // last error or warning per key: {text, tone}
-  let lastStatus = null;             // the last /status, to redraw a row at once
-  const DONE = { install: 'Installed', update: 'Updated', uninstall: 'Uninstalled' };
-  const WORKING = { install: 'Installing…', update: 'Updating…', uninstall: 'Removing…' };
+  // --------------------------------------------------------------- polling --
+  const POLL_MS = 15000;
+  const FAST_MS = 3000;
+  const PORTS_MS = 4000;
+  let statusTimer = null;
+  let portsTimer = null;
+  let statusLoading = null;
+  let portsLoading = null;
 
-  const setupItem = (s, kind, id) =>
-    ((s.setup && s.setup.items) || []).find((i) => i.kind === kind && i.id === id) || null;
-  const queued = (s, kind, id) => {
-    const item = setupItem(s, kind, id);
-    return Boolean(s.setup && s.setup.state === 'running' && item && item.state === 'pending');
-  };
-  const runningOp = (s, key) => {
-    const op = (s.operations || {})[key];
-    return op && op.state === 'running' ? op.kind : null;
-  };
-  const isBusy = (s, key, facts) =>
-    lifecycleBusy.has(key) || pendingOps.has(key) || Boolean(runningOp(s, key)) || Boolean(facts.inProgress);
+  const busyNow = (s) => Boolean(s && (
+    (s.setup && s.setup.state === 'running')
+    || pendingOps.size > 0
+    || Object.values(s.operations || {}).some((op) => op.state === 'running' || op.state === 'queued')
+    || (s.harnesses || []).some((h) => h.inProgress)
+    || (s.toolchains || []).some((t) => t.inProgress)));
 
-  // A click accepted earlier has finished: say how, once.
-  const factsFor = (s, key) => {
-    const [target, id] = key.split(':');
-    const list = target === 'harness' ? s.harnesses : (s.toolchains || []);
-    return list.find((x) => x.id === id) || {};
+  const loadStatus = () => {
+    if (statusLoading) return statusLoading;
+    statusLoading = (async () => {
+      const res = await api('/status');
+      if (res.ok) {
+        state.status = res.data;
+        state.statusError = null;
+        settleOperations(res.data);
+        trackPairing(res.data);
+        loadProvidersOnce();
+      } else if (!locked) {
+        // Name the URL and the reason. "Could not read status" sent someone
+        // hunting a migration bug when the page was calling the wrong path.
+        state.statusError = res.error;
+      }
+      render();
+      clearTimeout(statusTimer);
+      if (!document.hidden && !locked) statusTimer = setTimeout(loadStatus, busyNow(state.status) ? FAST_MS : POLL_MS);
+    })().finally(() => { statusLoading = null; });
+    return statusLoading;
   };
+
+  // Polled separately and more often: a tunnel takes a few seconds to be
+  // handed a hostname, and a port appearing moments after a dev server starts
+  // is the whole point. This is the same /ports API t3-expose calls, so
+  // publishing from a terminal shows up here without anything telling the page.
+  const loadPorts = () => {
+    if (portsLoading) return portsLoading;
+    portsLoading = (async () => {
+      const res = await api('/ports');
+      if (res.ok) { state.ports = res.data; state.portsAt = now(); }
+      render();
+      clearTimeout(portsTimer);
+      if (!document.hidden && !locked) portsTimer = setTimeout(loadPorts, PORTS_MS);
+    })().finally(() => { portsLoading = null; });
+    return portsLoading;
+  };
+
+  // A hidden tab polls nothing; coming back catches up at once.
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) { clearTimeout(statusTimer); clearTimeout(portsTimer); return; }
+    loadStatus();
+    loadPorts();
+  });
+
+  // OpenCode's row names its provider keys, and the key sheet lists them.
+  let providersAsked = false;
+  const loadProviders = async () => {
+    const res = await api('/providers');
+    if (res.ok) {
+      state.providers = res.data;
+      const names = new Map((res.data.providers || []).map((p) => [p.id, p.name]));
+      ui.providerNames = (res.data.configured || []).map((id) => names.get(id) || id);
+    }
+    return state.providers;
+  };
+  const loadProvidersOnce = () => {
+    if (providersAsked) return;
+    const oc = harness('opencode');
+    if (!oc || !oc.installed) return;
+    providersAsked = true;
+    loadProviders().then(render);
+  };
+
+  // ------------------------------------------------------------ operations --
+  /** A click accepted earlier has finished: say how, once. */
   const settleOperations = (s) => {
     for (const [key, pending] of pendingOps) {
       const op = (s.operations || {})[key];
+      const [target, id] = key.split(':');
       if (!op) {
         // The setup service restarted and forgot it. Once nothing is running
         // for this row any more, stop waiting: the row shows where it ended.
-        if (Date.now() - pending.at > 10000 && !factsFor(s, key).inProgress) {
+        const facts = target === 'harness' ? harness(id) : toolchain(id);
+        if (now() - pending.at > 10000 && !(facts && facts.inProgress)) {
           pendingOps.delete(key);
-          notices.set(key, { tone: 'warn', text: 'The setup service restarted during this '
-            + pending.kind + '; the row shows where it ended up.' });
+          notices.set(key, { tone: 'warn', text: 'The setup service restarted during this ' + pending.kind + '; the row shows where it ended up.' });
         }
         continue;
       }
-      if (op.state === 'running') continue;
+      if (op.state === 'running' || op.state === 'queued') continue;
       pendingOps.delete(key);
       if (op.state === 'ok') {
         if (op.warning) notices.set(key, { tone: 'warn', text: op.warning });
         else notices.delete(key);
-        toast(DONE[op.kind] + ' ' + pending.name, CHECK);
+        Kit.toast(M.DONE[op.kind] + ' ' + pending.name);
+      } else if (op.state === 'cancelled') {
+        notices.delete(key);
+        Kit.toast('Cancelled: ' + pending.kind + ' ' + pending.name, { tone: 'info' });
       } else {
-        notices.set(key, { tone: 'err', text: op.error || ('Could not ' + op.kind + ' ' + pending.name) });
+        const text = op.error || 'Could not ' + op.kind + ' ' + pending.name;
+        notices.set(key, { tone: 'danger', text });
+        const route = target === 'harness' ? 'agents' : 'toolchains';
+        Kit.toast(M.FAILED[op.kind] + ': ' + pending.name, {
+          tone: 'danger',
+          detail: text,
+          action: state.route === route ? null : { label: 'View', run: () => go(route) },
+        });
       }
     }
   };
-  const noticeLine = (key) => {
-    const notice = notices.get(key);
-    return notice
-      ? '<span style="color:var(--' + (notice.tone === 'warn' ? 'warn' : 'err') + '-fg)">'
-        + esc(notice.text) + '</span>'
-      : '';
-  };
-  // Show the click as taken straight away, without waiting on /status.
-  const redrawRows = () => {
-    if (!lastStatus) return;
-    renderToolchains(lastStatus);
-    if (!panelActive) renderAgents(lastStatus);
-  };
 
-  const callLifecycle = async (target, kind, id, name) => {
+  /**
+   * Install, update or uninstall. The POST answers 202 as soon as the work
+   * holds the lock (or is queued behind other work); /status says how it ends.
+   */
+  const callLifecycle = async (target, kind, id, version) => {
     const key = target + ':' + id;
-    const version = target === 'harness' ? (versionDrafts.get(id) ?? '').trim() : '';
+    const name = nameOf(target, id);
     notices.delete(key);
-    lifecycleBusy.add(key);
-    redrawRows();
-    try {
-      const res = await fetch(BASE + '/' + (target === 'harness' ? 'harnesses' : 'toolchains') + '/' + kind, {
-        method: 'POST', headers: {'content-type': 'application/json'},
-        body: JSON.stringify(version ? {id, version} : {id}),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (res.status === 202) {
-        pendingOps.set(key, { kind, name, at: Date.now() });
-        versionDrafts.delete(id);
-      } else if (!res.ok || data.ok === false) {
-        notices.set(key, { tone: 'err', text: data.error || ('Could not ' + kind + ' ' + name) });
-      } else {
-        versionDrafts.delete(id);
-        toast(DONE[kind] + ' ' + name, CHECK);
-      }
-    } catch (error) {
-      notices.set(key, { tone: 'err', text: String(error.message || error) });
-    } finally {
-      lifecycleBusy.delete(key);
-    }
-    load();
-  };
-
-  const confirmUninstall = (target, id, name) => confirmDialog({
-    title: 'Uninstall ' + name + '?',
-    body: target === 'harness'
-      ? 'The managed executable is removed. Credentials stay, so installing it again signs straight back in.'
-      : 'It is removed from the volume. A project that pins its own version still gets it from mise.',
-    confirmLabel: 'Uninstall',
-    onConfirm: () => callLifecycle(target, 'uninstall', id, name),
-  });
-
-  const agentChip = (s, h) => {
-    const key = 'harness:' + h.id;
-    const op = runningOp(s, key) || (pendingOps.get(key) || {}).kind || (h.inProgress ? h.operation : null);
-    if (op || lifecycleBusy.has(key)) return chip('info', WORKING[op] || 'Working…');
-    if (queued(s, 'agent', h.id)) return chip('idle', 'Queued');
-    if (!h.supported) return chip('idle', 'No build for this arch');
-    if (!h.installed) return h.failed ? chip('bad', 'Install failed') : chip('idle', 'Not installed');
-    if (h.runnable && h.signedIn === true) return chip('ok', 'Signed in');
-    if (h.runnable && h.signedIn === false) return chip('warn', 'Not signed in');
-    if (h.runnable) return chip('idle', 'Installed');
-    return chip('bad', 'Not runnable');
-  };
-
-  const failureLine = (facts) => {
-    if (!facts.failed || !facts.failure) return '';
-    // A failed update leaves the previous release in place; say which happened.
-    const text = facts.installed && facts.operation && facts.operation !== 'install'
-      ? 'Last ' + facts.operation + ' failed: ' + facts.failure
-      : facts.failure;
-    return '<span style="color:var(--err-fg)">' + esc(text.slice(0, 220)) + '</span>';
-  };
-
-  const agentMeta = (h) => {
-    const lines = [];
-    if (h.version) lines.push('<span class="tc-mono">' + esc(h.version) + '</span>');
-    const failure = failureLine(h);
-    if (failure) lines.push(failure);
-    const notice = noticeLine('harness:' + h.id);
-    if (notice) lines.push(notice);
-    // How each one authenticates, so a button press holds no surprises.
-    const how = h.canSignIn && h.canSetKey ? 'Browser sign-in, or a stored API key'
-      : h.canSignIn ? 'Browser sign-in'
-      : h.canSetKey ? 'API key, per provider' : '';
-    if (how && h.runnable) lines.push(esc(how));
-    return lines.length
-      ? '<div class="tc-row-meta">' + lines.join('<br>') + '</div>' : '';
-  };
-
-  const renderAgents = (s) => {
-    settleOperations(s);
-    const signed = s.harnesses.filter((h) => h.signedIn === true).length;
-    $('agent-count').textContent = signed + ' of ' + s.harnesses.length + ' signed in';
-    // Preserve version drafts across the periodic re-render: without this the
-    // poll wipes an explicit version mid-typing.
-    for (const input of document.querySelectorAll('.hv-version')) {
-      if (input.dataset.agent) versionDrafts.set(input.dataset.agent, input.value);
-    }
-    $('agents').innerHTML = s.harnesses.map((h) => {
-      const busy = isBusy(s, 'harness:' + h.id, h) || queued(s, 'agent', h.id);
-      const draft = versionDrafts.get(h.id) ?? '';
-      const versionInput = '<input class="tc-input tc-input--mono tc-input--sm hv-version"'
-        + ' data-agent="' + h.id + '" placeholder="latest" aria-label="Version for ' + esc(h.name) + '"'
-        + ' value="' + esc(draft) + '" style="width:7.5rem" />';
-      let lifecycle = '';
-      if (busy) {
-        lifecycle = '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm" disabled'
-          + ' aria-label="Working"><span class="tc-spin"></span></button>';
-      } else if (!h.installed) {
-        lifecycle = versionInput
-          + '<button type="button" class="tc-btn tc-btn--primary tc-btn--sm h-install"'
-          + ' data-agent="' + h.id + '">' + (h.failed ? 'Retry' : 'Install') + '</button>';
-      } else {
-        lifecycle = versionInput
-          + '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm h-update"'
-          + ' data-agent="' + h.id + '">Update</button>'
-          + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm h-uninstall"'
-          + ' data-agent="' + h.id + '">Uninstall</button>';
-      }
-      const signin = h.runnable && !busy
-        ? (h.canSignIn
-            ? '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm signin"'
-              + ' data-agent="' + h.id + '">Sign in</button>' : '')
-          + (h.canSetKey
-            ? '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm setkey"'
-              + ' data-agent="' + h.id + '" data-kind="' + esc(h.keyKind) + '">API key</button>' : '')
-        : '';
-      return '<div class="tc-row">'
-        + '<span class="tc-tile' + (h.signedIn === true ? ' tc-tile--signed' : '')
-        + '" style="--tile:var(--id-' + h.id + ')" aria-hidden="true">'
-        + esc(initials(h.name)) + '</span>'
-        + '<div class="tc-row-main"><div class="tc-row-nameline">'
-        + '<span class="tc-row-name">' + esc(h.name) + '</span>' + agentChip(s, h) + '</div>'
-        + agentMeta(h) + '</div>'
-        + '<div class="tc-row-actions tc-row-actions--wrap">' + lifecycle + signin + '</div>'
-        + '<div class="tc-row-panel" id="agent-' + h.id + '"></div></div>';
-    }).join('');
-
-    const nameOf = (id) => (s.harnesses.find((h) => h.id === id) || {}).name || id;
-    for (const input of document.querySelectorAll('.hv-version')) {
-      input.oninput = () => versionDrafts.set(input.dataset.agent, input.value);
-      input.onkeydown = (e) => { if (e.key === 'Enter') e.preventDefault(); };
-    }
-    for (const b of document.querySelectorAll('.h-install')) {
-      b.onclick = () => callLifecycle('harness', 'install', b.dataset.agent, nameOf(b.dataset.agent));
-    }
-    for (const b of document.querySelectorAll('.h-update')) {
-      b.onclick = () => callLifecycle('harness', 'update', b.dataset.agent, nameOf(b.dataset.agent));
-    }
-    for (const b of document.querySelectorAll('.h-uninstall')) {
-      b.onclick = () => confirmUninstall('harness', b.dataset.agent, nameOf(b.dataset.agent));
-    }
-  };
-
-  // -------------------------------------------------------- toolchains --
-  const renderToolchains = (s) => {
-    settleOperations(s);
-    const list = s.toolchains || [];
-    const installed = list.filter((t) => t.installed).length;
-    $('toolchain-count').textContent = list.length ? installed + ' of ' + list.length + ' installed' : '';
-    if (!list.length) {
-      $('toolchains').innerHTML = '<div class="tc-row"><div class="tc-row-meta">'
-        + 'Toolchain state is not readable right now.</div></div>';
-      return;
-    }
-    $('toolchains').innerHTML = list.map((t) => {
-      const key = 'toolchain:' + t.id;
-      const op = runningOp(s, key) || (pendingOps.get(key) || {}).kind || (t.inProgress ? t.operation : null);
-      const waiting = queued(s, 'toolchain', t.id);
-      const busy = isBusy(s, key, t) || waiting;
-      const state = op || lifecycleBusy.has(key) ? chip('info', WORKING[op] || 'Working…')
-        : waiting ? chip('idle', 'Queued')
-        : t.installed ? chip('ok', 'Installed')
-        : t.failed ? chip('bad', 'Install failed') : chip('idle', 'Not installed');
-      const lines = [];
-      if (t.version) lines.push('<span class="tc-mono">' + esc(t.version) + '</span>');
-      const failure = failureLine(t);
-      if (failure) lines.push(failure);
-      const notice = noticeLine(key);
-      if (notice) lines.push(notice);
-      const actions = busy
-        ? '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm" disabled'
-          + ' aria-label="Working"><span class="tc-spin"></span></button>'
-        : t.installed
-          ? '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm t-update" data-tool="'
-            + t.id + '">Update</button>'
-            + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm t-uninstall" data-tool="'
-            + t.id + '">Uninstall</button>'
-          : '<button type="button" class="tc-btn tc-btn--primary tc-btn--sm t-install" data-tool="'
-            + t.id + '">' + (t.failed ? 'Retry' : 'Install') + '</button>';
-      return '<div class="tc-row">'
-        + '<span class="tc-tile" style="--tile:var(--id-toolchain)" aria-hidden="true">'
-        + esc(initials(t.name)) + '</span>'
-        + '<div class="tc-row-main"><div class="tc-row-nameline">'
-        + '<span class="tc-row-name">' + esc(t.name) + '</span>' + state + '</div>'
-        + (lines.length ? '<div class="tc-row-meta">' + lines.join('<br>') + '</div>' : '')
-        + '</div><div class="tc-row-actions tc-row-actions--wrap">' + actions + '</div></div>';
-    }).join('');
-
-    const nameOf = (id) => (list.find((t) => t.id === id) || {}).name || id;
-    for (const b of document.querySelectorAll('.t-install')) {
-      b.onclick = () => callLifecycle('toolchain', 'install', b.dataset.tool, nameOf(b.dataset.tool));
-    }
-    for (const b of document.querySelectorAll('.t-update')) {
-      b.onclick = () => callLifecycle('toolchain', 'update', b.dataset.tool, nameOf(b.dataset.tool));
-    }
-    for (const b of document.querySelectorAll('.t-uninstall')) {
-      b.onclick = () => confirmUninstall('toolchain', b.dataset.tool, nameOf(b.dataset.tool));
-    }
-  };
-
-  // ------------------------------------------------------------- setup --
-  // The first start installs everything T3_PREINSTALL names in the
-  // background. Say so at the top of the page while it runs, and afterwards
-  // only if something failed.
-  const renderSetup = (s) => {
-    const el = $('setup-progress');
-    if (!el) return;
-    const setup = s.setup;
-    const items = (setup && setup.items) || [];
-    if (!items.length) { el.innerHTML = ''; return; }
-    const done = items.filter((i) => i.state === 'done').length;
-    // After a finished run, anything still pending was not tried: the run
-    // stops after three failures in a row, which is nearly always no network.
-    const failed = items.filter((i) => i.state === 'failed'
-      || (setup.state === 'finished' && i.state === 'pending'));
-    if (setup.state === 'running') {
-      const current = items.find((i) => i.state === 'installing');
-      el.innerHTML = '<div class="tc-notice tc-notice--info"><span class="tc-spin" aria-hidden="true"></span>'
-        + '<div><strong>Setting up this container</strong> &mdash; '
-        + (current ? 'installing ' + esc(current.name) : 'checking what is already here')
-        + ' (' + done + ' of ' + items.length + ' done). Agents and toolchains install once,'
-        + ' onto the volume, and each one is ready below as soon as it finishes.</div></div>';
-    } else if (failed.length) {
-      el.innerHTML = '<div class="tc-notice tc-notice--warn"><div>Could not install '
-        + esc(failed.map((i) => i.name).join(', ')) + ' on first start'
-        + (failed[0].error ? ' (' + esc(failed[0].error.slice(0, 140)) + ')' : '')
-        + '. Press Retry on the row to try again now; the next restart retries as well.</div></div>';
-    } else if (setup.state === 'interrupted') {
-      el.innerHTML = '<div class="tc-notice tc-notice--quiet">First-start setup stopped part way'
-        + ' (' + done + ' of ' + items.length + ' done). It carries on the next time the container starts.</div>';
+    lifecycleBusy.set(key, kind);
+    render();
+    const res = await api('/' + (target === 'harness' ? 'harnesses' : 'toolchains') + '/' + kind, { body: version ? { id, version } : { id } });
+    lifecycleBusy.delete(key);
+    if (res.status === 202) {
+      pendingOps.set(key, { kind, name, at: now() });
+      if (target === 'harness') versionDrafts.delete(id);
+    } else if (!res.ok) {
+      notices.set(key, { tone: 'danger', text: res.error || 'Could not ' + kind + ' ' + name });
     } else {
-      el.innerHTML = '';
+      if (target === 'harness') versionDrafts.delete(id);
+      notices.delete(key);
+      Kit.toast(M.DONE[kind] + ' ' + name);
     }
+    render();
+    await loadStatus();
+    return res;
   };
 
-  // ----------------------------------------------------------- sessions --
-  const revokeButton = (kind, id, label) =>
-    '<button type="button" class="tc-btn tc-btn--danger tc-btn--sm revoke" data-kind="'
-    + kind + '" data-id="' + esc(id) + '" data-label="' + esc(label) + '">Revoke</button>';
-
-  const renderSessions = (s) => {
-    const links = s.pairings.length;
-    // Next to the button that makes another one, how many are already unredeemed.
-    $('paircount').textContent = links
-      ? links + (links === 1 ? ' link unused' : ' links unused') : '';
-
-    $('sessioncount').textContent =
-      s.sessions.length + (s.sessions.length === 1 ? ' device' : ' devices')
-      + ' · ' + links + (links === 1 ? ' unused link' : ' unused links');
-
-    $('clients').innerHTML = s.sessions.length
-      ? s.sessions.map((c) => {
-          const name = c.client?.label || c.subject || c.sessionId;
-          return '<div class="tc-row"><div class="tc-row-main"><div class="tc-row-nameline">'
-            + '<span class="tc-row-name">' + esc(name) + '</span>'
-            + (c.connected ? chip('ok', 'Connected') : '') + '</div>'
-            + '<div class="tc-row-meta" title="Expires ' + esc(when(c.expiresAt)) + '">'
-            + (c.connected ? 'Expires ' + esc(ago(c.expiresAt))
-                : 'Last seen ' + esc(ago(c.lastConnectedAt))
-                  + ' · expires ' + esc(ago(c.expiresAt)))
-            + '</div></div><div class="tc-row-actions">'
-            + revokeButton('session', c.sessionId, name) + '</div></div>';
-        }).join('')
-      : '<div class="tc-empty tc-empty--compact">No devices paired yet.<br>'
-        + 'Create a link above to add one.</div>';
-
-    $('links').innerHTML = links
-      ? s.pairings.map((l) => {
-          const name = l.label || 'Unlabelled';
-          return '<div class="tc-row"><div class="tc-row-main">'
-            + '<div class="tc-row-nameline"><span class="tc-row-name">' + esc(name) + '</span></div>'
-            + '<div class="tc-row-meta" title="' + esc(when(l.expiresAt)) + '">Expires '
-            + esc(ago(l.expiresAt)) + '</div></div><div class="tc-row-actions">'
-            + revokeButton('pairing', l.id, name) + '</div></div>';
-        }).join('')
-      : '<div class="tc-empty tc-empty--compact">None outstanding.<br>'
-        + 'Every link created has been redeemed.</div>';
+  const cancelOperation = async (target, id) => {
+    const res = await api('/' + (target === 'harness' ? 'harnesses' : 'toolchains') + '/cancel', { body: { id } });
+    if (!res.ok) Kit.toast('Could not cancel', { tone: 'danger', detail: res.error });
+    await loadStatus();
   };
 
-  // ---------------------------------------------------- pairing progress --
-  // The tracker painted at mint time used to sit on "Device connects" forever,
-  // even after the phone had paired - nothing ever repainted it. Watch the
-  // session list instead, and hand the user onward the moment their device
-  // lands, or tell them when the link they are looking at can no longer work.
-  const renderPairProgress = (s) => {
-    if (!minted || minted.paired) return;
-    if (minted.baseline === null) {
-      minted.baseline = new Set(s.sessions.map((c) => c.sessionId));
-      return;
-    }
+  const confirmUninstall = async (target, id) => {
+    const name = nameOf(target, id);
+    const facts = target === 'harness' ? harness(id) : toolchain(id);
+    const version = facts && (facts.installedVersion || facts.version);
+    const ok = await Kit.confirm(target === 'harness'
+      ? {
+        title: 'Uninstall ' + name + '?',
+        body: 'Removes ' + (version ? 'the ' + version + ' executable' : 'the executable') + ' and its T3 Code wiring. Your sign-in and user data stay on the volume, so installing again signs you straight back in.',
+        consequences: [
+          { icon: 'trash-2', text: 'Removed: the CLI and T3 Code’s provider path' },
+          { icon: 'shield-check', text: 'Kept: credentials, settings, history' },
+          { icon: 'lock', text: 'Stays uninstalled across restarts' },
+        ],
+        confirm: 'Uninstall',
+      }
+      : {
+        title: 'Uninstall ' + name + '?',
+        body: 'Removes ' + name + (version ? ' ' + version : '') + ' from the volume. A project that pins its own version in mise.toml still gets that one from mise.',
+        consequences: [
+          { icon: 'trash-2', text: 'Removed: every release this console installed' },
+          { icon: 'shield-check', text: 'Kept: project pins in mise.toml and .tool-versions' },
+          { icon: 'lock', text: 'Stays uninstalled across restarts' },
+        ],
+        confirm: 'Uninstall',
+      });
+    if (ok) callLifecycle(target, 'uninstall', id);
+  };
 
-    const fresh = s.sessions.find((c) => !minted.baseline.has(c.sessionId));
+  /** "Update all": one request each; the server runs them one after another. */
+  const updateAll = async (target) => {
+    const rows = target === 'harness' ? M.agentRows(state.status, ui, now()) : M.toolchainRows(state.status, ui, now());
+    const due = rows.filter((r) => r.updateAvailable && r.state !== 'running' && r.state !== 'queued');
+    if (!due.length) { Kit.toast('Everything is up to date', { tone: 'info' }); return; }
+    for (const row of due) await callLifecycle(target, 'update', row.id);
+  };
+
+  // ------------------------------------------------------------- markup --
+  const tile = (row, size) => html`<span class="${cx('tc-tile', size && 'tc-tile--' + size, row.dim && 'tc-tile--dim')}" style="--_tile: var(${row.hue})" aria-hidden="true">${row.mono}</span>`;
+  const dot = (tone, extra) => html`<span class="${cx('tc-dot', 'tc-dot--' + tone, extra)}"></span>`;
+  const badge = (b) => b ? html`<span class="${cx('tc-badge', b.tone && 'tc-badge--' + b.tone)}">${b.spinner ? html`<span class="tc-spinner" aria-hidden="true"></span>` : ''}${b.text}</span>` : '';
+  const statusLine = (st, attrs) => html`<span class="tc-status"${attrs || ''}>${st.dot ? dot(st.dot) : ''}<span class="tc-status-text">${st.text}${st.code ? html` <code>${st.code}</code>` : ''}</span></span>`;
+  const noticeLine = (n) => n ? html`<span class="tc-status" role="${n.tone === 'danger' ? 'alert' : 'status'}">${dot(n.tone === 'danger' ? 'danger' : 'warn')}<span class="tc-status-text">${n.text}</span></span>` : '';
+  const versionLabel = (row) => {
+    if (!row.version) return '';
+    if (row.versionTo) return html`<span class="tc-version">${row.version} <span class="tc-version-arrow" aria-label="to">→</span> ${row.versionTo}</span>`;
+    // While work runs the row shows its progress instead.
+    const glyph = row.updateAvailable && row.state !== 'running' && row.state !== 'queued';
+    return html`<span class="tc-version">${row.version}${glyph ? html` <span class="tc-version-next" role="img" aria-label="Update available: ${row.latest}">${icon('circle-arrow-up')}</span>` : ''}</span>`;
+  };
+  const progressBar = (p) => html`<div class="tc-progress"${p && p.pct !== null ? '' : raw(' data-indeterminate')} style="--value: ${p && p.pct !== null ? p.pct : 0}%" role="progressbar" aria-label="Progress"${p && p.pct !== null ? raw(' aria-valuenow="' + p.pct + '" aria-valuemin="0" aria-valuemax="100"') : ''}><span></span></div>`;
+  const phaseText = (p, kind) => {
+    if (p && p.phase) return p.phase[0].toUpperCase() + p.phase.slice(1);
+    return (M.WORKING[kind] || 'Working') + '…';
+  };
+  const opLine = (row) => html`<div class="tc-op tc-row-op"><span class="tc-op-line tc-muted">${phaseText(row.progress, row.kind)}</span><span class="tc-op-pct">${M.progressText(row.progress)}</span>${progressBar(row.progress)}</div>`;
+
+  const btnClass = (variant, size) => cx('tc-btn', size || 'tc-btn--sm', variant && 'tc-btn--' + variant);
+  const actionButton = (row, opts) => {
+    const a = row.action;
+    if (!a) return '';
+    const variant = a.variant === 'primary' && opts.primary === false ? null : a.variant;
+    return html`<button class="${btnClass(variant)}" type="button" data-cmd="${a.cmd}" data-target="${row.target}" data-id="${row.id}" data-key="act-${row.key}">${a.icon ? icon(a.icon) : ''}${a.label}</button>`;
+  };
+  const menuButton = (row) => row.menu.length
+    ? html`<button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" aria-label="More for ${row.name}" aria-haspopup="menu" aria-expanded="${String(Kit.menuOpenFor('menu-' + row.key))}" data-cmd="row.menu" data-target="${row.target}" data-id="${row.id}" data-key="menu-${row.key}">${icon('ellipsis')}</button>`
+    : '';
+
+  /** An agent or toolchain row: tile, name and version, one status line, one verb, a menu. */
+  const resourceRow = (row, opts = {}) => html`
+    <div class="${cx('tc-row', (row.state === 'running' || row.state === 'signing') && 'tc-row--expanded')}" data-key="row-${row.key}">
+      ${tile(row)}
+      <div class="tc-row-main">
+        <div class="tc-row-title"><span class="tc-row-name">${row.name}</span>${versionLabel(row)}${badge(row.badge)}</div>
+        ${statusLine(row.status)}
+        ${noticeLine(row.notice)}
+        ${row.state === 'running' ? opLine(row) : ''}
+      </div>
+      <div class="tc-row-actions">${actionButton(row, opts)}${opts.menu === false ? '' : menuButton(row)}</div>
+    </div>`;
+
+  const section = (id, title, body, { actions, level } = {}) => html`
+    <section class="tc-section" aria-labelledby="${id}">
+      <div class="tc-section-head"><${raw(level || 'h2')} class="tc-section-title" id="${id}">${title}</${raw(level || 'h2')}>${actions ? html`<div class="tc-section-actions">${actions}</div>` : ''}</div>
+      ${body}
+    </section>`;
+  const muted = (text) => html`<span class="tc-small tc-muted">${text}</span>`;
+  const linkButton = (href, label, extra) => html`<a class="tc-btn tc-btn--ghost tc-btn--ghost-muted tc-btn--xs" href="${href}"${extra || ''}>${label}${icon('arrow-right')}</a>`;
+  const notice = (tone, iconName, title, desc, action) => html`
+    <div class="${cx('tc-notice', tone && 'tc-notice--' + tone)}"${tone === 'danger' ? raw(' role="alert"') : ''}>${icon(iconName)}<div class="tc-notice-body">${title ? html`<span class="tc-notice-title">${title}</span>` : ''}${desc ? html`<span class="tc-notice-desc">${desc}</span>` : ''}</div>${action || ''}</div>`;
+  // `size` is a tc-btn size class; '' is the default size, absent is xs.
+  const copyButton = (text, label, opts = {}) => {
+    const size = opts.size === undefined ? 'tc-btn--xs' : opts.size;
+    return opts.iconOnly
+      ? html`<button class="${cx('tc-btn tc-btn--icon', opts.ghost !== false && 'tc-btn--ghost', size)}" type="button" data-cmd="copy" data-text="${text}" aria-label="${label}">${icon('copy')}</button>`
+      : html`<button class="${cx('tc-btn', opts.ghost !== false && 'tc-btn--ghost', size)}" type="button" data-cmd="copy" data-text="${text}">${icon('copy')}<span data-label>${label || 'Copy'}</span></button>`;
+  };
+  const copyField = (value, { code, actions, label } = {}) => html`
+    <div class="${cx('tc-copyfield', code && 'tc-copyfield--code')}"><span class="tc-copyfield-value">${value}</span><span class="tc-copyfield-actions">${actions || copyButton(value, label)}</span></div>`;
+  /**
+   * qrencode's SVG, minus its XML prolog and the root's size in centimetres,
+   * so the stylesheet sizes it. Only the root tag is touched: every module is
+   * a <rect> with a width and height of its own.
+   */
+  const qrSvg = (svg) => {
+    const text = String(svg || '');
+    const at = text.indexOf('<svg');
+    if (at < 0) return '';
+    const tag = text.indexOf('>', at);
+    return raw(text.slice(at, tag).replace(/\s(width|height)="[^"]*"/g, '') + text.slice(tag));
+  };
+  const skeletonGroup = (rows) => html`<div class="tc-group" aria-hidden="true">${Array.from({ length: rows }, (_, i) => html`<div class="tc-skel-row"><span class="tc-skel tc-skel--tile"></span><span class="tc-skel" style="width:${[38, 52, 30, 44][i % 4]}%"></span></div>`)}</div>`;
+
+  // ------------------------------------------------------- page notices --
+  /** What could not be read, or is not current, above the page it affects. */
+  const pageNotices = (route) => {
+    const s = state.status;
+    const out = [];
+    if (state.statusError) {
+      out.push(notice('danger', 'circle-alert', 'Could not read status',
+        html`From <code>${BASE + '/status'}</code>: ${state.statusError}.${BASE ? '' : html` If this page is served under a path prefix, set <code>T3_SETUP_BASE_PATH</code>.`}`,
+        html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="refresh">${icon('refresh-cw')}Retry</button>`));
+    }
+    if (!s) return out;
+    // A part that could not be read says so, instead of rendering as "none".
+    if ((s.degraded || []).length) {
+      out.push(notice('warn', 'triangle-alert', 'Some of this is unreadable right now',
+        'Could not read ' + M.listOf(s.degraded.map((d) => d.what)) + '. Those parts show as empty; the container may still be starting.'));
+    }
+    const setup = s.setup;
+    if (setup && (route === 'overview' || route === 'agents' || route === 'toolchains')) {
+      const items = setup.items || [];
+      // After a finished run, anything still pending was not tried: the run
+      // stops after three failures in a row, which is nearly always no network.
+      const failed = items.filter((i) => i.state === 'failed' || (setup.state === 'finished' && i.state === 'pending'))
+        .filter((i) => {
+          const facts = i.kind === 'agent' ? harness(i.id) : toolchain(i.id);
+          return !(facts && facts.installed);
+        });
+      if (setup.state !== 'running' && failed.length) {
+        out.push(notice('warn', 'triangle-alert', 'First start could not install ' + M.listOf(failed.map((i) => i.name)),
+          (failed[0].error ? failed[0].error.slice(0, 160) + '. ' : '') + 'Press Install on the row to try again now; the next restart retries as well.'));
+      } else if (setup.state === 'interrupted') {
+        const done = items.filter((i) => i.state === 'done').length;
+        out.push(notice(null, 'history', 'First start stopped part way', done + ' of ' + items.length + ' installed. It carries on the next time the container starts.'));
+      }
+    }
+    // The sign-in state below is the last definite answer, not a fresh probe:
+    // offline, the refresh exceeds its budget and warms the next poll instead.
+    const cache = s.harnessCache;
+    if (route === 'agents' && cache && cache.stale && (cache.source === 'cache' || cache.source === 'cheap')) {
+      out.push(notice(null, 'history', null, 'Sign-in state is from the last check while a fresh one finishes. It refreshes on the next poll.'));
+    }
+    return out;
+  };
+
+  // ------------------------------------------------------------- overview --
+  const stepAction = (a, size) => {
+    if (!a) return '';
+    const cls = cx('tc-btn', a.variant === 'primary' && 'tc-btn--primary', size || 'tc-btn--sm');
+    if (a.cmd === 'goto') return html`<a class="${cls}" href="#${a.route}">${a.icon ? icon(a.icon) : ''}${a.label}</a>`;
+    return html`<button class="${cls}" type="button" data-cmd="${a.cmd}"${a.copy ? html` data-text="${a.copy}"` : ''}>${a.icon ? icon(a.icon) : ''}${a.label}</button>`;
+  };
+
+  const readinessGroup = (r) => {
+    const next = r.steps.find((step) => step.state === 'todo');
+    return html`
+      <section class="tc-group tc-group--brand" aria-labelledby="ready-title" data-key="readiness">
+        <div class="tc-ready">
+          <div class="tc-ready-head">
+            <div class="tc-ready-heading"><span class="tc-small tc-muted">Setup · ${r.done} of ${r.total} done</span><h1 class="tc-ready-title" id="ready-title">${r.title}</h1></div>
+            <span class="tc-spacer"></span>
+            <div class="tc-ready-meter" aria-hidden="true">${r.steps.map((step) => html`<span${step.done ? raw(' data-done') : ''}></span>`)}</div>
+          </div>
+          <p class="tc-page-lede">${r.lede}</p>
+          ${next && next.action ? html`<div class="tc-phone-only tc-ready-cta">${stepAction(next.action, 'tc-btn--block')}</div>` : ''}
+        </div>
+        <ol class="tc-checklist">
+          ${r.steps.map((step, i) => html`
+            <li class="${cx('tc-check', step.state === 'todo' && step.action && 'tc-desk-only')}" data-state="${step.state}" data-key="step-${step.id}">
+              <span class="tc-check-mark">${step.done ? icon('check') : String(i + 1)}</span>
+              <span class="tc-check-title">${step.title}</span>
+              ${step.done && step.aside ? html`<span class="tc-check-aside tc-mono tc-muted">${step.aside}</span>` : ''}
+              ${stepAction(step.action)}
+              ${!step.done && step.desc ? html`<span class="tc-check-desc">${step.desc}</span>` : ''}
+            </li>`)}
+        </ol>
+      </section>`;
+  };
+
+  const readyLine = (s) => html`
+    <section class="tc-group tc-group--brand" aria-labelledby="ready-title" data-key="ready">
+      <div class="tc-ready-line">
+        <span class="tc-check-mark" aria-hidden="true">${icon('check')}</span>
+        <div class="tc-row-main"><h1 class="tc-ready-line-title" id="ready-title">Ready</h1><span class="tc-status">${M.readySummary(s, ui)}</span></div>
+        <a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">Open T3 Code${icon('arrow-right')}</a>
+      </div>
+    </section>`;
+
+  const attentionRow = (item) => {
+    if (item.target === 'port') return portRow(item.port);
+    return resourceRow(item, { primary: false, menu: false });
+  };
+
+  const activitySection = (act, n) => {
+    const lines = [];
+    for (const row of act.running) {
+      const p = row.progress;
+      lines.push(html`<div class="tc-op" data-key="op-${row.key}"><span class="tc-op-line">${tile(row)}<span class="tc-truncate">${row.badge.text} ${row.name}${row.versionTo ? ' ' + row.versionTo : ''}</span></span><span class="tc-op-pct">${p && p.pct !== null ? p.pct + '%' : p && p.phase ? p.phase : ''}</span>${progressBar(p)}</div>`);
+    }
+    act.queued.forEach((row, i) => {
+      lines.push(html`<div class="tc-op" data-key="op-${row.key}"><span class="tc-op-line">${tile(row)}<span class="tc-truncate tc-muted">${row.name} · queued</span></span><span class="tc-op-pct">${i === 0 && !act.running.length ? 'next' : i === 0 ? 'next' : 'queued'}</span></div>`);
+    });
+    for (const f of act.finished) {
+      lines.push(html`<div class="tc-op" data-key="op-done-${f.key}"><span class="tc-op-line">${icon(f.ok ? 'circle-check' : 'circle-alert', f.ok ? 'tc-ok' : 'tc-danger')}<span class="tc-truncate">${f.text}</span></span><span class="tc-op-pct" title="${M.absTime(f.at)}">${M.relTime(f.at, n)}</span></div>`);
+    }
+    if (!lines.length) return '';
+    return section('act-title', 'Activity', html`<div class="tc-group"><div class="tc-card-body tc-op-list">${lines}</div></div>`, { actions: muted('Runs in the background') });
+  };
+
+  const glanceSection = (s, ports, n) => {
+    const sessions = s.sessions || [];
+    const lastSeen = sessions.some((c) => c.connected) ? 'active now'
+      : sessions.map((c) => M.toMs(c.lastConnectedAt)).filter(Boolean).sort((a, b) => b - a).map((t) => 'last seen ' + M.relTime(t, n))[0] || 'none connected yet';
+    const agents = M.agentRows(s, ui, n);
+    const installed = agents.filter((a) => a.version);
+    const signed = agents.filter((a) => a.state === 'ok' || a.state === 'update').length;
+    const updates = agents.filter((a) => a.updateAvailable).length;
+    const published = ports ? M.portRows(ports, ui, n).filter((p) => p.state === 'open') : [];
+    const readout = (label, value, sub) => html`<div class="tc-readout"><span class="tc-readout-label">${label}</span><span class="tc-readout-value">${value}</span>${sub ? html`<span class="tc-small tc-muted">${sub}</span>` : ''}</div>`;
+    const paths = s.paths || {};
+    return section('glance-title', 'At a glance', html`<div class="tc-group"><div class="tc-readouts">
+      ${readout('Devices', sessions.length + ' paired', lastSeen)}
+      ${readout('Agents', signed + ' of ' + installed.length + ' signed in', updates ? M.plural(updates, 'update') + ' available' : 'all current')}
+      ${readout('Ports', published.length ? html`${dot('info')}${published.length} published` : 'None published', published.length ? published.map((p) => p.port + (p.startedAt ? ' · ' + M.duration((n - p.startedAt) / 1000) : '')).join(', ') : ports ? M.plural(M.portRows(ports, ui, n).length, 'port') + ' listening' : '')}
+      ${Number.isFinite(paths.volumeBytes) ? readout('Volume', M.formatBytes(paths.volumeBytes), paths.volume) : ''}
+    </div></div>`);
+  };
+
+  const deviceRow = (d, { revoke, fresh } = {}) => html`
+    <div class="tc-row tc-row--compact" data-key="dev-${d.id}">
+      <span class="tc-tile tc-tile--icon" aria-hidden="true">${icon(d.icon)}</span>
+      <div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">${d.name}</span>${fresh ? html`<span class="tc-badge tc-badge--ok">New</span>` : ''}</div><span class="tc-status" title="${d.seenTitle}">${[d.status, d.ends].filter(Boolean).join(' · ')}</span></div>
+      ${revoke ? html`<div class="tc-row-actions"><button class="tc-btn tc-btn--danger tc-btn--sm" type="button" data-cmd="device.revoke" data-id="${d.id}" aria-label="Revoke ${d.name}">Revoke</button></div>`
+        : d.connected ? html`<span class="tc-dot tc-dot--ok" role="img" aria-label="Connected"></span>` : html`<span></span>`}
+    </div>`;
+
+  const recentSection = (s, n) => {
+    const events = s.events || [];
+    if (!events.length) return '';
+    const ICONS = {
+      'device.paired': 'smartphone', 'port.published': 'globe', 'port.stopped': 'circle-stop', 'harness.updated': 'circle-arrow-up',
+      'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'signin.ok': 'log-in', 'setup.finished': 'download',
+      'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
+    };
+    return section('recent-title', 'Recent', html`<div class="tc-group"><ol class="tc-log">${events.slice(0, 8).map((e) => html`
+      <li data-key="ev-${e.at}-${e.kind}">${icon(ICONS[e.kind] || 'activity')}<span class="tc-truncate">${e.text}${e.detail ? html` <span class="tc-mono">${e.detail}</span>` : ''}</span><time datetime="${new Date(e.at).toISOString()}" title="${M.absTime(e.at)}">${M.relTime(e.at, n)}</time></li>`)}</ol></div>`,
+    { actions: muted('Since the setup service started') });
+  };
+
+  const overviewPage = (s, n) => {
+    const r = M.readiness(s, ui);
+    const needs = M.needsYou(s, state.ports, ui);
+    const devices = M.deviceRows(s.sessions, n);
+    return html`
+      ${pageNotices('overview')}
+      ${r.ready ? readyLine(s) : readinessGroup(r)}
+      ${needs.length ? section('needs-title', 'Needs you', html`<div class="tc-group"><div class="tc-list">${needs.map(attentionRow)}</div></div>`,
+        { actions: needs.every((x) => x.target === 'port') ? linkButton('#ports', 'All ports') : linkButton('#agents', 'All agents') }) : ''}
+      ${activitySection(M.activity(s, ui, n), n)}
+      ${r.ready ? html`
+        ${glanceSection(s, state.ports, n)}
+        ${devices.length ? section('devs-title', 'Paired devices', html`<div class="tc-group"><div class="tc-list">${devices.map((d) => deviceRow(d))}</div></div>`, { actions: linkButton('#devices', 'Manage') }) : ''}
+        ${recentSection(s, n)}` : ''}`;
+  };
+
+  // -------------------------------------------------------------- devices --
+  // A minted pairing link, tracked until the device it was made for shows up.
+  // The sessions that existed at mint time are the baseline; a new one is what
+  // proves the scan landed. Held here, not in the DOM, so the poll can advance
+  // the tracker without repainting the QR underneath it.
+  const pair = {
+    ttl: '30d',
+    showForm: true,
+    minting: false,
+    error: null,
+    minted: null,       // {id, pairUrl, credential, expiresAt, qr, label, baseline, seen, outcome, pairedName, pairedId}
+    freshSession: null, // the session that just paired, for its "New" badge
+  };
+  const TTLS = [['1h', '1 hour'], ['7d', '7 days'], ['30d', '30 days']];
+
+  const trackPairing = (s) => {
+    const m = pair.minted;
+    if (!m || m.outcome) return;
+    const sessions = s.sessions || [];
+    if (m.baseline === null) { m.baseline = new Set(sessions.map((c) => c.sessionId)); return; }
+    const fresh = sessions.find((c) => !m.baseline.has(c.sessionId));
     if (fresh) {
-      minted.paired = true;
-      const name = fresh.client?.label || fresh.subject || 'your device';
-      $('out').innerHTML =
-        '<div class="tc-panel">' + STEPS(3)
-        + '<div class="tc-split"><div class="tc-stack">'
-        + '<p class="tc-hint">Paired with <strong>' + esc(name) + '</strong>. '
-        + 'You can close this page - the device is already signed in.</p>'
-        + '<div class="tc-copyrow">'
-        + '<a class="tc-btn tc-btn--primary" href="' + esc(s.publicUrl || '/')
-        + '" target="_blank" rel="noopener">Open T3 Code</a></div>'
-        + '</div></div></div>';
-      toast('Device paired', CHECK);
+      m.outcome = 'paired';
+      m.pairedName = (fresh.client && fresh.client.label) || fresh.subject || 'your device';
+      pair.freshSession = fresh.sessionId;
+      Kit.toast('Paired with ' + m.pairedName, { detail: 'It is already signed in.' });
       return;
     }
-
-    const listed = s.pairings.some((l) => l.id === minted.id);
-    if (listed) minted.seen = true;
-    const expired = minted.expiresAt && Date.parse(minted.expiresAt) < Date.now();
-    if (expired) {
-      minted.paired = true;
-      $('out').innerHTML =
-        '<div class="tc-panel">' + STEPS(1)
-        + '<div class="tc-split"><div class="tc-stack">'
-        + '<p class="tc-hint">This link expired before a device used it. '
-        + 'Create another one to pair.</p>'
-        + '</div></div></div>';
-      return;
-    }
+    const listed = (s.pairings || []).some((l) => l.id === m.id);
+    if (listed) m.seen = true;
+    if (m.expiresAt && Date.parse(m.expiresAt) < now()) { m.outcome = 'expired'; return; }
     // Only call it revoked once the list has shown the link at least once: the
     // status read that follows a mint can land before the pairing is listed.
-    if (minted.seen && !listed) {
-      minted.paired = true;
-      $('out').innerHTML =
-        '<div class="tc-panel">' + STEPS(1)
-        + '<div class="tc-split"><div class="tc-stack">'
-        + '<p class="tc-hint">This link was revoked before a device used it. '
-        + 'Create another one to pair.</p>'
-        + '</div></div></div>';
-    }
+    if (m.seen && !listed) m.outcome = 'revoked';
   };
 
-  // -------------------------------------------------------------- ports --
-  // Polled separately from the rest of the page and on a shorter interval: a
-  // tunnel takes a few seconds to be handed a hostname, and a port appearing
-  // moments after a dev server starts is the whole point. This calls the same
-  // /ports API t3-expose calls, so publishing from a terminal shows up here
-  // without anything having to tell the page about it.
-  const qrOpen = new Set();
-  const portsBusy = new Set();
-
-  const loadPorts = async () => {
-    let data;
-    try { data = await (await fetch(BASE + '/ports')).json(); } catch { return; }
-
-    if (data.available === false) {
-      $('portnote').textContent = 'cloudflared is not in this image';
-      $('ports').innerHTML = '<div class="tc-empty tc-empty--compact">'
-        + 'Publishing is unavailable in this build.</div>';
-      $('portfoot').hidden = true;
+  const mint = async () => {
+    const s = state.status;
+    if (pair.minting) return;
+    if (s && !s.publicUrl) {
+      pair.error = 'Set T3_PUBLIC_URL first: a pairing link points at it, and without it a device has nowhere to go.';
+      render();
       return;
     }
-
-    const tunnels = new Map((data.tunnels || []).map((t) => [t.port, t]));
-    const ports = [...new Set([...(data.listening || []), ...tunnels.keys()])]
-      .sort((a, b) => a - b);
-    const open = [...tunnels.values()].filter((t) => t.state === 'open').length;
-    $('portnote').textContent = open ? open + ' published' : '';
-    $('portfoot').hidden = !open;
-
-    if (!ports.length) {
-      $('ports').innerHTML = '<div class="tc-empty tc-empty--compact">Nothing is listening yet.'
-        + '<br>Start a dev server and it will appear here.</div>';
+    const input = $('pair-label');
+    const label = input ? input.value.trim() : (pair.minted && pair.minted.label) || '';
+    pair.minting = true;
+    pair.error = null;
+    render();
+    const res = await api('/pair', { body: { ttl: pair.ttl, label } });
+    pair.minting = false;
+    if (!res.ok) {
+      pair.error = res.error || 'Could not create a link';
+      pair.showForm = true;
+      render();
       return;
     }
-
-    $('ports').innerHTML = ports.map((port) => {
-      const t = tunnels.get(port);
-      const state = t ? t.state : 'idle';
-      const busy = portsBusy.has(port);
-
-      let chipHtml = '', meta = 'Listening in the container', actions = '', panel = '';
-      if (state === 'open') {
-        chipHtml = chip('info', 'Published');
-        meta = '<span class="tc-mono tc-truncate">' + esc(t.url) + '</span>';
-        actions = '<a class="tc-btn tc-btn--outline tc-btn--sm" href="' + esc(t.url)
-          + '" target="_blank" rel="noopener">Open</a>'
-          + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm portqr"'
-          + ' data-port="' + port + '">QR code</button>'
-          + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm unexpose"'
-          + ' data-port="' + port + '">Stop</button>';
-        if (qrOpen.has(port) && t.qr) {
-          panel = '<div class="tc-row-panel"><div class="tc-panel"><div class="tc-split">'
-            + '<div class="tc-stack"><p class="tc-hint">Scan to open port ' + port
-            + ' on another device.</p><div class="tc-copyrow">'
-            + '<div class="tc-linkbox">' + esc(t.url) + '</div>'
-            + '<button type="button" class="tc-btn tc-btn--outline" data-copy="' + esc(t.url)
-            + '" data-copy-msg="Published URL copied">Copy</button></div></div>'
-            + '<div class="tc-qr">' + t.qr + '</div></div></div></div>';
-        }
-      } else if (state === 'starting' || busy) {
-        chipHtml = chip('idle', 'Publishing');
-        meta = 'Waiting for a public hostname…';
-        actions = '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm" disabled>'
-          + '<span class="tc-spin"></span></button>';
-      } else if (state === 'failed') {
-        chipHtml = chip('bad', 'Failed');
-        meta = '<span style="color:var(--err-fg)">' + esc(t.error || 'the tunnel failed') + '</span>';
-        actions = '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm expose"'
-          + ' data-port="' + port + '">Retry</button>';
-      } else {
-        actions = '<button type="button" class="tc-btn tc-btn--outline tc-btn--sm expose"'
-          + ' data-port="' + port + '">Publish</button>';
-      }
-
-      return '<div class="tc-row">'
-        + '<span class="tc-tile tc-tile--port'
-        + (String(port).length > 4 ? ' tc-tile--port-wide' : '')
-        + '" aria-hidden="true">' + port + '</span>'
-        + '<div class="tc-row-main"><div class="tc-row-nameline">'
-        + '<span class="tc-row-name">Port ' + port + '</span>' + chipHtml + '</div>'
-        + '<div class="tc-row-meta">' + meta + '</div></div>'
-        + '<div class="tc-row-actions">' + actions + '</div>' + panel + '</div>';
-    }).join('');
-
-    for (const b of $('ports').querySelectorAll('.expose')) {
-      b.onclick = async () => {
-        const port = Number(b.dataset.port);
-        portsBusy.add(port);
-        b.disabled = true;
-        try {
-          await fetch(BASE + '/ports/expose', {
-            method: 'POST', headers: {'content-type': 'application/json'},
-            body: JSON.stringify({port}),
-          });
-        } finally { portsBusy.delete(port); }
-        loadPorts();
-      };
-    }
-    for (const b of $('ports').querySelectorAll('.unexpose')) {
-      b.onclick = async () => {
-        const port = Number(b.dataset.port);
-        b.disabled = true;
-        qrOpen.delete(port);
-        await fetch(BASE + '/ports/unexpose', {
-          method: 'POST', headers: {'content-type': 'application/json'},
-          body: JSON.stringify({port}),
-        });
-        loadPorts();
-      };
-    }
-    for (const b of $('ports').querySelectorAll('.portqr')) {
-      b.onclick = () => {
-        const port = Number(b.dataset.port);
-        if (qrOpen.has(port)) qrOpen.delete(port); else qrOpen.add(port);
-        loadPorts();
-      };
-    }
-  };
-
-  // --------------------------------------------------------------- load --
-  let fastPoll = null;
-  const load = async () => {
-    let s;
-    try {
-      const res = await fetch(BASE + '/status');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      s = await res.json();
-      lastStatus = s;
-    } catch (error) {
-      // Name the URL and the reason. "Could not read status" sent someone
-      // hunting a migration bug when the page was calling the wrong path.
-      $('strip').innerHTML = '<div class="tc-notice tc-notice--err">'
-        + 'Could not read status from <span class="tc-mono">' + esc(BASE + '/status')
-        + '</span> &mdash; ' + esc(error.message) + '.'
-        + (BASE ? '' : ' If this page is served under a path prefix, set '
-            + '<span class="tc-mono">T3_SETUP_BASE_PATH</span>.')
-        + '</div>';
-      return;
-    }
-
-    // Baselines for the next mint: what the next new session will be measured
-    // against.
-    lastSessions = s.sessions.map((c) => c.sessionId);
-
-    const build = s.image && s.image.version
-      ? s.image.version + (s.image.variant ? ' · ' + s.image.variant : '')
-      : 'unversioned build';
-    $('build').textContent = build;
-    $('health').innerHTML = s.server.ok
-      ? '<span class="tc-dot tc-dot--live" style="color:var(--ok-fg)"></span>Running '
-        + esc(s.server.version)
-      : '<span class="tc-dot" style="background:var(--err-fg)"></span>Server down';
-
-    // A part that could not be read says so, instead of rendering as "none".
-    // A stale harness answer says so too: the sign-in state below is the last
-    // definite verdict, not a fresh probe (offline the refresh exceeds its
-    // budget and warms the next poll instead). Never render it as current.
-    const note = $('degraded');
-    if (note) {
-      const staleHarness = s.harnessCache && s.harnessCache.stale
-        && (s.harnessCache.source === 'cache' || s.harnessCache.source === 'cheap');
-      note.innerHTML = ((s.degraded || []).length
-        ? '<div class="tc-notice tc-notice--warn">Could not read '
-          + esc(s.degraded.map((d) => d.what).join(', '))
-          + '. Shown below as empty; the container may still be starting.</div>'
-        : '')
-        + (staleHarness
-          ? '<div class="tc-notice tc-notice--quiet">Harness sign-in state is cached'
-            + ' while a fresh probe finishes — it refreshes on the next poll.</div>'
-          : '');
-    }
-
-    renderStrip(s);
-    renderSessions(s);
-    renderPairProgress(s);
-    renderDetails(s);
-    renderSetup(s);
-    renderToolchains(s);
-    if (!panelActive) renderAgents(s);
-
-    // Poll faster while something is installing, so a row flips to Installed
-    // within seconds of finishing rather than on the next 15 s tick.
-    const active = (s.setup && s.setup.state === 'running') || pendingOps.size > 0
-      || s.harnesses.some((h) => h.inProgress) || (s.toolchains || []).some((t) => t.inProgress);
-    clearTimeout(fastPoll);
-    if (active) fastPoll = setTimeout(load, 3000);
-
-    for (const b of document.querySelectorAll('.revoke')) {
-      b.onclick = () => confirmDialog({
-        title: b.dataset.kind === 'session' ? 'Revoke this device?' : 'Revoke this link?',
-        body: b.dataset.kind === 'session'
-          ? '<strong>' + esc(b.dataset.label) + '</strong> loses access immediately and has to '
-            + 'be paired again with a new link.'
-          : '<strong>' + esc(b.dataset.label) + '</strong> has not been redeemed yet. '
-            + 'Revoking it means the link stops working.',
-        confirmLabel: 'Revoke',
-        onConfirm: async () => {
-          b.disabled = true;
-          await fetch(BASE + '/revoke', {
-            method: 'POST', headers: {'content-type': 'application/json'},
-            body: JSON.stringify({kind: b.dataset.kind, id: b.dataset.id}),
-          });
-          toast('Revoked');
-          load();
-        },
-      });
-    }
-
-    if (panelActive) return;
-
-    // The provider list is fetched once and reused: it is the same for every
-    // agent row and does not change while the page is open.
-    let providerList = null;
-    const loadProviders = async () => {
-      if (providerList) return providerList;
-      try { providerList = await (await fetch(BASE + '/providers')).json(); }
-      catch { providerList = {providers: [], configured: []}; }
-      return providerList;
+    // Baseline the session list before the ceremony goes up. Null only if no
+    // status read has finished yet; the next one captures it instead.
+    pair.minted = {
+      id: res.data.id,
+      pairUrl: res.data.pairUrl,
+      credential: res.data.credential || null,
+      expiresAt: res.data.expiresAt,
+      qr: res.data.qr,
+      label,
+      ttl: pair.ttl,
+      baseline: s ? new Set((s.sessions || []).map((c) => c.sessionId)) : null,
+      seen: false,
+      outcome: null,
     };
+    pair.showForm = false;
+    pair.freshSession = null;
+    if (input) input.value = '';
+    render();
+    Kit.announce('Pairing link created. Waiting for the device.');
+    loadStatus();
+  };
 
-    for (const b of document.querySelectorAll('.setkey')) {
-      b.onclick = async () => {
-        const agent = b.dataset.agent;
-        const needsProvider = b.dataset.kind === 'opencode';
-        let providerField = '';
-        if (needsProvider) {
-          b.disabled = true;
-          const {providers, configured} = await loadProviders();
-          b.disabled = false;
-          const done = new Set(configured || []);
-          const opts = (providers || []).map((p) =>
-            '<option value="' + esc(p.id) + '">' + esc(p.name)
-            + (done.has(p.id) ? ' ✓' : '') + '</option>').join('');
-          providerField =
-            '<div class="tc-field"><label class="tc-label">Provider</label>'
-            + '<select class="tc-select pv">'
-            + '<option value="">Choose a provider' + (opts ? '' : ' (catalog unavailable)')
-            + '</option>' + opts + '<option value="__custom">Other — type an id</option></select>'
-            + '<input class="tc-input pv-custom" placeholder="Provider id, e.g. deepseek"'
-            + ' style="display:none;margin-top:8px" /></div>';
-        }
-        panelActive = agent;
-        $('agent-' + agent).innerHTML =
-          '<div class="tc-panel"><div class="tc-stack">' + providerField
-          + '<div class="tc-field"><label class="tc-label">API key</label>'
-          + '<input class="tc-input tc-input--mono kv-key" type="password"'
-          + ' placeholder="Paste the key" />'
-          + '<span class="tc-hint">Written to this container\'s state volume, never sent '
-          + 'anywhere else.</span></div>'
-          + '<div class="tc-cluster">'
-          + '<button type="button" class="tc-btn tc-btn--primary tc-btn--sm save">Save</button>'
-          + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm cancelkey">Cancel</button>'
-          + '</div><div class="out"></div></div></div>';
-        const box = $('agent-' + agent);
-        // Closing is what lets the list start refreshing again, so it needs to
-        // be reachable without saving something.
-        box.querySelector('.cancelkey').onclick = () => {
-          panelActive = null; box.innerHTML = ''; load();
-        };
-        const sel = box.querySelector('.pv');
-        const custom = box.querySelector('.pv-custom');
-        if (sel) sel.onchange = () => {
-          const isCustom = sel.value === '__custom';
-          custom.style.display = isCustom ? '' : 'none';
-          if (isCustom) custom.focus();
-        };
-        box.querySelector('.save').onclick = async (e) => {
-          e.target.disabled = true;
-          const body = {agent, key: box.querySelector('.kv-key').value};
-          if (sel) body.provider = sel.value === '__custom' ? custom.value.trim() : sel.value;
-          const res = await fetch(BASE + '/auth/apikey', {
-            method: 'POST', headers: {'content-type': 'application/json'},
-            body: JSON.stringify(body),
-          });
-          const data = await res.json();
-          box.querySelector('.out').innerHTML = res.ok
-            ? '<div class="tc-notice tc-notice--ok">Saved.</div>'
-            : '<div class="tc-notice tc-notice--err">' + esc(data.error) + '</div>';
-          e.target.disabled = false;
-          // Leave a failed attempt on screen with the key still in it; only a
-          // success closes the form and lets the list resume.
-          if (res.ok) { toast('API key saved', CHECK); panelActive = null; setTimeout(load, 600); }
-        };
-      };
+  const pairSteps = (m) => {
+    const failed = m.outcome === 'expired' || m.outcome === 'revoked';
+    const paired = m.outcome === 'paired';
+    const stepState = [ 'done', failed ? 'failed' : paired ? 'done' : 'active', paired ? 'done' : '' ];
+    const labels = [['Link created', 'Created'], [failed ? (m.outcome === 'expired' ? 'Link expired' : 'Link revoked') : 'Waiting for the device', failed ? (m.outcome === 'expired' ? 'Expired' : 'Revoked') : 'Waiting'], ['Paired', 'Paired']];
+    const parts = [];
+    labels.forEach(([long, short], i) => {
+      if (i) parts.push(html`<span class="tc-step-line"${stepState[i - 1] === 'done' && stepState[i] !== '' ? raw(' data-done') : ''} aria-hidden="true"></span>`);
+      const mark = stepState[i] === 'done' ? icon('check') : stepState[i] === 'failed' ? icon('x') : String(i + 1);
+      parts.push(html`<li class="tc-step"${stepState[i] ? raw(' data-state="' + stepState[i] + '"') : ''}${stepState[i] === 'active' ? raw(' aria-current="step"') : ''}><span class="tc-step-mark">${mark}</span><span class="tc-step-text-long">${long}</span><span class="tc-step-text-short">${short}</span></li>`);
+    });
+    return html`<ol class="tc-steps" aria-label="Pairing progress">${parts}</ol>`;
+  };
+
+  const pairForm = (s) => {
+    const noUrl = s && !s.publicUrl;
+    return html`
+      <div class="tc-group tc-group--brand" data-key="pair-form"><div class="tc-card-body tc-pair-form">
+        <div class="tc-pair-form-intro"><span class="tc-row-name">A single-use link for one device</span><span class="tc-small tc-muted">Scan it with the T3 Code app, open it in a browser, or paste the pair code into the desktop app.</span></div>
+        <div class="tc-pair-form-fields">
+          <div class="tc-field"><label class="tc-label" for="pair-label">Label <span class="tc-label-opt">optional</span></label><input id="pair-label" class="tc-input" placeholder="e.g. iPhone" maxlength="64" autocomplete="off" spellcheck="false"></div>
+          <div class="tc-field"><span class="tc-label" id="ttl-label">Expires in</span><div class="tc-seg" role="group" aria-labelledby="ttl-label">${TTLS.map(([value, label]) => html`<button type="button" aria-pressed="${String(pair.ttl === value)}" data-cmd="pair.ttl" data-value="${value}">${label}</button>`)}</div></div>
+        </div>
+        <button class="tc-btn tc-btn--primary" type="button" data-cmd="pair.start" data-key="pair-create"${pair.minting || noUrl ? raw(' disabled') : ''}>${pair.minting ? html`<span class="tc-spinner" aria-hidden="true"></span>` : icon('link')}Create pairing link<span class="tc-kbd tc-desk-only" aria-hidden="true">P</span></button>
+        ${noUrl ? html`<div class="tc-pair-form-note">${notice('warn', 'triangle-alert', 'Set T3_PUBLIC_URL first', 'A pairing link points at the address in T3_PUBLIC_URL. Set it to the URL your devices use, then recreate the container.')}</div>` : ''}
+        ${pair.error && !noUrl ? html`<p class="tc-hint tc-hint--err tc-pair-form-note" role="alert">${pair.error}</p>` : ''}
+      </div></div>`;
+  };
+
+  const pairCeremony = (m, s, n) => {
+    if (m.outcome === 'paired') {
+      return html`
+        <div class="tc-group tc-group--brand" data-key="pair-done"><div class="tc-card-body tc-pair-done">
+          ${pairSteps(m)}
+          <span class="tc-empty-icon">${icon('smartphone', 'tc-icon--lg')}</span>
+          <div class="tc-pair-done-text"><h3 class="tc-pair-done-title">Paired with ${m.pairedName}</h3><p class="tc-page-lede">It is already signed in. You can close this page.</p></div>
+          <div class="tc-pair-done-actions"><a class="tc-btn tc-btn--primary" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a><button class="tc-btn tc-btn--ghost" type="button" data-cmd="pair.new">Pair another device</button></div>
+        </div></div>`;
     }
+    if (m.outcome) {
+      return html`
+        <div class="tc-group tc-group--brand" data-key="pair-ended"><div class="tc-card-body tc-stack tc-pair-body">
+          ${pairSteps(m)}
+          <p class="tc-page-lede">${m.outcome === 'expired' ? 'This link expired before a device used it.' : 'This link was revoked before a device used it.'} Create another one to pair.</p>
+          <div><button class="tc-btn tc-btn--primary" type="button" data-cmd="pair.again">${icon('link')}Create another link</button></div>
+        </div></div>`;
+    }
+    const code = m.credential;
+    return html`
+      <div class="tc-group tc-group--brand" data-key="pair-live">
+        <div class="tc-card-body tc-stack tc-pair-body">
+          ${pairSteps(m)}
+          <div class="tc-pair">
+            <div class="tc-pair-fields">
+              <div class="tc-field tc-desk-only"><span class="tc-label">Pairing link</span>${copyField(m.pairUrl, { actions: html`${copyButton(m.pairUrl)}<a class="tc-btn tc-btn--ghost tc-btn--xs tc-btn--icon" href="${m.pairUrl}" target="_blank" rel="noopener" aria-label="Open pairing link">${icon('external-link')}</a>` })}</div>
+              ${code ? html`<div class="tc-field"><span class="tc-label">Pair code</span>${copyField(code, { code: code.length <= 14 })}<p class="tc-hint tc-desk-only">For desktop clients that ask for a server URL and a code separately. The server URL is ${s.publicUrl}.</p></div>` : ''}
+              <div class="tc-pair-phone-actions tc-phone-only">${copyButton(m.pairUrl, 'Copy link', { ghost: false, size: '' })}<a class="tc-btn" href="${m.pairUrl}" target="_blank" rel="noopener">${icon('external-link')}Open here</a></div>
+              <div class="tc-notice tc-desk-only">${icon('shield-check')}<div class="tc-notice-body"><span class="tc-notice-desc">The token lives in the link fragment. Treat the link like a password.</span></div></div>
+            </div>
+            ${m.qr ? html`<div class="tc-pair-qr"><div class="tc-qr" role="img" aria-label="QR code for the pairing link" data-keep>${qrSvg(m.qr)}</div><div class="tc-qr-caption">Scan with the T3 Code app</div></div>` : ''}
+          </div>
+        </div>
+        <div class="tc-card-foot" aria-live="polite"><span class="tc-spinner tc-info" aria-hidden="true"></span><span>Listening for the device…<span class="tc-desk-only"> this page updates on its own.</span></span><span class="tc-spacer"></span><button class="tc-btn tc-btn--danger tc-btn--xs" type="button" data-cmd="link.revoke" data-id="${m.id}">Revoke link</button></div>
+      </div>`;
+  };
 
-    for (const b of document.querySelectorAll('.signin')) {
-      b.onclick = async () => {
-        const agent = b.dataset.agent;
-        const agentName = b.closest('.tc-row')?.querySelector('.tc-row-name')?.textContent
-          || 'the agent';
-        b.disabled = true;
-        const box = $('agent-' + agent);
-        // An empty rounded box for the several seconds a CLI takes to produce
-        // a URL reads as a bug. Say what is happening.
-        box.innerHTML = '<div class="tc-panel"><div class="tc-cluster">'
-          + '<span class="tc-spin"></span>'
-          + '<span class="tc-hint">Starting sign-in\u2026 waiting for '
-          + esc(agentName) + ' to return a URL.</span></div></div>';
-        const res = await fetch(BASE + '/auth/signin', {
-          method: 'POST', headers: {'content-type': 'application/json'},
-          body: JSON.stringify({agent}),
-        });
-        const started = await res.json();
-        if (!res.ok) {
-          box.innerHTML = '<div class="tc-notice tc-notice--err">' + esc(started.error) + '</div>';
-          b.disabled = false;
-          return;
-        }
-        panelActive = agent;
-        const finish = (html) => { panelActive = null; box.innerHTML = html; b.disabled = false; };
-        let painted = false;
-        const poll = async () => {
-          const st = await (await fetch(BASE + '/auth/session?id=' + started.id)).json();
-          if (st.state === 'done') {
-            finish('<div class="tc-notice tc-notice--ok">Signed in.</div>');
-            toast('Signed in', CHECK);
-            load();
-            return;
-          }
-          if (st.state === 'failed' || st.state === 'cancelled') {
-            finish('<div class="tc-notice tc-notice--err">'
-              + esc(st.error || 'Sign-in stopped') + '</div>');
-            return;
-          }
-          // Paint once. Re-rendering on every poll would clear the code field
-          // under whoever is pasting into it.
-          if (st.url && !painted) {
-            painted = true;
-            // Two columns: the code you scan on the right, everything you read
-            // or type on the left, so the QR stops pushing the field you
-            // actually need down the page.
-            box.innerHTML =
-              '<div class="tc-panel"><div class="tc-split"><div class="tc-stack">'
-              + '<p class="tc-hint">Open this on any device and approve.</p>'
-              + '<div class="tc-copyrow">'
-              + '<div class="tc-linkbox">' + esc(st.url) + '</div>'
-              + '<button type="button" class="tc-btn tc-btn--outline" data-copy="' + esc(st.url)
-              + '" data-copy-msg="Sign-in URL copied">Copy</button>'
-              + '<a class="tc-btn tc-btn--outline" href="' + esc(st.url)
-              + '" target="_blank" rel="noopener">Open</a></div>'
-              + (st.code ? '<div class="tc-cluster">' + chip('idle', 'Confirm code ' + st.code)
-                 + '</div>' : '')
-              + (st.needsCode
-                 ? '<div class="tc-field"><label class="tc-label">Code from your browser</label>'
-                   + '<div class="tc-copyrow"><input class="tc-input tc-input--mono codein"'
-                   + ' placeholder="Paste the code" />'
-                   + '<button type="button" class="tc-btn tc-btn--primary sendcode">Submit</button>'
-                   + '<button type="button" class="tc-btn tc-btn--ghost cancel">Cancel</button>'
-                   + '</div></div>'
-                 : '<div class="tc-cluster">'
-                   + '<button type="button" class="tc-btn tc-btn--ghost tc-btn--sm cancel">'
-                   + 'Cancel</button></div>')
-              + '</div>'
-              + (st.qr ? '<div class="tc-qr">' + st.qr + '</div>' : '')
-              + '</div></div>';
-            const send = box.querySelector('.sendcode');
-            if (send) send.onclick = async () => {
-              send.disabled = true;
-              send.textContent = 'Submitting';
-              await fetch(BASE + '/auth/code', {
-                method: 'POST', headers: {'content-type': 'application/json'},
-                body: JSON.stringify({id: started.id, code: box.querySelector('.codein').value}),
-              });
-            };
-            box.querySelector('.cancel').onclick = async () => {
-              await fetch(BASE + '/auth/cancel', {
-                method: 'POST', headers: {'content-type': 'application/json'},
-                body: JSON.stringify({id: started.id}),
-              });
-              finish('<div class="tc-notice tc-notice--quiet">Sign-in cancelled.</div>');
-            };
-          }
-          setTimeout(poll, 2000);
-        };
-        poll();
-      };
+  const devicesPage = (s, n) => {
+    const devices = M.deviceRows(s.sessions, n);
+    const m = pair.minted;
+    const waiting = m && !m.outcome ? m.id : null;
+    const links = M.linkRows(s.pairings, waiting, n);
+    const ceremony = m && !pair.showForm;
+    const sub = ceremony && !m.outcome
+      ? (m.label ? '“' + m.label + '” · ' : '') + 'single use · expires ' + M.relTime(m.expiresAt, n)
+      : null;
+    return html`
+      ${pageNotices('devices')}
+      ${section('pair-title', 'Pair a device', ceremony ? pairCeremony(m, s, n) : pairForm(s), { actions: sub ? muted(sub) : null })}
+      ${section('paired-title', 'Paired devices', devices.length
+        ? html`<div class="tc-group"><div class="tc-list">${devices.map((d) => deviceRow(d, { revoke: true, fresh: d.id === pair.freshSession }))}</div></div>`
+        : html`<div class="tc-group"><div class="tc-empty">
+            <span class="tc-empty-icon">${icon('smartphone')}</span>
+            <span class="tc-empty-title">No devices paired yet</span>
+            <span class="tc-empty-desc">Create a link above, then scan it with the phone you want to drive this server from.</span>
+            <span class="tc-mono tc-muted tc-empty-cmd">or run t3-pair in the container</span>
+          </div></div>`,
+      { actions: ceremony ? html`<button class="tc-btn tc-btn--xs" type="button" data-cmd="pair.new">${icon('plus')}New link<span class="tc-kbd tc-desk-only" aria-hidden="true">P</span></button>` : devices.length ? muted(String(devices.length)) : null })}
+      ${links.length ? section('links-title', 'Unused links', html`<div class="tc-group"><div class="tc-list">${links.map((l) => html`
+        <div class="tc-row tc-row--compact" data-key="link-${l.id}">
+          <span class="tc-tile tc-tile--icon" aria-hidden="true">${icon('link')}</span>
+          <div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">${l.name}</span>${l.waiting ? html`<span class="tc-badge tc-badge--info">Waiting</span>` : ''}</div><span class="tc-status" title="${l.expiresTitle}">${l.status}</span></div>
+          <div class="tc-row-actions"><button class="tc-btn tc-btn--danger tc-btn--sm" type="button" data-cmd="link.revoke" data-id="${l.id}" aria-label="Revoke link ${l.name}">Revoke</button></div>
+        </div>`)}</div></div>`) : ''}
+      ${devices.length ? '' : notice(null, 'history', 'Sessions last 30 days', 'After that the device asks to pair again, which takes a few seconds here. Threads, projects and agent sign-ins are kept on the volume.')}`;
+  };
+
+  // --------------------------------------------------------------- agents --
+  const agentsPage = (s, n) => {
+    const rows = M.agentRows(s, ui, n);
+    const needs = rows.filter((r) => r.attention || r.updateAvailable);
+    const shown = state.agentFilter === 'attention' ? needs : rows;
+    const filter = html`<div class="tc-seg" role="group" aria-label="Show">${[['all', 'All'], ['attention', 'Needs you']].map(([value, label]) => html`<button type="button" aria-pressed="${String(state.agentFilter === value)}" data-cmd="agents.filter" data-value="${value}">${label}${value === 'attention' && needs.length ? html` <span class="tc-num">${needs.length}</span>` : ''}</button>`)}</div>`;
+    return html`
+      ${pageNotices('agents')}
+      ${section('ag-title', 'Agents', html`<div class="tc-group">
+        ${shown.length ? html`<div class="tc-list">${shown.map((row) => resourceRow(row))}</div>`
+          : rows.length ? html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-title">Nothing needs you</span><span class="tc-empty-desc">Every installed agent is signed in and current.</span></div>`
+            : html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-desc">Agent state is not readable right now.</span></div>`}
+        <div class="tc-card-foot">${icon('info', 'tc-icon--sm')}<span>Then turn each provider on in T3 Code under Settings → Providers.</span></div>
+      </div>`, { actions: filter })}
+      ${section('ag-how', 'How sign-in works', html`<div class="tc-group"><dl class="tc-kv">
+        <dt>Credentials</dt><dd class="tc-kv-prose">On the state volume at <code>${(s.paths && s.paths.volume) || '/home/t3'}</code>. They survive a recreate.</dd>
+        <dt>Signed-in check</dt><dd class="tc-kv-prose">Asks each CLI, so keys in the environment count too.</dd>
+        <dt>From a shell</dt><dd><code>t3-login claude</code><span class="tc-subtle">·</span><code>t3-harness list</code></dd>
+      </dl></div>`)}`;
+  };
+
+  // ----------------------------------------------------------- toolchains --
+  const INCLUDED = [
+    ['terminal', 'Node and Python', 'with npm, pip'],
+    ['terminal', 'git, git-lfs, gh, ssh', 'source control'],
+    ['wrench', 'clang, CMake, GDB', 'native builds'],
+    ['server', 'psql, redis-cli', 'databases'],
+    ['activity', 'ffmpeg, ImageMagick', 'media'],
+    ['globe', 'Headless Chromium', 'browser image', 'browser'],
+  ];
+  const toolchainsPage = (s, n) => {
+    const rows = M.toolchainRows(s, ui, n);
+    const paths = s.paths || {};
+    const browserImage = (s.image && s.image.variant === 'browser') || Boolean(s.browser);
+    const size = Number.isFinite(paths.toolchainsBytes) ? M.formatBytes(paths.toolchainsBytes) + (paths.toolchains ? ' in ' + paths.toolchains : '') : null;
+    return html`
+      ${pageNotices('toolchains')}
+      ${section('tc-title', 'On the volume', html`<div class="tc-group">
+        ${rows.length ? html`<div class="tc-list">${rows.map((row) => resourceRow(row))}</div>`
+          : html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-desc">Toolchain state is not readable right now.</span></div>`}
+        <div class="tc-card-foot">${icon('info', 'tc-icon--sm')}<span>Available in every directory. A project that pins a version in <code>mise.toml</code> or <code>.tool-versions</code> gets that one instead.</span></div>
+      </div>`, { actions: size ? muted(size) : null })}
+      ${section('img-title', 'In the image', html`<div class="tc-group"><div class="tc-included">${INCLUDED.filter((i) => !i[3] || browserImage).map(([ic, what, note]) => html`<div>${icon(ic)}<span>${what}</span><span class="tc-included-what">${note}</span></div>`)}</div></div>`,
+        { actions: muted('Updated by pulling a new image') })}
+      ${notice(null, 'shield-check', 'Nothing updates on its own', html`mise records exact versions and never falls back to another tool on <code>PATH</code>. Update is always a button press, here or with <code>mise use</code>.`)}`;
+  };
+
+  // ---------------------------------------------------------------- ports --
+  const portRow = (p) => {
+    const tileEl = html`<span class="tc-tile tc-tile--port"${p.state === 'open' || p.state === 'starting' ? raw(' data-live') : ''} aria-hidden="true">${p.port}</span>`;
+    const proc = p.process ? html`<code>${p.process}</code>` : null;
+    const where = p.address && p.address !== '0.0.0.0' && p.address !== '*' && p.address !== '::' ? html`<span class="tc-mono">${p.address}</span>` : null;
+    const joinParts = (parts) => parts.filter(Boolean).map((x, i) => i ? html` · ${x}` : x);
+    let title = html`<span class="tc-row-name">Port ${p.port}</span>`;
+    let status;
+    let actions;
+    let panel = '';
+    if (p.state === 'open') {
+      title = html`${title}<span class="tc-badge tc-badge--info">Published</span>`;
+      status = html`<span class="tc-status"><a class="tc-mono tc-truncate" href="${p.url}" target="_blank" rel="noopener">${p.url}</a></span>`;
+      actions = html`
+        <span class="tc-desk-only tc-row-actions-inline">${copyButton(p.url, 'Copy URL for port ' + p.port, { iconOnly: true, ghost: false, size: 'tc-btn--sm' })}<button class="${cx('tc-btn tc-btn--icon tc-btn--sm', p.expanded && 'tc-btn--pressed')}" type="button" data-cmd="port.qr" data-id="${p.port}" aria-label="Show QR code for port ${p.port}" aria-expanded="${String(p.expanded)}" data-key="qr-${p.port}">${icon('qr-code')}</button></span>
+        <button class="tc-btn tc-btn--danger tc-btn--sm" type="button" data-cmd="port.stop" data-id="${p.port}" data-key="stop-${p.port}">Stop</button>`;
+      // On a phone the QR and the URL are the row; on a desktop, one press away.
+      panel = html`<div class="${cx('tc-row-panel tc-port-panel', !p.expanded && 'tc-phone-only')}">
+        ${p.qr ? html`<div class="tc-qr" role="img" aria-label="QR code for port ${p.port}" data-keep>${qrSvg(p.qr)}</div>` : ''}
+        <div class="tc-stack tc-port-panel-text"><span class="tc-hint tc-desk-only">Scan to open port ${p.port} on another device.</span>${copyField(p.url.replace(/^https:\/\//, ''), { actions: copyButton(p.url, 'Copy URL for port ' + p.port, { iconOnly: true, size: 'tc-btn--sm' }) })}</div>
+      </div>`;
+    } else if (p.state === 'starting') {
+      title = html`${title}<span class="tc-badge tc-badge--info"><span class="tc-spinner" aria-hidden="true"></span>Publishing</span>`;
+      status = html`<span class="tc-status"><span class="tc-status-text">${joinParts([proc, 'waiting for a public hostname…'])}</span></span>${progressBar(null)}`;
+      actions = html`<button class="tc-btn tc-btn--ghost tc-btn--sm" type="button" data-cmd="port.stop" data-id="${p.port}" data-key="stop-${p.port}">Cancel</button>`;
+    } else if (p.state === 'failed') {
+      title = html`${title}<span class="tc-badge tc-badge--danger">Failed</span>`;
+      status = statusLine({ dot: 'danger', text: p.error || 'The tunnel failed' });
+      actions = html`<button class="tc-btn tc-btn--warning tc-btn--sm" type="button" data-cmd="port.publish" data-id="${p.port}" data-key="pub-${p.port}">${icon('refresh-cw')}Retry</button>`;
+    } else {
+      status = p.db
+        ? html`<span class="tc-status">${dot('warn')}<span class="tc-status-text">${joinParts([proc, 'looks like a database, so Publish asks first'])}</span></span>`
+        : html`<span class="tc-status"><span class="tc-status-text">${proc || where ? joinParts([proc, where]) : p.listening ? 'Listening in the container' : 'Not listening right now'}</span></span>`;
+      actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="port.publish" data-id="${p.port}" data-key="pub-${p.port}">${p.db ? 'Publish…' : 'Publish'}</button>`;
+    }
+    return html`
+      <div class="${cx('tc-row', p.expanded && 'tc-row--expanded')}" data-key="port-${p.port}">
+        ${tileEl}
+        <div class="tc-row-main"><div class="tc-row-title">${title}</div>${status}</div>
+        <div class="tc-row-actions">${actions}</div>
+        ${panel}
+      </div>`;
+  };
+
+  const portsPage = (s, n) => {
+    const ports = state.ports;
+    if (!ports) return html`${pageNotices('ports')}${skeletonGroup(3)}`;
+    if (ports.available === false) {
+      return html`${pageNotices('ports')}${section('pl-title', 'Listening in the container', html`<div class="tc-group"><div class="tc-empty tc-empty--compact"><span class="tc-empty-title">Publishing is unavailable in this build</span><span class="tc-empty-desc">cloudflared is not in this image, so ports cannot get a public URL from here.</span></div></div>`)}`;
+    }
+    const rows = M.portRows(ports, ui, n);
+    return html`
+      ${pageNotices('ports')}
+      ${section('pl-title', 'Listening in the container', html`<div class="tc-group">
+        ${rows.length ? html`<div class="tc-list">${rows.map(portRow)}</div>`
+          : html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-icon">${icon('ethernet-port')}</span><span class="tc-empty-title">Nothing is listening yet</span><span class="tc-empty-desc">Start a dev server in a T3 Code terminal and it appears here within a few seconds.</span></div>`}
+        <div class="tc-card-foot">${icon('terminal', 'tc-icon--sm')}<span>From a terminal: <code>t3-expose 5173</code> publishes, <code>t3-expose stop 3000</code> stops.</span></div>
+      </div>`, { actions: muted('Checks every few seconds') })}
+      ${section('pl-how', 'How publishing works', html`<div class="tc-group"><dl class="tc-kv">
+        <dt>Tunnel</dt><dd class="tc-kv-prose">A Cloudflare quick tunnel. No account, no DNS record, no certificate.</dd>
+        <dt>Address</dt><dd class="tc-kv-prose">A random <code>trycloudflare.com</code> hostname with HTTPS, new each time you publish.</dd>
+        <dt>Bound to 127.0.0.1</dt><dd class="tc-kv-prose">Included. Most dev servers listen on loopback, and those are the ones that need this most.</dd>
+      </dl></div>`)}
+      ${notice('warn', 'triangle-alert', 'A published URL is public', 'It is random and stops working the moment you stop it, but anyone holding it can reach that port. Publish a dev server, not your database.')}`;
+  };
+
+  const publishPort = async (port) => {
+    const row = M.portRows(state.ports, ui, now()).find((p) => p.port === port);
+    if (row && row.db) {
+      const ok = await Kit.confirm({
+        title: 'Publish port ' + port + '?',
+        body: (row.process ? row.process : 'Port ' + port) + ' looks like a database. Publishing gives it a public URL that anyone holding it can reach.',
+        consequences: [
+          { icon: 'globe', text: 'Public: a random trycloudflare.com address' },
+          { icon: 'triangle-alert', text: 'Nothing in front of it checks who is connecting' },
+          { icon: 'circle-stop', text: 'Stops when you press Stop or the container restarts' },
+        ],
+        confirm: 'Publish anyway',
+      });
+      if (!ok) return;
+    }
+    portsBusy.add(port);
+    render();
+    const res = await api('/ports/expose', { body: { port } });
+    portsBusy.delete(port);
+    if (!res.ok) Kit.toast('Could not publish port ' + port, { tone: 'danger', detail: res.error });
+    await loadPorts();
+  };
+
+  const stopPort = async (port) => {
+    expandedPorts.delete(port);
+    const res = await api('/ports/unexpose', { body: { port } });
+    if (!res.ok && res.status !== 404) Kit.toast('Could not stop port ' + port, { tone: 'danger', detail: res.error });
+    else Kit.toast('Stopped publishing port ' + port, { tone: 'info' });
+    await loadPorts();
+  };
+
+  // ---------------------------------------------------------- environment --
+  const kindBadge = (kind) => kind === 'durable' ? html`<span class="tc-badge tc-badge--ok">Durable</span>`
+    : kind === 'anonymous' ? html`<span class="tc-badge tc-badge--warn">Anonymous</span>`
+      : kind === 'none' ? html`<span class="tc-badge tc-badge--warn">Not mounted</span>` : '';
+  const kindText = (kind) => kind === 'durable' ? 'Durable volume' : kind === 'anonymous' ? 'Anonymous volume, lost when the container is removed'
+    : kind === 'none' ? 'Inside the container, lost when it is removed' : null;
+
+  const environmentPage = (s, n) => {
+    const server = s.server || {};
+    const image = s.image || {};
+    const paths = s.paths || {};
+    const readout = (label, value, mono) => html`<div class="tc-readout"><span class="tc-readout-label">${label}</span><span class="${cx('tc-readout-value', mono && 'tc-mono tc-mono--body')}">${value}</span></div>`;
+    const t3 = s.t3 || {};
+    const consolePath = BASE || '/';
+    const keySource = s.setupKeySource;
+    return html`
+      ${pageNotices('environment')}
+      ${section('ev-server', 'Server', html`<div class="tc-group"><div class="tc-readouts">
+        ${readout('T3 Code', server.ok ? html`${dot('ok')}Running ${server.version || ''}` : html`${dot('danger')}Not answering`)}
+        ${readout('Image', image.version ? image.version + (image.variant ? ' · ' + image.variant : '') : 'unversioned', true)}
+        ${s.platform ? readout('Platform', s.platform, true) : ''}
+        ${Number.isFinite(server.uptimeSeconds) ? readout('Uptime', M.duration(server.uptimeSeconds)) : ''}
+      </div></div>`)}
+      ${section('ev-access', 'Access', html`<div class="tc-group"><dl class="tc-kv">
+        <dt>Public URL</dt><dd>${s.publicUrl ? html`<span class="tc-mono tc-mono--body tc-truncate">${s.publicUrl}</span><span class="tc-spacer"></span>${copyButton(s.publicUrl, 'Copy public URL', { iconOnly: true })}`
+          : html`${dot('warn')}<span>Not set. Pairing links need <code>T3_PUBLIC_URL</code>.</span>`}</dd>
+        ${t3.bind ? html`<dt>T3 Code</dt><dd><span class="tc-mono tc-mono--body">${t3.bind}</span><span class="tc-kv-aside">${/^(127\.|localhost|\[?::1)/.test(t3.bind) ? 'loopback, behind your proxy' : 'every interface in the container'}</span></dd>` : ''}
+        <dt>Setup console</dt><dd><span class="tc-mono tc-mono--body">${consolePath}</span><span class="tc-kv-aside">${BASE ? 'on the same hostname · ' : ''}port ${s.setupPort || 3774}</span></dd>
+        <dt>Pairing links last</dt><dd><span class="tc-mono tc-mono--body">${paths.pairTtl || '30d'}</span><span class="tc-kv-aside">T3_PAIR_TTL · a paired session lasts 30 days</span></dd>
+      </dl></div>`)}
+      ${section('ev-storage', 'Storage', html`<div class="tc-group"><div class="tc-list">
+        <div class="tc-row tc-row--compact"><span class="tc-tile tc-tile--icon" aria-hidden="true">${icon('server')}</span><div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">State</span><code>${paths.volume || '—'}</code></div><span class="tc-status">${[kindText(paths.volumeKind), 'threads, credentials, agents and toolchains', Number.isFinite(paths.volumeBytes) ? M.formatBytes(paths.volumeBytes) : null].filter(Boolean).join(' · ')}</span></div>${kindBadge(paths.volumeKind)}</div>
+        <div class="tc-row tc-row--compact"><span class="tc-tile tc-tile--icon" aria-hidden="true">${icon('terminal')}</span><div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">Workspace</span><code>${paths.workspace || '—'}</code></div><span class="tc-status">${[kindText(paths.workspaceKind) || 'Your projects', Number.isFinite(paths.workspaceProjects) ? M.plural(paths.workspaceProjects, 'project') + ' registered on start' : null].filter(Boolean).join(' · ')}</span></div>${kindBadge(paths.workspaceKind)}</div>
+      </div></div>`)}
+      ${s.browser ? section('ev-browser', 'Agent browser', html`<div class="tc-group"><dl class="tc-kv">
+        <dt>Headless Chromium</dt><dd>${s.browser.chromium ? html`${dot('ok')}Ready` : html`${dot('warn')}Missing`}</dd>
+        ${s.browser.playwrightMcp ? html`<dt>Playwright MCP</dt><dd><span class="tc-mono tc-mono--body">${s.browser.playwrightMcp}</span></dd>` : ''}
+        ${s.browser.devtoolsMcp ? html`<dt>Chrome DevTools MCP</dt><dd><span class="tc-mono tc-mono--body">${s.browser.devtoolsMcp}</span></dd>` : ''}
+      </dl></div>`, { actions: muted('Wired into Claude Code, Codex and OpenCode') }) : ''}
+      ${section('ev-console', 'This console', html`<div class="tc-group"><div class="tc-list">
+        ${keySource ? html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Setup key</span><span class="tc-status tc-status--prose">${keySource === 'generated'
+          ? html`Generated at boot, so it changes when the container is recreated. Set <code>T3_SETUP_KEY</code> to keep it.`
+          : html`Pinned with <code>T3_SETUP_KEY</code>, so it survives a recreate.`}</span></div>${keySource === 'generated' ? html`<span class="tc-badge tc-badge--warn">Not pinned</span>` : html`<span class="tc-badge tc-badge--ok">Pinned</span>`}</div>` : ''}
+        <div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Lock console</span><span class="tc-status">Ends this browser’s session. You will need the setup key to come back.</span></div><button class="tc-btn tc-btn--sm" type="button" data-cmd="lock">${icon('lock')}Lock</button></div>
+        <div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Turn the console off</span><span class="tc-status tc-status--prose">Set <code>T3_SETUP_ENABLED=0</code> once you are set up. Pairing then needs <code>t3-pair</code> in a shell.</span></div>${copyButton('T3_SETUP_ENABLED=0', 'Copy T3_SETUP_ENABLED=0', { iconOnly: true, size: 'tc-btn--sm' })}</div>
+      </div></div>`)}`;
+  };
+
+  // ----------------------------------------------------------------- more --
+  const THEMES = [['light', 'Light'], ['system', 'System'], ['dark', 'Dark']];
+  const themeSeg = (cls) => html`<div class="${cx('tc-seg', cls)}" role="group" aria-label="Theme">${THEMES.map(([mode, label]) => html`<button type="button" aria-pressed="${String(themeMode() === mode)}" data-cmd="theme" data-mode="${mode}">${label}</button>`)}</div>`;
+  const morePage = (s) => {
+    const tools = (s.toolchains || []).filter((t) => t.installed).length;
+    const image = s.image || {};
+    const server = s.server || {};
+    const failedTools = M.toolchainRows(s, ui, now()).filter((t) => t.state === 'failed' || t.state === 'running').length;
+    return html`
+      ${section('pm-title', 'More', html`<div class="tc-group">
+        <a class="tc-linkrow" href="#toolchains">${icon('wrench')}Toolchains<span class="tc-linkrow-aside">${failedTools ? M.plural(failedTools, 'needs', 'need') + ' you' : tools + ' installed'}</span>${icon('chevron-right')}</a>
+        <a class="tc-linkrow" href="#environment">${icon('settings-2')}Environment<span class="tc-linkrow-aside">${image.version || ''}</span>${icon('chevron-right')}</a>
+      </div>`, { level: 'h1' })}
+      ${section('pm-app', 'Appearance', html`<div class="tc-group"><div class="tc-linkrow">Theme${themeSeg()}</div></div>`)}
+      ${section('pm-srv', 'This server', html`<div class="tc-group">
+        <div class="tc-readouts tc-readouts--two">
+          <div class="tc-readout"><span class="tc-readout-label">T3 Code</span><span class="tc-readout-value">${dot(server.ok ? 'ok' : 'danger')}${server.ok ? server.version || 'Running' : 'Down'}</span></div>
+          <div class="tc-readout"><span class="tc-readout-label">Image</span><span class="tc-readout-value tc-mono tc-mono--body">${image.version ? image.version + (image.variant ? ' · ' + image.variant : '') : '—'}</span></div>
+        </div>
+        <a class="tc-linkrow tc-linkrow--top" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code${icon('chevron-right')}</a>
+        <button class="tc-linkrow tc-linkrow--danger" type="button" data-cmd="lock">${icon('lock')}Lock console</button>
+      </div>`)}`;
+  };
+
+  // ---------------------------------------------------------------- shell --
+  const ROUTES = ['overview', 'devices', 'agents', 'toolchains', 'ports', 'environment', 'more'];
+  const TITLES = { overview: 'Overview', devices: 'Devices', agents: 'Agents', toolchains: 'Toolchains', ports: 'Ports', environment: 'Environment', more: 'More' };
+  const PAGES = { overview: overviewPage, devices: devicesPage, agents: agentsPage, toolchains: toolchainsPage, ports: portsPage, environment: environmentPage, more: morePage };
+  // On a phone, Toolchains and Environment live under More.
+  const TAB_OF = { toolchains: 'more', environment: 'more' };
+
+  const navBadge = (b) => {
+    if (!b) return { cls: 'tc-nav-count', text: '', hidden: true };
+    if (b.tone) return { cls: 'tc-badge tc-badge--' + b.tone + ' tc-badge--count', text: String(b.count), hidden: !b.count };
+    return { cls: 'tc-nav-count', text: String(b.count ?? ''), hidden: b.count === undefined };
+  };
+
+  const renderShell = (s, n) => {
+    const badges = M.navBadges(s, state.ports, ui);
+    for (const route of ROUTES) {
+      const el = $('nav-' + route);
+      if (el) {
+        const b = navBadge(badges[route]);
+        if (el.className !== b.cls) el.className = b.cls;
+        if (el.textContent !== b.text) el.textContent = b.text;
+        el.hidden = b.hidden;
+        const tone = badges[route] && badges[route].tone;
+        el.title = tone === 'warn' ? b.text + ' need you' : tone === 'info' ? b.text + ' active' : '';
+      }
+      const tab = $('tab-' + route);
+      if (tab) tab.hidden = !(badges[route] && badges[route].tone === 'warn' && badges[route].count);
+    }
+    const server = s.server || {};
+    const image = s.image || {};
+    patch($('server-card'), html`
+      <div class="tc-server-row">${dot(server.ok ? 'ok' : 'danger', server.ok && 'tc-dot--live')}<strong>${server.ok ? 'Running' : 'Not answering'}</strong>${server.version ? html`<span class="tc-mono">${server.version}</span>` : ''}</div>
+      <div class="tc-server-row"><span class="tc-mono">${image.version ? image.version + (image.variant ? ' · ' + image.variant : '') : 'unversioned build'}</span></div>`);
+    patch($('phone-status'), html`${dot(server.ok ? 'ok' : 'danger', server.ok && 'tc-dot--live')}${server.ok ? 'Running' : 'Down'}`);
+    for (const link of document.querySelectorAll('[data-open-t3]')) if (link.getAttribute('href') !== t3Url()) link.setAttribute('href', t3Url());
+
+    // The banner: what the first start is still installing.
+    const banner = M.setupBanner(s);
+    const bannerEl = $('banner');
+    bannerEl.hidden = !banner;
+    if (banner) {
+      patch(bannerEl, html`<span class="tc-spinner tc-info" aria-hidden="true"></span><span class="tc-banner-text"><strong>First start</strong> · ${banner.text}</span><span class="tc-spacer"></span>${progressBar({ pct: banner.pct })}<span class="tc-op-pct">${banner.done}/${banner.total}</span>`);
     }
   };
 
-  load();
+  const renderTopbar = (s, n) => {
+    const route = state.route;
+    const summary = s ? M.summaries(s, state.ports, ui, n, location.host)[route] : null;
+    const crumb = $('crumb');
+    if (crumb.textContent !== TITLES[route]) crumb.textContent = TITLES[route];
+    const sum = $('summary');
+    if (summary) {
+      if (sum.textContent !== summary.text) sum.textContent = summary.text;
+      sum.classList.toggle('tc-mono', Boolean(summary.mono));
+    } else if (sum.textContent) sum.textContent = '';
+    let actions = '';
+    if (s) {
+      if (route === 'overview') {
+        actions = M.readiness(s, ui).ready
+          ? html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="pair.start">${icon('plus')}Pair a device</button>`
+          : html`<a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a>`;
+      } else if (route === 'agents' || route === 'toolchains') {
+        const rows = route === 'agents' ? M.agentRows(s, ui, n) : M.toolchainRows(s, ui, n);
+        if (rows.some((r) => r.updateAvailable)) actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="${route === 'agents' ? 'harness.updateAll' : 'toolchain.updateAll'}">${icon('circle-arrow-up')}Update all</button>`;
+      } else if (route === 'ports') {
+        actions = html`<span class="tc-small tc-muted">Same list as <code>t3-expose</code></span>`;
+      } else if (route === 'environment') {
+        actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="diagnostics">${icon('copy')}<span data-label>Copy diagnostics</span></button>`;
+      }
+    }
+    patch($('page-actions'), actions);
+  };
+
+  const render = () => {
+    const s = state.status;
+    const n = now();
+    if (s) renderShell(s, n);
+    renderTopbar(s, n);
+    const route = state.route;
+    const el = $('page-' + route);
+    if (!el) return;
+    if (!s) {
+      // Still waiting for the first answer: keep the skeleton, unless the
+      // answer was an error worth showing.
+      if (state.statusError) patch(el, html`${pageNotices(route)}${skeletonGroup(3)}`);
+      return;
+    }
+    patch(el, PAGES[route](s, n));
+  };
+
+  // --------------------------------------------------------------- routes --
+  const routeFromHash = () => {
+    const name = location.hash.replace(/^#\/?/, '').split(/[/?]/)[0];
+    return ROUTES.includes(name) ? name : 'overview';
+  };
+  const go = (route) => {
+    if (location.hash === '#' + route) show(route, true);
+    else location.hash = route;
+  };
+  let first = true;
+  const show = (route, focus) => {
+    const changed = route !== state.route || first;
+    state.route = route;
+    Kit.closeAll('route');
+    for (const page of document.querySelectorAll('.tc-page[data-route]')) page.hidden = page.getAttribute('data-route') !== route;
+    for (const link of document.querySelectorAll('[data-nav]')) {
+      const here = link.getAttribute('data-nav') === route
+        || (link.closest('.tc-tabbar') && link.getAttribute('data-nav') === TAB_OF[route]);
+      if (here) link.setAttribute('aria-current', 'page');
+      else link.removeAttribute('aria-current');
+    }
+    render();
+    if (changed && !first) {
+      window.scrollTo(0, 0);
+      Kit.announce(TITLES[route]);
+      if (focus) $('main').focus({ preventScroll: true });
+    }
+    first = false;
+    if (route === 'ports' && !state.ports) loadPorts();
+  };
+  window.addEventListener('hashchange', () => show(routeFromHash(), keyboardNav));
+  let keyboardNav = false;
+
+  // ---------------------------------------------------------------- theme --
+  const THEME_KEY = 't3-console-theme';
+  const themeMode = () => {
+    try { return localStorage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; }
+  };
+  const SYSTEM_DARK = window.matchMedia('(prefers-color-scheme: dark)');
+  const applyTheme = (mode) => {
+    const resolved = mode === 'system' ? (SYSTEM_DARK.matches ? 'dark' : 'light') : mode;
+    document.documentElement.setAttribute('data-theme', resolved);
+    document.documentElement.setAttribute('data-theme-mode', mode);
+    const toggle = $('theme-toggle');
+    if (toggle) {
+      const next = { system: 'light', light: 'dark', dark: 'system' }[mode];
+      toggle.innerHTML = String(icon(mode === 'system' ? 'monitor' : mode === 'dark' ? 'moon' : 'sun'));
+      toggle.setAttribute('aria-label', 'Theme: ' + (mode === 'system' ? 'following the system' : mode) + '. Switch to ' + (next === 'system' ? 'the system theme' : next));
+      toggle.title = toggle.getAttribute('aria-label');
+    }
+  };
+  const setTheme = (mode) => {
+    try { localStorage.setItem(THEME_KEY, mode); } catch { /* this session only */ }
+    applyTheme(mode);
+    render();
+  };
+  SYSTEM_DARK.addEventListener('change', () => { if (themeMode() === 'system') applyTheme('system'); });
+
+  // -------------------------------------------------------------- sign-in --
+  // A sheet that follows each CLI's real flow as numbered steps. The server
+  // runs the CLI; this page shows what it printed and polls until the
+  // manager's probe says the agent is signed in.
+  const signin = { layer: null, agent: null, session: null, phase: 'idle', error: null, cancelled: false, startedAt: 0, poll: null, tick: null };
+
+  const signinSheet = () => {
+    const meta = M.AGENTS[signin.agent] || {};
+    const st = signin.session || {};
+    const host = M.hostOf(st.url);
+    const qr = st.qr ? html`<div class="tc-qr tc-qr--sm tc-desk-only" role="img" aria-label="QR code for the sign-in page" data-keep>${qrSvg(st.qr)}</div>` : '';
+    const waiting = (text, extra) => html`<div class="tc-op tc-op--quiet"><span class="tc-op-line">${raw('<span class="tc-spinner tc-info" aria-hidden="true"></span>')}<span>${text}</span></span><span class="tc-op-pct">${extra || ''}</span></div>`;
+    const step = (n, title, stateName, body) => html`<div class="tc-sheet-step"${stateName ? raw(' data-state="' + stateName + '"') : ''}><span class="tc-step-mark">${stateName === 'done' ? icon('check') : String(n)}</span><div class="tc-sheet-step-body"><span class="${cx('tc-sheet-step-title', !stateName && 'tc-muted')}">${title}</span>${body || ''}</div></div>`;
+    const openPage = (label) => html`<div class="tc-signin-open"><a class="tc-btn" href="${st.url}" target="_blank" rel="noopener">${icon('external-link')}${label}</a>${copyButton(st.url, 'Copy the sign-in link', { iconOnly: true, size: '' })}</div>`;
+    let body;
+    if (signin.phase === 'failed') {
+      body = html`${notice('danger', 'circle-alert', 'Sign-in did not finish', signin.error || 'The CLI stopped before it reported a session.')}
+        ${st.tail ? html`<pre class="tc-log-tail">${st.tail}</pre>` : ''}`;
+    } else if (!st.url) {
+      body = step(1, 'Starting ' + (meta.name || 'the CLI'), 'active', waiting('Waiting for ' + (meta.name || 'it') + ' to print a sign-in link…'));
+    } else if (meta.flow === 'device') {
+      const left = st.expiresAt ? M.countdown(st.expiresAt - now()) : null;
+      body = html`
+        ${step(1, 'Open the device page', 'done', html`<div class="tc-signin-split"><div class="tc-stack tc-signin-fields">${copyField(st.url, { actions: copyButton(st.url, 'Copy device page link', { iconOnly: true }) })}<a class="tc-btn tc-btn--sm tc-self-start" href="${st.url}" target="_blank" rel="noopener">${icon('external-link')}Open device page</a>${st.qr ? html`<span class="tc-hint tc-desk-only">Or scan to approve on your phone.</span>` : ''}</div>${qr}</div>`)}
+        ${step(2, 'Enter this code there', 'active', st.code
+          ? html`${copyField(st.code, { code: true })}${waiting('Waiting for you to approve…', left ? 'expires in ' + left : '')}`
+          : waiting('Waiting for the code…'))}
+        ${step(3, 'Signed in', '', html`<span class="tc-hint">This sheet closes on its own when ${meta.name} reports a session.</span>`)}`;
+    } else if (meta.flow === 'code') {
+      const submitted = st.state === 'submitted' || signin.phase === 'submitting';
+      body = html`
+        ${step(1, 'Approve on ' + (host.replace(/^www\./, '') || 'the sign-in page'), 'done', html`<div class="tc-signin-split"><div class="tc-stack tc-signin-fields">${openPage('Open sign-in page')}<span class="tc-hint">Opens in a new tab. Come back here for the code.</span></div>${qr}</div>`)}
+        ${step(2, 'Paste the code it shows you', submitted ? 'done' : 'active', html`
+          <form class="tc-signin-code" data-sheet-form="code" novalidate>
+            <label class="tc-sr" for="signin-code">Code from the sign-in page</label>
+            <input id="signin-code" name="code" class="tc-input tc-input--mono" placeholder="Paste the code" autocomplete="one-time-code" autocapitalize="off" spellcheck="false"${submitted ? raw(' disabled') : ''}>
+            <button class="tc-btn tc-btn--primary" type="submit"${submitted ? raw(' disabled') : ''}>${submitted ? html`<span class="tc-spinner" aria-hidden="true"></span>Checking` : 'Submit'}</button>
+          </form>`)}
+        ${submitted ? step(3, 'Signed in', 'active', waiting('Waiting for ' + meta.name + ' to accept the code…')) : step(3, 'Signed in', '', '')}`;
+    } else {
+      body = html`
+        ${step(1, 'Open the sign-in page', 'done', html`<div class="tc-signin-split"><div class="tc-stack tc-signin-fields">${openPage('Open sign-in page')}<span class="tc-hint">Sign in there with the account ${meta.name} should use.</span></div>${qr}</div>`)}
+        ${step(2, 'Approve, then come back', 'active', waiting('Waiting for ' + meta.name + ' to report a session…'))}`;
+    }
+    return html`
+      <div class="tc-sheet-head"><span class="tc-tile tc-tile--lg" style="--_tile: var(${meta.hue})" aria-hidden="true">${meta.mono}</span><div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
+      <div class="tc-sheet-body" aria-live="polite">${body}</div>
+      <div class="tc-sheet-foot">${signin.phase === 'failed'
+        ? html`<button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Close</button><button class="tc-btn tc-btn--primary" type="button" data-sheet="retry">${icon('refresh-cw')}Try again</button>`
+        : html`<span class="tc-sheet-foot-note tc-desk-only"><span class="tc-kbd">Esc</span> cancels</span><button class="tc-btn tc-btn--ghost" type="button" data-sheet="cancel">Cancel sign-in</button>`}</div>`;
+  };
+
+  const endSignin = () => {
+    clearTimeout(signin.poll);
+    clearInterval(signin.tick);
+    signin.poll = null;
+    signin.tick = null;
+    ui.signingIn = null;
+    render();
+  };
+
+  const cancelSignin = () => {
+    signin.cancelled = true;
+    const id = signin.session && signin.session.id;
+    if (id && signin.phase !== 'failed') api('/auth/cancel', { body: { id } });
+    if (signin.layer) signin.layer.close('cancel');
+  };
+
+  const pollSignin = async () => {
+    if (!signin.layer || signin.cancelled || !signin.session) return;
+    const attempt = signin.attempt;
+    const res = await api('/auth/session?id=' + encodeURIComponent(signin.session.id));
+    if (!signin.layer || signin.cancelled || signin.attempt !== attempt) return;
+    if (!res.ok) {
+      signin.phase = 'failed';
+      signin.error = res.status === 404 ? 'The setup service no longer knows this sign-in (it may have restarted).' : res.error;
+      signin.layer.render();
+      return;
+    }
+    const st = res.data;
+    signin.session = Object.assign({}, signin.session, st, { expiresAt: st.expiresAt || signin.session.expiresAt });
+    if (st.state === 'done') {
+      const name = (M.AGENTS[signin.agent] || {}).name || signin.agent;
+      signin.layer.close('done');
+      Kit.toast('Signed in to ' + name);
+      loadStatus();
+      return;
+    }
+    if (st.state === 'failed' || st.state === 'cancelled') {
+      signin.phase = 'failed';
+      signin.error = st.error || (st.state === 'cancelled' ? 'Sign-in was cancelled.' : null);
+      signin.layer.render();
+      return;
+    }
+    if (signin.phase === 'submitting' && st.state !== 'submitted') signin.phase = 'awaiting';
+    signin.layer.render();
+    signin.poll = setTimeout(pollSignin, 1500);
+  };
+
+  const beginSignin = async () => {
+    // Each start is an attempt; an answer for an older one (the sheet closed,
+    // or Try again was pressed, while the CLI was starting) only cleans up.
+    const attempt = signin.attempt = (signin.attempt || 0) + 1;
+    signin.phase = 'starting';
+    signin.session = null;
+    signin.error = null;
+    signin.layer.render();
+    const res = await api('/auth/signin', { body: { agent: signin.agent } });
+    if (!signin.layer || signin.cancelled || signin.attempt !== attempt) {
+      if (res.ok && res.data.id) api('/auth/cancel', { body: { id: res.data.id } });
+      return;
+    }
+    if (!res.ok) {
+      signin.phase = 'failed';
+      signin.error = res.error;
+      signin.layer.render();
+      return;
+    }
+    signin.session = Object.assign({}, res.data, { expiresAt: res.data.expiresAt || now() + 15 * 60 * 1000 });
+    signin.phase = 'awaiting';
+    signin.layer.render();
+    signin.poll = setTimeout(pollSignin, 1200);
+  };
+
+  const openSignin = (id, trigger) => {
+    if (signin.layer) return;
+    Object.assign(signin, { agent: id, session: null, phase: 'starting', error: null, cancelled: false, startedAt: now() });
+    ui.signingIn = id;
+    render();
+    signin.layer = Kit.open({
+      kind: 'sheet',
+      panel: { tag: 'aside', class: 'tc-sheet ' + (Kit.isPhone() ? 'tc-sheet--bottom' : 'tc-sheet--inset'), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'signin-title' },
+      returnTo: trigger,
+      backdrop: 'ignore',
+      render: signinSheet,
+      onEscape: cancelSignin,
+      onClose: (reason) => {
+        // Closed by anything but success or an explicit cancel (a route
+        // change, the back button): the CLI is still waiting, so stop it.
+        const id = signin.session && signin.session.id;
+        if (reason !== 'done' && !signin.cancelled && signin.phase !== 'failed' && id) api('/auth/cancel', { body: { id } });
+        signin.cancelled = reason !== 'done';
+        signin.layer = null;
+        endSignin();
+      },
+    });
+    const panel = signin.layer.panel;
+    panel.addEventListener('click', (e) => {
+      const action = e.target.closest('[data-sheet]');
+      if (!action) return;
+      const what = action.getAttribute('data-sheet');
+      if (what === 'cancel') cancelSignin();
+      else if (what === 'close') signin.layer.close('close');
+      else if (what === 'retry') { signin.cancelled = false; beginSignin(); }
+    });
+    panel.addEventListener('submit', async (e) => {
+      const form = e.target.closest('[data-sheet-form="code"]');
+      if (!form) return;
+      e.preventDefault();
+      const code = form.querySelector('input').value.trim();
+      if (!code || !signin.session) { form.querySelector('input').focus(); return; }
+      signin.phase = 'submitting';
+      signin.layer.render();
+      const res = await api('/auth/code', { body: { id: signin.session.id, code } });
+      if (!res.ok) {
+        signin.phase = 'failed';
+        signin.error = res.error;
+      } else {
+        signin.session = Object.assign({}, signin.session, res.data);
+      }
+      if (signin.layer) signin.layer.render();
+    });
+    // The device code's countdown.
+    signin.tick = setInterval(() => { if (signin.layer && signin.session && signin.session.code) signin.layer.render(); }, 1000);
+    beginSignin();
+  };
+
+  // ------------------------------------------------------------- API keys --
+  const keySheet = { layer: null, agent: null, query: '', provider: null, other: false, reveal: false, saving: false, error: null, active: 0 };
+  const HUES = ['--id-claude', '--id-codex', '--id-opencode', '--id-grok', '--id-cursor'];
+  const hueOf = (id) => HUES[[...String(id)].reduce((a, c) => (a + c.charCodeAt(0)) % HUES.length, 0)];
+  const initials = (name) => {
+    const words = String(name).replace(/[^A-Za-z0-9 ]/g, ' ').trim().split(/\s+/).filter(Boolean);
+    return (words.length > 1 ? words[0][0] + words[1][0] : String(name).slice(0, 1)).toUpperCase();
+  };
+  const providerMatches = () => {
+    const list = (state.providers && state.providers.providers) || [];
+    const q = keySheet.query.trim().toLowerCase();
+    if (!q) return list.slice(0, 40).map((p) => ({ p, at: -1 }));
+    const scored = [];
+    for (const p of list) {
+      const name = p.name.toLowerCase();
+      const at = name.indexOf(q);
+      const idAt = p.id.indexOf(q);
+      if (at === -1 && idAt === -1) continue;
+      scored.push({ p, at, score: at === 0 || idAt === 0 ? 0 : at > 0 ? 1 : 2 });
+    }
+    scored.sort((a, b) => a.score - b.score || a.p.name.localeCompare(b.p.name));
+    return scored.slice(0, 40);
+  };
+
+  const keySheetBody = () => {
+    const meta = M.AGENTS[keySheet.agent] || {};
+    const isOpenCode = keySheet.agent === 'opencode';
+    const providers = state.providers || {};
+    const configured = new Set(providers.configured || []);
+    const names = new Map((providers.providers || []).map((p) => [p.id, p.name]));
+    const chosen = keySheet.provider;
+    const keyStep = (n, active) => html`<div class="tc-sheet-step"${active ? raw(' data-state="active"') : ''}><span class="tc-step-mark">${String(n)}</span><div class="tc-sheet-step-body"><label class="tc-sheet-step-title" for="apikey">API key</label>
+      <div class="tc-inputwrap"><input id="apikey" name="key" class="tc-input tc-input--mono" type="${keySheet.reveal ? 'text' : 'password'}" placeholder="sk-…" autocomplete="off" spellcheck="false" autocapitalize="off"><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--xs" type="button" data-sheet="reveal" aria-label="${keySheet.reveal ? 'Hide' : 'Show'} API key" aria-pressed="${String(keySheet.reveal)}">${icon(keySheet.reveal ? 'eye-off' : 'eye')}</button></div>
+      ${keySheet.error ? html`<p class="tc-hint tc-hint--err" role="alert">${keySheet.error}</p>` : html`<span class="tc-hint">Stored on the state volume, never in the image.</span>`}</div></div>`;
+    let steps;
+    if (isOpenCode) {
+      const matches = providerMatches();
+      const cache = providers.cache || {};
+      const freshness = cache.source === 'fallback' || !cache.at
+        ? 'A built-in list; the full catalog loads once models.dev is reachable'
+        : ((providers.providers || []).length + ' providers from models.dev · catalog cached ' + M.relTime(cache.at, now()));
+      const options = matches.map(({ p, at }, i) => {
+        const label = at >= 0 && keySheet.query.trim() ? raw(Kit.esc(p.name.slice(0, at)) + '<mark>' + Kit.esc(p.name.slice(at, at + keySheet.query.trim().length)) + '</mark>' + Kit.esc(p.name.slice(at + keySheet.query.trim().length))) : p.name;
+        return html`<li class="tc-option" role="option" id="prov-opt-${i}" data-provider="${p.id}" data-index="${i}" aria-selected="${String(keySheet.active === i)}"><span class="tc-tile tc-tile--sm" style="--_tile: var(${hueOf(p.id)})" aria-hidden="true">${initials(p.name)}</span><span class="tc-truncate">${label}</span><span class="tc-option-meta tc-mono">${configured.has(p.id) ? html`${icon('check', 'tc-icon--xs')} ` : ''}${p.id}</span></li>`;
+      });
+      options.push(html`<li class="tc-option" role="option" id="prov-opt-${matches.length}" data-provider="__other" data-index="${matches.length}" aria-selected="${String(keySheet.active === matches.length)}">${icon('plus')}<span>Other — type an id</span></li>`);
+      const providerStep = keySheet.other
+        ? html`<div class="tc-field"><input id="prov-other" class="tc-input tc-input--mono" placeholder="Provider id, e.g. deepseek" autocomplete="off" spellcheck="false" autocapitalize="off"><button class="tc-btn tc-btn--ghost tc-btn--xs tc-self-start" type="button" data-sheet="list">Back to the list</button></div>`
+        : html`<div class="tc-combobox">
+            <div class="tc-palette-input">${icon('search', 'tc-muted')}<input id="prov" role="combobox" aria-expanded="true" aria-controls="provl" aria-autocomplete="list" aria-activedescendant="prov-opt-${keySheet.active}" placeholder="Search providers" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
+            <ul class="tc-listbox" id="provl" role="listbox" aria-label="Providers">${options}</ul>
+          </div><span class="tc-hint">${chosen ? html`Selected: <strong>${names.get(chosen) || chosen}</strong> <span class="tc-mono">${chosen}</span>` : freshness}</span>`;
+      steps = html`
+        <div class="tc-sheet-step" data-state="${chosen ? 'done' : 'active'}"><span class="tc-step-mark">${chosen ? icon('check') : '1'}</span><div class="tc-sheet-step-body"><label class="tc-sheet-step-title" for="${keySheet.other ? 'prov-other' : 'prov'}">Provider</label>${providerStep}</div></div>
+        ${keyStep(2, Boolean(chosen))}
+        ${configured.size ? html`<div class="tc-stack tc-saved-keys-wrap"><span class="tc-small tc-muted">Saved keys</span><div class="tc-group"><div class="tc-list">${[...configured].map((id) => html`
+          <div class="tc-row tc-row--compact tc-row--key" data-key="saved-${id}"><span class="tc-tile tc-tile--sm" style="--_tile: var(${hueOf(id)})" aria-hidden="true">${initials(names.get(id) || id)}</span><div class="tc-row-main"><span class="tc-row-name">${names.get(id) || id}</span></div><button class="tc-btn tc-btn--ghost tc-btn--ghost-muted tc-btn--xs" type="button" data-sheet="remove" data-provider="${id}" aria-label="Remove the ${names.get(id) || id} key">Remove</button></div>`)}</div></div></div>` : ''}`;
+    } else {
+      steps = keyStep(1, true);
+    }
+    return html`
+      <div class="tc-sheet-head"><span class="tc-tile tc-tile--lg" style="--_tile: var(${meta.hue})" aria-hidden="true">${meta.mono}</span><div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="key-title">${isOpenCode ? 'Add a provider key' : 'Use an API key'}</h2><span class="tc-small tc-muted">${isOpenCode ? html`Writes to OpenCode’s <code>auth.json</code> on the volume` : html`Runs <code>codex login --with-api-key</code>; the key goes in on stdin`}</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
+      <div class="tc-sheet-body">${steps}</div>
+      <div class="tc-sheet-foot"><button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Cancel</button><button class="tc-btn tc-btn--primary" type="submit" data-key="key-save" disabled>${keySheet.saving ? html`<span class="tc-spinner" aria-hidden="true"></span>Saving` : 'Save key'}</button></div>`;
+  };
+
+  /** Save stays disabled until every step is filled; this reads the live fields. */
+  const syncKeySave = () => {
+    const panel = keySheet.layer && keySheet.layer.panel;
+    if (!panel) return;
+    const key = panel.querySelector('#apikey');
+    const other = panel.querySelector('#prov-other');
+    const provider = keySheet.agent !== 'opencode' || (keySheet.other ? other && other.value.trim() : keySheet.provider);
+    const save = panel.querySelector('[data-key="key-save"]');
+    if (save) save.disabled = keySheet.saving || !(key && key.value.trim() && provider);
+  };
+
+  const renderKeySheet = () => { if (keySheet.layer) { keySheet.layer.render(); syncKeySave(); } };
+
+  const chooseProvider = (id) => {
+    if (id === '__other') {
+      keySheet.other = true;
+      keySheet.provider = null;
+      renderKeySheet();
+      const other = keySheet.layer.panel.querySelector('#prov-other');
+      if (other) other.focus();
+      return;
+    }
+    keySheet.provider = id;
+    const p = ((state.providers && state.providers.providers) || []).find((x) => x.id === id);
+    const input = keySheet.layer.panel.querySelector('#prov');
+    if (input && p) input.value = p.name;
+    keySheet.query = p ? p.name : '';
+    keySheet.active = 0;
+    renderKeySheet();
+    const key = keySheet.layer.panel.querySelector('#apikey');
+    if (key) key.focus();
+  };
+
+  const openKeySheet = async (id, trigger) => {
+    if (keySheet.layer) return;
+    Object.assign(keySheet, { agent: id, query: '', provider: null, other: false, reveal: false, saving: false, error: null, active: 0 });
+    if (id === 'opencode' && !state.providers) await loadProviders();
+    keySheet.layer = Kit.open({
+      kind: 'sheet',
+      panel: { tag: 'form', class: 'tc-sheet ' + (Kit.isPhone() ? 'tc-sheet--bottom' : 'tc-sheet--inset'), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'key-title', novalidate: true },
+      returnTo: trigger,
+      backdrop: 'ignore',
+      render: keySheetBody,
+      focus: id === 'opencode' ? '#prov' : '#apikey',
+      onClose: () => { keySheet.layer = null; },
+    });
+    syncKeySave();
+    const panel = keySheet.layer.panel;
+    panel.addEventListener('input', (e) => {
+      if (e.target.id === 'prov') {
+        keySheet.query = e.target.value;
+        keySheet.provider = null;
+        keySheet.active = 0;
+        renderKeySheet();
+        const list = panel.querySelector('#provl');
+        if (list) list.scrollTop = 0;
+      } else {
+        if (keySheet.error && e.target.id === 'apikey') { keySheet.error = null; renderKeySheet(); }
+        syncKeySave();
+      }
+    });
+    panel.addEventListener('keydown', (e) => {
+      if (e.target.id !== 'prov') return;
+      const count = panel.querySelectorAll('#provl .tc-option').length;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        keySheet.active = (keySheet.active + (e.key === 'ArrowDown' ? 1 : -1) + count) % count;
+        renderKeySheet();
+        const opt = panel.querySelector('#prov-opt-' + keySheet.active);
+        if (opt) opt.scrollIntoView({ block: 'nearest' });
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        const opt = panel.querySelector('#prov-opt-' + keySheet.active);
+        if (opt) chooseProvider(opt.getAttribute('data-provider'));
+      }
+    });
+    panel.addEventListener('click', async (e) => {
+      const option = e.target.closest('.tc-option[data-provider]');
+      if (option) { chooseProvider(option.getAttribute('data-provider')); return; }
+      const action = e.target.closest('[data-sheet]');
+      if (!action) return;
+      const what = action.getAttribute('data-sheet');
+      if (what === 'close') keySheet.layer.close('cancel');
+      else if (what === 'reveal') { keySheet.reveal = !keySheet.reveal; renderKeySheet(); }
+      else if (what === 'list') { keySheet.other = false; renderKeySheet(); }
+      else if (what === 'remove') {
+        const provider = action.getAttribute('data-provider');
+        const label = ((state.providers.providers || []).find((p) => p.id === provider) || {}).name || provider;
+        const ok = await Kit.confirm({
+          title: 'Remove the ' + label + ' key?',
+          body: 'OpenCode stops using ' + label + ' until you add a key for it again. Nothing else changes.',
+          confirm: 'Remove key',
+        });
+        if (!ok) return;
+        const res = await api('/auth/apikey/remove', { body: { agent: 'opencode', provider } });
+        if (!res.ok) Kit.toast('Could not remove the key', { tone: 'danger', detail: res.error });
+        else Kit.toast('Removed the ' + label + ' key');
+        await loadProviders();
+        renderKeySheet();
+        loadStatus();
+      }
+    });
+    panel.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const key = panel.querySelector('#apikey').value.trim();
+      const other = panel.querySelector('#prov-other');
+      const provider = keySheet.agent === 'opencode' ? (keySheet.other ? other && other.value.trim() : keySheet.provider) : undefined;
+      if (!key || (keySheet.agent === 'opencode' && !provider)) return;
+      keySheet.saving = true;
+      keySheet.error = null;
+      renderKeySheet();
+      const res = await api('/auth/apikey', { body: { agent: keySheet.agent, key, provider } });
+      keySheet.saving = false;
+      if (!keySheet.layer) return;
+      if (!res.ok) {
+        // Leave a failed attempt on screen with the key still in it.
+        keySheet.error = res.error;
+        renderKeySheet();
+        return;
+      }
+      const label = provider ? (((state.providers || {}).providers || []).find((p) => p.id === provider) || {}).name || provider : null;
+      keySheet.layer.close('saved');
+      Kit.toast(label ? 'Saved the ' + label + ' key' : 'API key saved');
+      if (keySheet.agent === 'opencode') await loadProviders();
+      loadStatus();
+    });
+  };
+
+  // ------------------------------------------------------------- versions --
+  const VERSION = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
+  const openVersionDialog = (id, trigger) => {
+    const h = harness(id);
+    if (!h) return;
+    const name = nameOf('harness', id);
+    const current = h.installedVersion || h.version;
+    let error = null;
+    const layer = Kit.open({
+      kind: 'center',
+      panel: { tag: 'form', class: 'tc-dialog', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'hv-title', novalidate: true },
+      returnTo: trigger,
+      backdrop: 'close',
+      focus: '#hv-version',
+      render: () => html`
+        <div class="tc-dialog-body">
+          <h2 class="tc-dialog-title" id="hv-title">Install a specific version of ${name}</h2>
+          <p class="tc-dialog-desc">${current ? name + ' is on ' + current + '. ' : ''}mise installs exactly the version you name and T3 Code switches to it${current ? '; ' + current + ' keeps working until it finishes' : ''}.</p>
+          <div class="tc-field tc-dialog-field">
+            <label class="tc-label" for="hv-version">Version</label>
+            <input id="hv-version" class="tc-input tc-input--mono hv-version" placeholder="${h.latestVersion || 'e.g. 1.2.3'}" autocomplete="off" spellcheck="false" autocapitalize="off"${error ? raw(' aria-invalid="true" aria-describedby="hv-error"') : ''}>
+            ${error ? html`<p class="tc-hint tc-hint--err" id="hv-error" role="alert">${error}</p>`
+              : html`<span class="tc-hint">${h.latestVersion ? 'The latest is ' + h.latestVersion + '. ' : ''}${(h.managedVersions || []).length ? 'On the volume: ' + h.managedVersions.join(', ') + '.' : ''}</span>`}
+          </div>
+        </div>
+        <div class="tc-dialog-foot"><button class="tc-btn tc-btn--ghost" type="button" data-dialog="cancel">Cancel</button><button class="tc-btn tc-btn--primary" type="submit">${icon('download')}Install</button></div>`,
+    });
+    const input = layer.panel.querySelector('#hv-version');
+    // The draft survives closing the dialog, a poll, and opening it again.
+    input.value = versionDrafts.get(id) || '';
+    input.addEventListener('input', () => versionDrafts.set(id, input.value));
+    layer.panel.addEventListener('click', (e) => { if (e.target.closest('[data-dialog="cancel"]')) layer.close('cancel'); });
+    layer.panel.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const version = input.value.trim();
+      if (!VERSION.test(version)) {
+        error = version ? 'That is not a version mise can install exactly (for example 2.1.290).' : 'Enter a version.';
+        layer.render();
+        input.focus();
+        return;
+      }
+      layer.close('submit');
+      callLifecycle('harness', h.installed ? 'update' : 'install', id, version);
+    });
+  };
+
+  // ------------------------------------------------------------- commands --
+  const rowFor = (target, id) => target === 'harness'
+    ? M.agentRows(state.status, ui, now()).find((r) => r.id === id)
+    : M.toolchainRows(state.status, ui, now()).find((r) => r.id === id);
+
+  const confirmRevoke = async (kind, id) => {
+    const s = state.status || {};
+    let label = id;
+    if (kind === 'session') {
+      const c = (s.sessions || []).find((x) => x.sessionId === id);
+      label = (c && ((c.client && c.client.label) || c.subject)) || 'this device';
+    } else {
+      const l = (s.pairings || []).find((x) => x.id === id);
+      label = (l && l.label) || 'Unlabelled';
+    }
+    const ok = await Kit.confirm(kind === 'session'
+      ? { title: 'Revoke ' + label + '?', body: label + ' loses access immediately and has to be paired again with a new link.', confirm: 'Revoke' }
+      : { title: 'Revoke this link?', body: '“' + label + '” has not been used yet. Revoking it means the link stops working.', confirm: 'Revoke link' });
+    if (!ok) return;
+    const res = await api('/revoke', { body: { kind, id } });
+    if (!res.ok) { Kit.toast('Could not revoke', { tone: 'danger', detail: res.error }); return; }
+    Kit.toast(kind === 'session' ? 'Revoked ' + label : 'Link revoked');
+    await loadStatus();
+  };
+
+  const COMMANDS = {
+    refresh: () => { loadStatus(); loadPorts(); },
+    goto: (a) => go(a.route),
+    copy: (a, el) => Kit.copy(a.text, el, a.toast),
+    theme: (a) => setTheme(a.mode),
+    'theme.cycle': () => setTheme({ system: 'light', light: 'dark', dark: 'system' }[themeMode()]),
+    palette: () => openPalette(),
+    'open.t3': () => window.open(t3Url(), '_blank', 'noopener'),
+    lock: async () => {
+      await fetch(BASE + '/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual' }).catch(() => {});
+      locked = true;
+      location.replace(BASE + '/');
+    },
+    diagnostics: (a, el) => {
+      const report = M.redactedDiagnostics(state.status, state.ports, { console: { base: BASE || '/', route: state.route, viewport: innerWidth + 'x' + innerHeight } });
+      Kit.copy(JSON.stringify(report, null, 2), el && el.closest('[data-cmd]'), 'Diagnostics copied');
+    },
+    'updates.check': async () => {
+      const res = await api('/updates/check', { body: {} });
+      Kit.toast(res.ok ? 'Checking for updates' : 'Could not check for updates', res.ok ? { tone: 'info', detail: 'Rows show any newer release within a minute.' } : { tone: 'danger', detail: res.error });
+      setTimeout(loadStatus, 8000);
+    },
+
+    'row.menu': (a, el) => {
+      const row = rowFor(a.target, a.id);
+      if (!row || !row.menu.length) return;
+      const status = row.status.text;
+      Kit.menu(el, {
+        label: row.name + ' actions',
+        head: { title: row.name, sub: [row.version, Kit.isPhone() ? status.toLowerCase() : null].filter(Boolean).join(' · '), tile: tile(row, 'lg') },
+        items: row.menu.map((m) => m.sep ? m : Object.assign({}, m, { run: () => run(m.cmd, { target: row.target, id: row.id }, el) })),
+      });
+    },
+    'harness.install': (a) => callLifecycle('harness', 'install', a.id),
+    'harness.update': (a) => callLifecycle('harness', 'update', a.id),
+    'harness.uninstall': (a) => confirmUninstall('harness', a.id),
+    'harness.version': (a, el) => openVersionDialog(a.id, el),
+    'harness.signin': (a, el) => openSignin(a.id, el),
+    'harness.apikey': (a, el) => openKeySheet(a.id, el),
+    'harness.updateAll': () => updateAll('harness'),
+    'toolchain.install': (a) => callLifecycle('toolchain', 'install', a.id),
+    'toolchain.update': (a) => callLifecycle('toolchain', 'update', a.id),
+    'toolchain.uninstall': (a) => confirmUninstall('toolchain', a.id),
+    'toolchain.updateAll': () => updateAll('toolchain'),
+    'op.cancel': (a) => cancelOperation(a.target, a.id),
+
+    'pair.start': () => {
+      if (state.route !== 'devices') go('devices');
+      mint();
+    },
+    'pair.again': () => {
+      // Same label and lifetime as the link that lapsed.
+      if (pair.minted) pair.ttl = pair.minted.ttl || pair.ttl;
+      mint();
+    },
+    'pair.new': () => {
+      if (state.route !== 'devices') go('devices');
+      pair.showForm = true;
+      pair.error = null;
+      render();
+      const input = $('pair-label');
+      if (input) input.focus();
+    },
+    'pair.ttl': (a) => { pair.ttl = a.value; render(); },
+    'device.revoke': (a) => confirmRevoke('session', a.id),
+    'link.revoke': (a) => confirmRevoke('pairing', a.id),
+
+    'agents.filter': (a) => { state.agentFilter = a.value; render(); },
+
+    'port.publish': (a) => publishPort(Number(a.id)),
+    'port.stop': (a) => stopPort(Number(a.id)),
+    'port.qr': (a) => {
+      const port = Number(a.id);
+      if (expandedPorts.has(port)) expandedPorts.delete(port);
+      else expandedPorts.add(port);
+      if (state.route !== 'ports') go('ports');
+      render();
+    },
+  };
+
+  /** Run one command by name: buttons, menus, shortcuts and the palette all come through here. */
+  const run = (name, args, el) => {
+    const command = COMMANDS[name];
+    if (!command) return;
+    try {
+      const result = command(args || {}, el || null);
+      if (result && typeof result.catch === 'function') {
+        result.catch((error) => Kit.toast('Something went wrong', { tone: 'danger', detail: String(error && error.message || error) }));
+      }
+    } catch (error) {
+      Kit.toast('Something went wrong', { tone: 'danger', detail: String(error && error.message || error) });
+    }
+  };
+
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-cmd]');
+    if (!el || el.disabled || el.closest('[inert]')) return;
+    e.preventDefault();
+    const args = Object.assign({}, el.dataset);
+    run(el.getAttribute('data-cmd'), args, el);
+  });
+
+  // Navigation links keep their hrefs (middle-click, copy link); keyboard
+  // navigation from them moves focus to the page.
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.closest && e.target.closest('[data-nav]')) keyboardNav = true;
+  }, true);
+  window.addEventListener('hashchange', () => { keyboardNav = false; });
+
+  // -------------------------------------------------------------- palette --
+  const openPalette = () => Kit.palette({
+    items: () => M.paletteItems(state.status || {}, state.ports, ui, now()),
+    search: M.searchPalette,
+    run: (item) => {
+      const { cmd, ...args } = item.cmd;
+      if (cmd === 'goto') keyboardNav = true;
+      run(cmd, args, null);
+    },
+  });
+
+  // ------------------------------------------------------------ shortcuts --
+  Kit.bind('mod+k', openPalette);
+  Kit.bind('/', openPalette);
+  for (const [key, route] of [['o', 'overview'], ['d', 'devices'], ['a', 'agents'], ['t', 'toolchains'], ['p', 'ports'], ['e', 'environment']]) {
+    Kit.bind('g ' + key, () => { keyboardNav = true; go(route); });
+  }
+  Kit.bind('p', () => {
+    if (pair.showForm || !pair.minted || pair.minted.outcome) run('pair.start');
+    else run('pair.new');
+  }, () => state.route === 'devices');
+
+  // ------------------------------------------------------------------ boot --
+  window.T3C.hydrateIcons(document);
+  Kit.syncDensity();
+  applyTheme(themeMode());
+  // ⌘ on Apple keyboards, Ctrl elsewhere.
+  if (!/Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent || '')) {
+    for (const k of document.querySelectorAll('[data-mod-key]')) k.textContent = 'Ctrl K';
+  }
+  // Re-render when the layout crosses the phone breakpoint (menus and sheets
+  // pick their shape at open time; rows pick theirs on render).
+  Kit.PHONE.addEventListener('change', render);
+  show(routeFromHash());
+  loadStatus();
   loadPorts();
-  setInterval(load, 15000);
-  setInterval(loadPorts, 4000);
-}
+})();
