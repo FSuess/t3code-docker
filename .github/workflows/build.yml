@@ -286,15 +286,18 @@ jobs:
           #   browser -> :browser :full :latest :1.2.3 :1.2
           #              :1.2.3-browser :1.2-browser :1.2.3-full :1.2-full
           #   core    -> :core :slim :1.2.3-core :1.2-core :1.2.3-slim :1.2-slim
+          # A prerelease tag (v1.2.3-rc.1) publishes only its own version tags:
+          # the floating names stay on the last release, and metadata-action
+          # already skips {{major}}.{{minor}} for a prerelease.
           flavor: latest=false
           tags: |
-            type=raw,value=${{ matrix.target }}
+            type=raw,value=${{ matrix.target }},enable=${{ !contains(github.ref_name, '-') }}
             type=semver,pattern={{version}},suffix=-${{ matrix.target }}
             type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.target }}
-            type=raw,value=${{ matrix.target == 'browser' && 'full' || 'slim' }}
+            type=raw,value=${{ matrix.target == 'browser' && 'full' || 'slim' }},enable=${{ !contains(github.ref_name, '-') }}
             type=semver,pattern={{version}},suffix=-${{ matrix.target == 'browser' && 'full' || 'slim' }}
             type=semver,pattern={{major}}.{{minor}},suffix=-${{ matrix.target == 'browser' && 'full' || 'slim' }}
-            type=raw,value=latest,enable=${{ matrix.target == 'browser' }}
+            type=raw,value=latest,enable=${{ matrix.target == 'browser' && !contains(github.ref_name, '-') }}
             type=semver,pattern={{version}},enable=${{ matrix.target == 'browser' }}
             type=semver,pattern={{major}}.{{minor}},enable=${{ matrix.target == 'browser' }}
 
@@ -327,7 +330,13 @@ jobs:
           [ "$arm64" -eq 1 ] || { echo "missing the arm64 digest" >&2; exit 1; }
           mapfile -t tags < <(jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
           args=(); for tag in "${tags[@]}"; do args+=(-t "$tag"); done
-          docker buildx imagetools create "${args[@]}" "${refs[@]}"
+          # Assemble the manifest under a staging tag and verify it there, so
+          # the release tags only move once it maps exactly the tested digests;
+          # then check one of them landed the same.
+          staging="${REGISTRY}/${SLUG}:candidate-${GITHUB_SHA::12}-${{ matrix.target }}"
+          docker buildx imagetools create -t "$staging" "${refs[@]}"
+          scripts/verify-promoted-manifest.sh "${expects[@]}" "$staging"
+          docker buildx imagetools create "${args[@]}" "$staging"
           scripts/verify-promoted-manifest.sh "${expects[@]}" "${tags[0]}"
           {
             echo "### Promoted \`${{ matrix.target }}\`"
