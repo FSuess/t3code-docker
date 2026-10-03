@@ -74,7 +74,9 @@
     // cookie expired. The page itself asks for the key again.
     if (res.status === 401 && !locked) {
       locked = true;
-      location.replace(BASE + '/' + location.search + location.hash);
+      // The unlock form is served at this same address: reload it (going to
+      // the same address with a #page in it would only scroll).
+      location.reload();
     }
     const data = await res.json().catch(() => ({}));
     const ok = res.ok && data.ok !== false;
@@ -2090,7 +2092,8 @@
     lock: async () => {
       await fetch(BASE + '/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual' }).catch(() => {});
       locked = true;
-      location.replace(BASE + '/');
+      // Keeps ?embed=t3, so inside T3 Code the key is asked for in the dialog.
+      location.replace(BASE + '/' + location.search);
     },
     diagnostics: (a, el) => {
       const report = M.redactedDiagnostics(state.status, state.ports, { console: { base: BASE || '/', route: state.route, viewport: innerWidth + 'x' + innerHeight } });

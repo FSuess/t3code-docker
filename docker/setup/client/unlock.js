@@ -93,7 +93,11 @@
         credentials: 'same-origin',
       });
       if (res.ok) {
-        location.replace(BASE + '/' + kept() + location.hash);
+        // The console is served at this same address. A reload, not a
+        // navigation to it: with a page in its #fragment, navigating to the
+        // same address only scrolls, and the unlock form would stay.
+        history.replaceState(null, '', BASE + '/' + kept() + location.hash);
+        location.reload();
         return;
       }
       showError(res.status === 401
