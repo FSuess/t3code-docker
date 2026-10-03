@@ -792,6 +792,13 @@ Issues and pull requests are welcome. Before opening one:
 - **CI builds and tests both images on both architectures** before anything is
   published, so a change that only works on amd64 is caught. The slower agent
   lifecycle test runs on amd64 for every build.
+- **To work on the setup page or what it adds to T3 Code's pages**, run
+  `node scripts/dev-console.mjs` inside a container from this image. It starts
+  a scratch T3 Code and the setup page from your working tree behind one
+  origin, as a tunnel would. It restarts the setup page as you edit, serves
+  T3 Code's pages with your copy of `docker/t3-client/setup-bridge.js`, and
+  prints a pairing link. `scripts/setup-bridge-audit.js` checks those pages
+  in a browser.
 
 Releases are made from tags. Pushing `vX.Y.Z` builds each image for each
 architecture, tests each one against the exact digest that was pushed, runs the
