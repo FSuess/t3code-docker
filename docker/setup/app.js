@@ -379,6 +379,8 @@
       ${body}
     </section>`;
   const muted = (text) => html`<span class="tc-small tc-muted">${text}</span>`;
+  // An empty state's icon, on its card with two more fanned out behind it.
+  const emptyIcon = (name, cls) => html`<span class="tc-empty-media" aria-hidden="true"><span class="tc-empty-icon">${icon(name, cls)}</span></span>`;
   const linkButton = (href, label, extra) => html`<a class="tc-btn tc-btn--ghost tc-btn--ghost-muted tc-btn--xs" href="${href}"${extra || ''}>${label}${icon('arrow-right')}</a>`;
   const notice = (tone, iconName, title, desc, action) => html`
     <div class="${cx('tc-notice', tone && 'tc-notice--' + tone)}"${tone === 'danger' ? raw(' role="alert"') : ''}>${icon(iconName)}<div class="tc-notice-body">${title ? html`<span class="tc-notice-title">${title}</span>` : ''}${desc ? html`<span class="tc-notice-desc">${desc}</span>` : ''}</div>${action || ''}</div>`;
@@ -682,7 +684,7 @@
       return html`
         <div class="tc-group tc-group--brand" data-key="pair-done"><div class="tc-card-body tc-pair-done">
           ${pairSteps(m)}
-          <span class="tc-empty-icon">${icon('smartphone', 'tc-icon--lg')}</span>
+          ${emptyIcon('smartphone', 'tc-icon--lg')}
           <div class="tc-pair-done-text"><h3 class="tc-pair-done-title">Paired with ${m.pairedName}</h3><p class="tc-page-lede">It is already signed in. You can close this page.</p></div>
           <div class="tc-pair-done-actions"><a class="tc-btn tc-btn--primary" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a><button class="tc-btn tc-btn--ghost" type="button" data-cmd="pair.new">Pair another device</button></div>
         </div></div>`;
@@ -729,7 +731,7 @@
       ${section('paired-title', 'Paired devices', devices.length
         ? html`<div class="tc-group"><div class="tc-list">${devices.map((d) => deviceRow(d, { revoke: true, fresh: d.id === pair.freshSession }))}</div></div>`
         : html`<div class="tc-group"><div class="tc-empty">
-            <span class="tc-empty-icon">${icon('smartphone')}</span>
+            ${emptyIcon('smartphone')}
             <span class="tc-empty-title">No devices paired yet</span>
             <span class="tc-empty-desc">Create a link above, then scan it with the phone you want to drive this server from.</span>
             <span class="tc-mono tc-muted tc-empty-cmd">or run t3-pair in the container</span>
@@ -808,7 +810,7 @@
   // A first look at what can be added: one press opens the sheet on that tool.
   const QUICK_ADD = ['kubectl', 'terraform', 'aws-cli', 'java', 'zig', 'just'];
   const toolsEmpty = () => html`<div class="tc-empty">
-    <span class="tc-empty-icon">${icon('plus')}</span>
+    ${emptyIcon('plus')}
     <span class="tc-empty-title">Add any tool mise can install</span>
     <span class="tc-empty-desc">Cloud CLIs, other languages, linters: about a thousand tools, each pinned to an exact version like the toolchains above.</span>
     <div class="tc-chips" role="group" aria-label="Suggestions">${QUICK_ADD.map((name) => html`<button class="tc-chip-btn" type="button" data-cmd="package.add" data-id="${name}">${name}</button>`)}</div>
@@ -870,7 +872,7 @@
       ${pageNotices('ports')}
       ${section('pl-title', 'Listening in the container', html`<div class="tc-group">
         ${rows.length ? html`<div class="tc-list">${rows.map(portRow)}</div>`
-          : html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-icon">${icon('ethernet-port')}</span><span class="tc-empty-title">Nothing is listening yet</span><span class="tc-empty-desc">Start a dev server in a T3 Code terminal and it appears here within a few seconds.</span></div>`}
+          : html`<div class="tc-empty tc-empty--compact">${emptyIcon('ethernet-port')}<span class="tc-empty-title">Nothing is listening yet</span><span class="tc-empty-desc">Start a dev server in a T3 Code terminal and it appears here within a few seconds.</span></div>`}
         <div class="tc-card-foot">${icon('terminal', 'tc-icon--sm')}<span>From a terminal: <code>t3-expose 5173</code> publishes, <code>t3-expose stop 3000</code> stops.</span></div>
       </div>`, { actions: muted('Checks every few seconds') })}
       ${section('pl-how', 'How publishing works', html`<div class="tc-group"><dl class="tc-kv">

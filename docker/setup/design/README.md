@@ -33,6 +33,16 @@ Each of these is a bug in the handoff, not a restyle. Keep them when syncing.
 3. **"Press ⌘C" everywhere.** The narration names the keys of the platform it
    runs on (`⌘C` on Apple devices, `Ctrl C` elsewhere), as the Kbd guideline
    asks; `T3C.copyKeys` carries it.
+4. **The empty state's back cards painted over its icon.** The handoff drew the
+   two fanned cards as `.tc-empty-icon`'s own `::before`/`::after` at
+   `z-index: -1` inside an `isolation: isolate` box, which paints them above
+   that box's background, so their outlines crossed the icon's card. T3's
+   EmptyMedia uses sibling elements. Here the cards belong to a wrapper,
+   `<span class="tc-empty-media"><span class="tc-empty-icon">…</span></span>`,
+   and the icon's card sits above them. They use T3's geometry: 2px out, not 6px. In
+   the same component, `.tc-empty--compact` with an icon squeezed its title
+   into a one-word column on a phone; it now stacks the title over its line
+   beside the icon.
 
 ## Local additions
 

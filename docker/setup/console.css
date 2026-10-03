@@ -107,7 +107,7 @@ html.tc-locked { overflow: hidden; }
 .tc-pair-done .tc-steps { align-self: stretch; }
 .tc-empty-cmd { margin-top: var(--space-2); }
 .tc-pair-done { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 18px; padding: 22px var(--space-4) 18px; }
-.tc-pair-done .tc-empty-icon { margin: 10px 0 2px; }
+.tc-pair-done .tc-empty-media { margin: 10px 0 2px; }
 .tc-pair-done-title { font-size: 24px; line-height: 32px; font-weight: 600; letter-spacing: -0.025em; text-wrap: balance; }
 @media (max-width: 1023.98px) {
   .tc-pair { flex-direction: column; align-items: stretch; }

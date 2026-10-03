@@ -390,16 +390,25 @@
 
 /* -------------------------------------------------------------- empty -- */
 .tc-empty { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px; padding: 40px var(--space-6); }
-.tc-empty-icon { position: relative; width: 36px; height: 36px; border-radius: var(--radius-md); display: grid; place-items: center; background: var(--surface); border: 1px solid var(--border);
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.05); color: var(--fg); margin-bottom: 16px; }
-.tc-empty-icon::before, .tc-empty-icon::after { content: ""; position: absolute; inset: -1px; border-radius: inherit; border: 1px solid var(--border); background: var(--surface); z-index: -1; scale: 0.84; }
-.tc-empty-icon::before { rotate: -10deg; translate: -6px 1px; transform-origin: bottom left; }
-.tc-empty-icon::after { rotate: 10deg; translate: 6px 1px; transform-origin: bottom right; }
-.tc-empty-icon { isolation: isolate; }
+/* The icon's card in front of two smaller ones fanned out behind it, as T3's
+   EmptyMedia draws it. The back cards are the wrapper's, so the front card (the
+   icon's own box) paints over them. */
+.tc-empty-media { position: relative; isolation: isolate; display: inline-grid; flex: none; margin-bottom: 16px; }
+.tc-empty-media::before, .tc-empty-media::after { content: ""; position: absolute; inset: -1px 0 1px; border-radius: var(--radius-md); border: 1px solid var(--border); background: var(--surface); scale: 0.84; pointer-events: none; }
+.tc-empty-media::before { rotate: -10deg; translate: -2px 0; transform-origin: bottom left; }
+.tc-empty-media::after { rotate: 10deg; translate: 2px 0; transform-origin: bottom right; }
+.tc-empty-icon { position: relative; z-index: 1; width: 36px; height: 36px; border-radius: var(--radius-md); display: grid; place-items: center; background: var(--surface); border: 1px solid var(--border);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.05); color: var(--fg); }
 .tc-empty-title { color: var(--fg); font-weight: 600; font-size: 17px; line-height: 24px; }
 .tc-empty-desc { font-size: 13px; line-height: 18px; color: var(--fg-muted); }
 .tc-empty .tc-btn { margin-top: 12px; }
-.tc-empty--compact { padding: 14px var(--space-4); flex-direction: row; text-align: left; gap: 8px; font-size: 12px; color: var(--fg-muted); }
+.tc-empty--compact { padding: 14px var(--space-4); flex-direction: row; flex-wrap: wrap; align-items: baseline; text-align: left; column-gap: 8px; row-gap: 2px; font-size: 12px; color: var(--fg-muted); }
+.tc-empty--compact .tc-empty-title { font-size: 14px; line-height: 20px; }
+/* With an icon: the icon beside the title and the line under it, so a phone
+   wraps the sentence rather than the title. The fanned cards reach past the
+   icon's box on both sides. */
+.tc-empty--compact:has(> .tc-empty-media) { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; column-gap: 6px; }
+.tc-empty--compact > .tc-empty-media { grid-row: 1 / span 2; margin: 0 8px 0 6px; }
 
 /* --------------------------------------------------------- floating -- */
 /* Glass: upstream dropdown-glass / dialog-glass. */
