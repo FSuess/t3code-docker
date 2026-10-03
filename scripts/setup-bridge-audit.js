@@ -241,6 +241,102 @@ const run = async (base) => {
     await page.waitForTimeout(800);
     expect(await page.locator("[data-t3-setup-entry]").count() === 0, "outside Settings there is no entry");
 
+    console.log("The command palette");
+    const PALETTE = '[data-command-palette="true"]';
+    // T3's palette spends the first Escape after an arrow key on its own
+    // highlight (its own behaviour, not Setup's), so close it with as many as it takes.
+    const closePalette = async () => {
+      for (let i = 0; i < 3 && await page.locator(PALETTE).count(); i++) {
+        await page.keyboard.press("Escape");
+        await page.waitForTimeout(300);
+      }
+    };
+    const rows = () => page.evaluate(() => {
+      const dialog = document.querySelector('[data-command-palette="true"]');
+      if (!dialog) return null;
+      const ours = [...dialog.querySelectorAll("[data-t3-setup-item]")];
+      const theirs = [...dialog.querySelectorAll('[data-slot="command-item"]:not([data-t3-setup-item])')];
+      const lit = theirs.find((row) => row.hasAttribute("data-highlighted"));
+      const list = dialog.querySelector('[data-slot="command-list"]');
+      return {
+        ours: ours.map((row) => row.getAttribute("data-t3-setup-item")),
+        ourLit: ours.findIndex((row) => row.hasAttribute("data-highlighted")),
+        theirs: theirs.length,
+        // T3 draws its highlighted row with a background; Setup's highlight leaves it plain.
+        theirLitPainted: lit ? getComputedStyle(lit).backgroundColor !== "rgba(0, 0, 0, 0)" : null,
+        first: list ? list.firstElementChild && list.firstElementChild.hasAttribute("data-t3-setup-palette") : null,
+        emptyHidden: [...dialog.querySelectorAll("[data-t3-setup-empty] > :not([data-t3-setup-host])")].every((n) => !n.getClientRects().length),
+        // A row, as T3's are: the icon beside the text, not above it.
+        rowShaped: ours.every((row) => {
+          const icon = row.querySelector("svg").getBoundingClientRect();
+          const text = row.querySelector("svg + span").getBoundingClientRect();
+          return icon.right <= text.left && icon.top < text.bottom && icon.bottom > text.top;
+        }),
+        active: document.activeElement && document.activeElement.getAttribute("aria-activedescendant"),
+      };
+    });
+    const search = async (query) => {
+      await closePalette();
+      await page.keyboard.press("Control+k");
+      await page.waitForSelector(PALETTE + " input", { timeout: 5000 });
+      await page.keyboard.type(query, { delay: 20 });
+      await page.waitForTimeout(600);
+      return rows();
+    };
+    const dialogRoute = async () => {
+      await page.waitForSelector(".t3-setup-layer[data-ready]", { timeout: 20000 }).catch(() => null);
+      const frame = page.frames().find((f) => f.url().includes("/__setup/"));
+      return { open: await page.locator(".t3-setup-layer").count() === 1, palette: await page.locator(PALETTE).count(), hash: frame ? new URL(frame.url()).hash : null };
+    };
+    const closeDialog = async () => {
+      await page.keyboard.press("Escape");
+      await page.waitForSelector(".t3-setup-layer", { state: "detached", timeout: 5000 }).catch(() => null);
+    };
+
+    // First a search T3 has nothing for, on a page where its palette has shown
+    // no rows yet: Setup's has no classes of T3's to copy.
+    let found = await search("mise");
+    expect(found && found.ours.join() === "toolchains" && found.ourLit === 0 && found.rowShaped,
+      "\"mise\" offers Toolchains, drawn as a row", JSON.stringify(found));
+    if (!found.theirs) expect(found.emptyHidden, "standing in for T3's \"No matching\" line", JSON.stringify(found));
+
+    found = await search("setup");
+    expect(found && found.ours.join() === "setup" && found.ourLit === 0 && found.rowShaped, "\"setup\" lists Open setup, highlighted", JSON.stringify(found));
+    expect(found.first !== false, "Setup's group comes first", JSON.stringify(found));
+    expect(found.active === "t3-setup-cmd-0" && found.theirLitPainted !== true, "and only Setup's row reads as highlighted", JSON.stringify(found));
+    await page.keyboard.press("Enter");
+    let opened = await dialogRoute();
+    expect(opened.open && opened.palette === 0 && opened.hash === "", "Enter closes the palette and opens Setup", JSON.stringify(opened));
+    await closeDialog();
+
+    found = await search("pair");
+    expect(found && found.ours.join() === "pair" && found.ourLit === 0, "\"pair\" offers Pair a device", JSON.stringify(found));
+    if (found.theirs) {
+      await page.keyboard.press("ArrowDown");
+      await page.waitForTimeout(200);
+      const down = await rows();
+      expect(down.ourLit === -1 && down.theirLitPainted === true, "ArrowDown moves on to T3's own results", JSON.stringify(down));
+      await page.keyboard.press("ArrowUp");
+      await page.waitForTimeout(200);
+      const up = await rows();
+      expect(up.ourLit === 0 && up.theirLitPainted !== true, "and ArrowUp back to Setup's", JSON.stringify(up));
+    } else {
+      expect(found.emptyHidden, "where T3 has nothing to offer, Setup's rows stand in for \"No matching\"", JSON.stringify(found));
+    }
+    await page.keyboard.press("Enter");
+    opened = await dialogRoute();
+    expect(opened.open && opened.palette === 0 && opened.hash === "#devices", "it opens Setup on Devices, after arrow keys too", JSON.stringify(opened));
+    await closeDialog();
+
+    found = await search("set");
+    if (found.theirs) {
+      expect(found.ours.join() === "setup" && found.ourLit === -1 && /^base-ui/.test(found.active || ""),
+        "\"set\" lists Open setup but leaves Enter with T3's first result", JSON.stringify(found));
+    }
+    found = await search("settings");
+    expect(found && found.ours.length === 0, "\"settings\" is T3's alone", JSON.stringify(found));
+    await closePalette();
+
     console.log("The console's own guard");
     // Asked from here rather than from the page, which cannot set Sec-Fetch-Site.
     const cookies = (await context.cookies()).filter((c) => c.name.startsWith("t3_session")).map((c) => `${c.name}=${c.value}`).join("; ");

@@ -206,6 +206,11 @@ T3 Code links to it in two places:
   failed. Available updates aren't counted. **Esc** or **✕** closes the
   dialog, and **Open in a new tab** at the foot of its sidebar opens the page
   on its own.
+- In T3 Code's command palette (**⌘K**), searching for **setup** offers **Open
+  setup**, and **pair**, **agents**, **toolchains** or **ports** offer that
+  page of the setup page. Enter opens the same dialog on that page. A short
+  search such as "set", which could equally mean T3 Code's settings, lists
+  Setup without taking Enter away from T3 Code's own first result.
 
 The dialog doesn't ask for the key because the setup page accepts T3 Code's own
 session. It asks T3 Code about the browser's session cookie and lets the

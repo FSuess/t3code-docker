@@ -70,6 +70,49 @@ test("only the console in the dialog is listened to", () => {
   assert.equal(B.fromConsole(message({}), null, "https://t3.example.com"), false, "no dialog open");
 });
 
+test("Setup's commands answer to their own words in T3's palette, and not to T3's", () => {
+  const found = (q) => { const m = B.paletteMatches(q); return [m.items.map((i) => i.id).join(","), m.strong]; };
+  assert.deepEqual(found("setu"), ["setup", true]);
+  assert.deepEqual(found("setup"), ["setup", true], "setup alone finds Open setup only");
+  assert.deepEqual(found("set"), ["setup", false], "three letters could mean Settings: listed, not taking Enter");
+  assert.deepEqual(found("se"), ["", false]);
+  assert.deepEqual(found("setup ag"), ["agents", true], "setup and a word narrow to that page");
+  assert.deepEqual(found("ports setup"), ["ports", true]);
+  assert.deepEqual(found("pair"), ["pair", true]);
+  assert.deepEqual(found("devi"), ["pair", true]);
+  assert.deepEqual(found("mise"), ["toolchains", true]);
+  assert.deepEqual(found("publish"), ["ports", true]);
+  assert.deepEqual(found("console"), ["setup", true]);
+  for (const q of ["settings", "open", "sign", "go to", "new thread", "setup ports x", "theme"]) assert.deepEqual(found(q), ["", false], q);
+  for (const item of B.PALETTE_ITEMS) assert.ok(item.route === null || /^[a-z]+$/.test(item.route), item.id);
+});
+
+test("arrow keys walk Setup's rows and T3's as one list that wraps", () => {
+  const step = (key, own, at, ours = 2, theirs = 3) => { const r = B.paletteStep({ key, own, ours, theirs, at }); return [r.own, r.pass]; };
+  // Within Setup's rows: T3 never sees the key.
+  assert.deepEqual(step("ArrowDown", 0, -1), [1, false]);
+  assert.deepEqual(step("ArrowUp", 1, -1), [0, false]);
+  // Off Setup's last row: T3 lights its first itself when it has no active row yet...
+  assert.deepEqual(step("ArrowDown", 1, -1), [-1, true]);
+  // ...is left on it when it already is there, and wraps to it from its last.
+  assert.deepEqual(step("ArrowDown", 1, 0), [-1, false]);
+  assert.deepEqual(step("ArrowDown", 1, 2), [-1, true]);
+  // Up off T3's first row, or down off its last: into Setup's.
+  assert.deepEqual(step("ArrowUp", -1, 0), [1, false]);
+  assert.deepEqual(step("ArrowDown", -1, 2), [0, false]);
+  // Within T3's rows: T3's keys.
+  assert.deepEqual(step("ArrowDown", -1, 1), [-1, true]);
+  assert.deepEqual(step("ArrowUp", -1, 2), [-1, true]);
+  // Up off Setup's first row: round to T3's last, which T3 moves to itself.
+  assert.deepEqual(step("ArrowUp", 0, 0), [-1, true]);
+  // With nothing from T3, Setup's rows wrap among themselves.
+  assert.deepEqual(step("ArrowDown", 1, -1, 2, 0), [0, false]);
+  assert.deepEqual(step("ArrowUp", 0, -1, 2, 0), [1, false]);
+  // A fresh search where T3 has the highlight: down lights the top row, Setup's.
+  assert.deepEqual(step("ArrowDown", -1, -1), [0, false]);
+  assert.deepEqual(step("Enter", 0, -1), [0, true], "other keys are not its business");
+});
+
 test("the build step injects the bridge once, before </body>, or fails loudly", () => {
   const dir = mkdtempSync(join(tmpdir(), "t3-client-"));
   const shell = join(dir, "index.html");
