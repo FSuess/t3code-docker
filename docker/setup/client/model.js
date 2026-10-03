@@ -614,6 +614,30 @@ const T3Model = (() => {
     return TOOL_SPEC.test(id) && !id.includes('..') && !id.endsWith('/');
   };
 
+  // A backend spec half typed ("npm:"): what goes after the colon, and a real
+  // one to finish it with. mise has backends not listed here; they work the
+  // same, and only miss out on the example.
+  const SPEC_EXAMPLES = {
+    npm: ['package', 'npm:prettier'],
+    cargo: ['crate', 'cargo:ripgrep'],
+    pipx: ['package', 'pipx:black'],
+    gem: ['gem', 'gem:rubocop'],
+    go: ['module path', 'go:golang.org/x/tools/gopls'],
+    github: ['owner/repo', 'github:cli/cli'],
+    gitlab: ['owner/repo', 'gitlab:gitlab-org/cli'],
+    ubi: ['owner/repo', 'ubi:BurntSushi/ripgrep'],
+    aqua: ['package', 'aqua:cli/cli'],
+  };
+  /** Backend specs to suggest when nothing in the registry matches. */
+  const SPEC_SAMPLES = ['npm:prettier', 'cargo:ripgrep', 'github:cli/cli'];
+  /** The backend of a search that is a backend and a colon, and nothing yet after it; else null. */
+  const specPrefix = (query) => {
+    const m = /^([a-z][a-z0-9-]{0,31}):$/.exec(String(query || '').trim());
+    if (!m) return null;
+    const known = SPEC_EXAMPLES[m[1]];
+    return { backend: m[1], noun: known ? known[0] : null, example: known ? known[1] : null };
+  };
+
   // A release as listed: a version string, or `{ version, waiting, prerelease,
   // releasedAt, supported }` from /harnesses/versions and /packages/versions.
   const versionOf = (release) => String((release && typeof release === 'object' ? release.version : release) || '');
@@ -1237,7 +1261,7 @@ const T3Model = (() => {
     relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs, imageLabel,
     progressOf, progressText,
     agentRow, agentRows, toolRow, toolchainRow, toolchainRows, packageRows, portRows, looksLikeDatabase,
-    monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
+    monogram, managedOn, isVersionSpec, isToolSpec, specPrefix, SPEC_SAMPLES, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind, deviceName,
     readiness, readySummary, needsYou, activity, setupBanner,
     navBadges, attentionCount, summaries,

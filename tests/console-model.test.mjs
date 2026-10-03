@@ -359,6 +359,16 @@ test("the count T3 Code shows beside Setup is what needs the user, not what coul
   assert.equal(M.attentionCount(statusWith(), null, null), 0, "the server asks without any page state");
 });
 
+test("a backend half typed gets what goes after the colon, and a spec to finish it with", () => {
+  assert.deepEqual({ ...M.specPrefix("npm:") }, { backend: "npm", noun: "package", example: "npm:prettier" });
+  assert.deepEqual({ ...M.specPrefix(" cargo: ") }, { backend: "cargo", noun: "crate", example: "cargo:ripgrep" });
+  assert.deepEqual({ ...M.specPrefix("github:") }, { backend: "github", noun: "owner/repo", example: "github:cli/cli" });
+  assert.deepEqual({ ...M.specPrefix("pnpm:") }, { backend: "pnpm", noun: null, example: null }, "a backend it has no example for");
+  for (const q of ["npm", "npm:prettier", "npm::", ":", "NPM:", "", "foo bar:"]) assert.equal(M.specPrefix(q), null, q);
+  // Every example is a spec the search itself would offer.
+  for (const spec of [...M.SPEC_SAMPLES, "npm:prettier", "go:golang.org/x/tools/gopls"]) assert.ok(M.isToolSpec(spec), spec);
+});
+
 // --------------------------------------------------------------------- ports --
 
 test("port rows join what listens with what is published, and spot databases", () => {

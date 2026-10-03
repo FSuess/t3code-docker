@@ -336,6 +336,10 @@ const audit = () => {
       await page.waitForSelector(".tc-layer #tool-list .tc-option, .tc-layer .tc-combobox-note", { timeout: 30000 });
       await page.keyboard.type("kube");
     }],
+    ["tool spec hint", async (page) => {
+      await page.fill(".tc-layer #tool-q", "npm:");
+      await page.waitForSelector(".tc-layer .tc-combobox-note--stack", { timeout: 30000 });
+    }],
     ["agent release", async (page) => {
       await page.keyboard.press("Escape");
       await page.evaluate(() => { location.hash = "agents"; });

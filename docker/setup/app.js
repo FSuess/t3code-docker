@@ -1645,6 +1645,19 @@
       <span class="tc-option-text"><span class="tc-option-name">${marked(e.name, o.match)}</span>${e.description ? html`<span class="tc-option-desc">${e.description}</span>` : ''}</span>${meta}</li>`;
   };
 
+  // A backend spec to try, as a button that fills the search with it.
+  const specExample = (spec) => html`<button class="tc-chip-btn" type="button" data-sheet="spec" data-spec="${spec}">${spec}</button>`;
+  /** What to say when the search lists nothing: how to finish a half-typed spec, or that a spec works. */
+  const noToolMatch = (q) => {
+    const prefix = M.specPrefix(q);
+    if (prefix) {
+      return html`<div class="tc-combobox-note tc-combobox-note--stack" role="status"><span>${prefix.noun
+        ? html`Name the ${prefix.noun} after <code>${prefix.backend}:</code>, for example`
+        : html`Name the tool after <code>${prefix.backend}:</code>.`}</span>${prefix.example ? html`<span class="tc-chips">${specExample(prefix.example)}</span>` : ''}</div>`;
+    }
+    return html`<div class="tc-combobox-note tc-combobox-note--stack" role="status"><span>Nothing in mise’s registry matches. A backend spec works too, such as</span><span class="tc-chips">${M.SPEC_SAMPLES.map(specExample)}</span></div>`;
+  };
+
   const toolPicker = () => {
     const options = toolOptions();
     const q = toolSheet.query.trim();
@@ -1654,7 +1667,7 @@
         <div class="tc-palette-input">${icon('search', 'tc-muted')}<input id="tool-q" role="combobox" aria-expanded="true" aria-controls="tool-list" aria-autocomplete="list" aria-activedescendant="${options.length ? 'tool-opt-' + toolSheet.active : ''}" placeholder="kubectl, terraform, json, npm:prettier…" autocomplete="off" spellcheck="false" autocapitalize="off"></div>
         ${loading ? spinnerNote('Loading mise’s registry…')
           : options.length ? html`<ul class="tc-listbox tc-listbox--rich" id="tool-list" role="listbox" aria-label="${q ? 'Matching tools' : 'Suggested tools'}">${options.map(toolOption)}</ul>`
-            : html`<div class="tc-combobox-note">Nothing in the registry matches. A backend spec works too: <code>npm:prettier</code>, <code>cargo:ripgrep</code>, <code>github:owner/repo</code>.</div>`}
+            : noToolMatch(q)}
       </div>
       <span class="tc-hint">${registryLoad.error ? registryLoad.error + '. A backend spec still works.'
         : ui.registry ? (q ? '' : 'A few to start with. ') + 'Search ' + ui.registry.length.toLocaleString() + ' tools by name, command or what they do.' : ''}</span>`;
@@ -2004,6 +2017,19 @@
       const action = e.target.closest('[data-sheet]');
       if (!action) return;
       const what = action.getAttribute('data-sheet');
+      if (what === 'spec') {
+        // An example spec: into the search, offered at the top, ready for Enter.
+        toolSheet.query = action.getAttribute('data-spec');
+        toolSheet.active = 0;
+        renderToolSheet();
+        const input = panel.querySelector('#tool-q');
+        if (input) {
+          input.value = toolSheet.query;
+          input.focus();
+          input.setSelectionRange(input.value.length, input.value.length);
+        }
+        return;
+      }
       if (what === 'close') toolSheet.layer.close('cancel');
       else if (what === 'change') {
         Object.assign(toolSheet, { tool: null, info: null, releases: null, offered: null, error: null });

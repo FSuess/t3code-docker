@@ -333,6 +333,11 @@ html.tc-locked { overflow: hidden; }
 .tc-listbox--releases .tc-option-meta { flex: none; gap: 0; white-space: nowrap; }
 .tc-listbox--releases .tc-option-meta > span + span::before { content: "·"; padding: 0 6px; }
 .tc-combobox-note { display: flex; align-items: center; gap: var(--space-2); padding: 10px 12px; border-top: 1px solid var(--hairline); font-size: 13px; color: var(--fg-muted); }
+/* A sentence over a row of examples. The sentence's text and code flow as one
+   line that wraps, rather than each becoming a flex item of its own. */
+.tc-combobox-note--stack { flex-direction: column; align-items: flex-start; gap: 10px; padding: 12px; line-height: 1.45; }
+.tc-combobox-note--stack .tc-chips { justify-content: flex-start; margin-top: 0; gap: 6px; }
+.tc-combobox-note--stack .tc-chip-btn { height: var(--control-xs, 24px); padding: 0 10px; font-size: 12px; }
 .tc-tool-picked { display: flex; align-items: flex-start; gap: var(--space-3); }
 .tc-tool-picked-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
 .tc-kv--sheet { border: 1px solid color-mix(in srgb, var(--border) 60%, transparent); border-radius: var(--radius-lg); }
