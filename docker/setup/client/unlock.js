@@ -39,10 +39,42 @@
     input.focus();
   });
 
+  // The query without the failed-post flag: what the page was opened with,
+  // such as ?embed=t3 inside T3 Code, survives a wrong key and the unlock.
+  const kept = () => {
+    const params = new URLSearchParams(location.search);
+    params.delete('error');
+    const query = params.toString();
+    return query ? '?' + query : '';
+  };
+
   // Arriving from a failed no-script post: say so, then drop the flag so a
   // reload does not keep repeating it.
   if (new URLSearchParams(location.search).has('error')) {
-    history.replaceState(null, '', location.pathname + location.hash);
+    history.replaceState(null, '', location.pathname + kept() + location.hash);
+  }
+
+  // An embedded address opened in a tab of its own has nothing to close back to.
+  if (document.documentElement.hasAttribute('data-embed') && window.parent === window) {
+    location.replace(BASE + '/' + location.hash);
+    return;
+  }
+
+  // Opened inside T3 Code's settings: Close and Escape hand back to T3 Code,
+  // which also keeps the theme in step.
+  if (document.documentElement.getAttribute('data-embed') === 't3' && window.parent !== window) {
+    const close = () => window.parent.postMessage({ source: 't3-setup', type: 'close' }, location.origin);
+    for (const button of document.querySelectorAll('[data-cmd="embed.close"]')) button.addEventListener('click', close);
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !e.isComposing) close(); });
+    window.addEventListener('message', (e) => {
+      const m = e.data;
+      if (e.source !== window.parent || e.origin !== location.origin || !m || m.source !== 't3-code') return;
+      if (m.type === 'theme' && (m.theme === 'light' || m.theme === 'dark')) {
+        document.documentElement.setAttribute('data-theme', m.theme);
+        document.documentElement.setAttribute('data-theme-mode', m.theme);
+      }
+    });
+    window.parent.postMessage({ source: 't3-setup', type: 'ready' }, location.origin);
   }
 
   form.addEventListener('submit', async (event) => {
@@ -61,7 +93,7 @@
         credentials: 'same-origin',
       });
       if (res.ok) {
-        location.replace(BASE + '/' + location.hash);
+        location.replace(BASE + '/' + kept() + location.hash);
         return;
       }
       showError(res.status === 401

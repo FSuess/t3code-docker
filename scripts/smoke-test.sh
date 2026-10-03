@@ -158,7 +158,7 @@ T3_BINARY="$(docker exec "$NAME" printenv T3_INFRA_BINARY 2>/dev/null || true)"
 [ -n "$T3_BINARY" ] || T3_BINARY="${T3_PREFIX}/t3"
 check "the immutable T3 platform binary is where the image says it is" \
   "docker exec $NAME test -x $T3_BINARY"
-check "the T3 client shell is available for the setup pill" \
+check "the T3 client shell is available for the setup bridge" \
   "docker exec $NAME test -f $T3_PREFIX/client/index.html"
 check "T3 is not installed in the mutable npm prefix" \
   "docker exec $NAME test ! -e /opt/npm-global/lib/node_modules/t3"
@@ -456,11 +456,63 @@ lock_signs_out() {
 check "Lock console signs the browser out" lock_signs_out
 
 # The setup console is the front door for a fresh install, but T3 Code's own
-# UI does not link to it - the pill injected into the client shell is the only
-# route back. Assert it is in the served HTML, not just the built file, so a
-# T3 bump cannot quietly drop it.
+# UI does not link to it - the bridge injected into the client shell (the pill
+# on the pairing screen, Setup in Settings) is the only route back. Assert it
+# is in the served HTML, not just the built file, so a T3 bump cannot quietly
+# drop it.
 check "the T3 client links to the setup console" \
-  "docker exec $NAME sh -c 'curl -fsS http://127.0.0.1:3773/ | grep -q t3-setup-pill'"
+  "output_has 'docker exec $NAME curl -fsS http://127.0.0.1:3773/' 'data-t3-setup-bridge'"
+
+# T3 Code's settings open the console in a dialog, signed in on the browser's
+# own T3 session. T3 vouches for the session (with a terminal, which could read
+# the setup key anyway), the console trusts only T3's word, and nothing that
+# changes state is accepted from another site, whatever the cookie.
+T3_COOKIE=""
+t3_browser_session() {
+  T3_COOKIE="$(docker exec "$NAME" node -e '
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync("t3", ["auth", "pairing", "create", "--base-url", "http://127.0.0.1", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const { credential } = JSON.parse(out.slice(out.indexOf("{")));
+    fetch("http://127.0.0.1:3773/api/auth/browser-session", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ credential }) })
+      .then((r) => process.stdout.write((r.headers.get("set-cookie") || "").split(";")[0]));
+  ')" && [[ "$T3_COOKIE" == t3_session* ]]
+}
+check "a pairing credential becomes a T3 browser session" t3_browser_session
+console_code() { docker exec "$NAME" curl -sS -o /dev/null -w '%{http_code}' --max-time 25 "$@"; }
+t3_session_opens_console() {
+  local body
+  body="$(docker exec "$NAME" curl -fsS --max-time 25 -H "cookie: $T3_COOKIE" http://127.0.0.1:3774/status)" || return 1
+  printf '%s' "$body" | python3 -c 'import json, sys; assert json.load(sys.stdin)["viewer"] == {"via": "t3"}'
+}
+check "the console accepts a session T3 vouches for" t3_session_opens_console
+check "and not one T3 does not" \
+  "[ \"\$(console_code -H \"cookie: \${T3_COOKIE}x\" http://127.0.0.1:3774/status)\" = 401 ]"
+revoke_code() {
+  console_code -H "cookie: $T3_COOKIE" -H 'content-type: application/json' "$@" \
+    -d '{"kind":"link","id":"none"}' http://127.0.0.1:3774/revoke
+}
+check "a state change from another site is refused" \
+  "[ \"\$(revoke_code -H 'sec-fetch-site: cross-site')\" = 403 ] && [ \"\$(revoke_code -H 'sec-fetch-site: same-site')\" = 403 ]"
+check "a T3 session changes nothing unless the browser says it came from here" \
+  "[ \"\$(revoke_code)\" = 401 ]"
+hello_says_only_what_it_may() {
+  local stranger member
+  stranger="$(docker exec "$NAME" curl -fsS --max-time 25 http://127.0.0.1:3774/__setup/hello)" || return 1
+  member="$(docker exec "$NAME" curl -fsS --max-time 25 -H "cookie: $T3_COOKIE" http://127.0.0.1:3774/__setup/hello)" || return 1
+  python3 - "$stranger" "$member" <<'PY'
+import json, sys
+stranger, member = (json.loads(a) for a in sys.argv[1:3])
+assert stranger == {"service": "t3-setup", "signedIn": False}, stranger
+assert member["signedIn"] is True and isinstance(member["attention"], int), member
+PY
+}
+check "the console tells T3's page where it is, and a stranger nothing more" hello_says_only_what_it_may
+framed_by_its_own_origin_only() {
+  local headers
+  headers="$(docker exec "$NAME" curl -sS -o /dev/null -D - http://127.0.0.1:3774/)" || return 1
+  grep -qi '^x-frame-options: SAMEORIGIN' <<<"$headers" && grep -qi "frame-ancestors 'self'" <<<"$headers"
+}
+check "only its own origin may frame the console" framed_by_its_own_origin_only
 
 # Pulling a new image should be confirmable from the page itself rather than by
 # guessing, so the build is stamped in at the end of the Dockerfile and shown in
@@ -1003,6 +1055,28 @@ console_layout_is_clean() {
 }
 check "the console has no layout defects" console_layout_is_clean
 
+# The bridge on T3's own pages, in a real browser, with the console routed
+# beside T3 on one origin (the audit starts that router itself): the pill
+# before pairing, Setup in Settings, the dialog and its phone layout.
+setup_bridge_works() {
+  [ "$HAS_BROWSER" -eq 1 ] || return 0
+  local credential
+  credential="$(docker exec "$NAME" node -e '
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync("t3", ["auth", "pairing", "create", "--base-url", "http://127.0.0.1", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    process.stdout.write(JSON.parse(out.slice(out.indexOf("{"))).credential);
+  ')" || return 1
+  docker cp scripts/setup-bridge-audit.js "$NAME:/tmp/setup-bridge-audit.js" >/dev/null 2>&1 || return 1
+  { printf '\nsetup-bridge-audit:\n'
+    docker exec \
+      -e NODE_PATH=/opt/t3-mcp/lib/node_modules/@playwright/mcp/node_modules \
+      -e CHROME_PATH=/usr/bin/chromium \
+      -e T3_PAIR_CREDENTIAL="$credential" \
+      "$NAME" node /tmp/setup-bridge-audit.js 2>&1
+  } >>"$UI_AUDIT_LOG"
+}
+check "T3 Code's pages reach the console: the pill, Setup in Settings, the dialog" setup_bridge_works
+
 check "the browser gets the client script verbatim" client_script_is_verbatim
 check "and those scripts parse" \
   "docker exec $NAME sh -c 'for f in /opt/t3-setup/app.js /opt/t3-setup/client/*.js /opt/t3-setup/design/ui.js; do node --check \"\$f\" || exit 1; done'"
@@ -1101,7 +1175,7 @@ docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true
 
 printf '\n%d passed, %d failed\n\n' "$pass" "$fail"
 if [ "$fail" -gt 0 ] && [ -s "$UI_AUDIT_LOG" ]; then
-  printf 'Console layout audit output:\n'
+  printf 'Browser audit output:\n'
   sed 's/^/  /' "$UI_AUDIT_LOG"
   printf '\n'
 fi

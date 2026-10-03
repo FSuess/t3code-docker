@@ -1012,6 +1012,19 @@ const T3Model = (() => {
     };
   };
 
+  /**
+   * How many things need the person, counted as the sidebar's warn badges
+   * count them: agents signed out or failing, tools that failed, ports that
+   * would not publish, settings an older image left behind. Updates are not
+   * counted; they are offered, not owed, and some agent has one most days.
+   * T3 Code's settings show this beside Setup.
+   */
+  const attentionCount = (status, ports, ui) => {
+    const badges = navBadges(status, ports, ui);
+    return ['agents', 'toolchains', 'ports', 'environment']
+      .reduce((n, route) => n + (badges[route] && badges[route].tone === 'warn' ? badges[route].count : 0), 0);
+  };
+
   // -------------------------------------------------------------- summary --
   const summaries = (status, ports, ui, now, host) => {
     const s = status || {};
@@ -1218,7 +1231,7 @@ const T3Model = (() => {
     monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind,
     readiness, readySummary, needsYou, activity, setupBanner,
-    navBadges, summaries,
+    navBadges, attentionCount, summaries,
     paletteItems, searchPalette,
     redactedDiagnostics,
   };

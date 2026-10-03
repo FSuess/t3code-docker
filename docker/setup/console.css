@@ -42,6 +42,10 @@ html.tc-locked { overflow: hidden; }
 .tc-main:focus { outline: none; }
 .tc-topbar-summary { min-width: 0; }
 .tc-topbar-actions { display: flex; align-items: center; gap: 8px; flex: none; }
+/* Inside T3 Code's settings the console is a dialog, closed from the end of
+   the top bar (the phone's too), set apart from the page's own actions. */
+.tc-topbar-sep { width: 1px; height: 16px; background: var(--border); flex: none; margin: 0 2px; }
+.tc-topbar-actions:empty + .tc-topbar-sep { display: none; }
 
 /* The phone's top bar: brand, the server's health in a word, search. */
 .tc-phonebar { display: none; align-items: center; gap: 8px; height: var(--phonebar-h); padding: 0 12px 0 16px; flex: none;
@@ -211,7 +215,9 @@ html.tc-locked { overflow: hidden; }
 
 /* Unlock: the standalone card, full height. */
 .tc-standalone { min-height: 100vh; min-height: 100dvh; }
-.tc-masthead-in { padding: 24px; }
+.tc-masthead-in { padding: 24px; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.tc-masthead .tc-embed-close { margin: -8px -8px 0 0; color: color-mix(in srgb, var(--on-stage) 80%, transparent); --_icon: currentColor; }
+.tc-masthead .tc-embed-close:hover { color: var(--on-stage); background: rgb(255 255 255 / 0.12); }
 .tc-unlock-form { display: flex; flex-direction: column; gap: var(--space-4); margin-top: var(--space-6); }
 .tc-unlock-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .tc-standalone .tc-note { margin-top: var(--space-6); }

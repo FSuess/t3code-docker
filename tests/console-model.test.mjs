@@ -337,6 +337,28 @@ test("navigation badges warn about what needs the user, and count what is live",
   assert.deepEqual(plain(M.navBadges(s, failedPort, ui()).ports), { tone: "warn", count: 1 });
 });
 
+test("the count T3 Code shows beside Setup is what needs the user, not what could be updated", () => {
+  const s = statusWith({
+    harnesses: [
+      harness("claude", { latestVersion: "2.0.0" }),
+      harness("codex", { signedIn: false }),
+      harness("opencode", { failed: true, failure: "x", operation: "update" }),
+      harness("grok"),
+      harness("cursor"),
+    ],
+    toolchains: [toolchain("go", { failed: true, failure: "y", operation: "update" }), toolchain("rust", { latestVersion: "9.9.9" })],
+    legacyEnv: ["GOROOT"],
+  });
+  // codex signed out, opencode failed, go failed, an old image's setting:
+  // four. Claude's and Rust's updates are offered, not owed.
+  assert.equal(M.attentionCount(s, null, ui()), 4);
+  assert.equal(M.needsYou(s, null, ui()).length, 5, "the Overview still lists updates");
+  const failedPort = { available: true, listening: [8080], tunnels: [{ port: 8080, state: "failed", error: "edge" }] };
+  assert.equal(M.attentionCount(s, failedPort, ui()), 5, "a port that would not publish counts when ports are known");
+  assert.equal(M.attentionCount(statusWith(), null, ui()), 0);
+  assert.equal(M.attentionCount(statusWith(), null, null), 0, "the server asks without any page state");
+});
+
 // --------------------------------------------------------------------- ports --
 
 test("port rows join what listens with what is published, and spot databases", () => {

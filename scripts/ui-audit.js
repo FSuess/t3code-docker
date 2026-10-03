@@ -13,7 +13,8 @@
  *
  * Every route is measured at every viewport, and so are the overlays a person
  * opens most: a row's menu (a bottom sheet on a phone), the uninstall dialog,
- * the command palette and the pairing ceremony.
+ * the command palette and the pairing ceremony. Then again embedded, as T3
+ * Code's settings open the console in a dialog.
  *
  * Exits non-zero when it finds something.
  */
@@ -34,6 +35,14 @@ const CHROME = process.env.CHROME_PATH
 
 // Viewports worth checking: the narrowest phone, the split point, and a desktop.
 const VIEWPORTS = [[360, 800], [390, 844], [820, 1180], [1100, 1000], [1440, 900]];
+// And the console as T3 Code's settings show it, in a dialog: on a phone, where
+// the dialog fills the screen, and at the dialog's own size on a desktop.
+const EMBEDDED = [[390, 844], [1198, 878]];
+const embedded = (url) => { const u = new globalThis.URL(url); u.searchParams.set("embed", "t3"); return u.href; };
+const RUNS = [
+  ...VIEWPORTS.map((viewport) => ({ url: URL, viewport, tag: "" })),
+  ...EMBEDDED.map((viewport) => ({ url: embedded(URL), viewport, tag: " embedded" })),
+];
 
 const audit = () => {
   const findings = [];
@@ -266,6 +275,21 @@ const audit = () => {
 
   // What to measure at each size: every route, then the overlays.
   const ROUTES = ["overview", "devices", "agents", "toolchains", "ports", "environment", "more"];
+  /** A host page on the console's origin holding the console in a frame; the frame, with the page's keyboard. */
+  const framed = async (page, url) => {
+    const host = new globalThis.URL("/__ui-audit-host", url).href;
+    await page.route(host, (route) => route.fulfill({
+      contentType: "text/html",
+      body: `<!doctype html><style>html,body{margin:0;height:100%}iframe{display:block;border:0;width:100%;height:100%}</style><iframe src="${url}"></iframe>`,
+    }));
+    await page.goto(host, { waitUntil: "domcontentloaded" });
+    const frame = await (await page.waitForSelector("iframe")).contentFrame();
+    await frame.waitForSelector("input[type=password]", { timeout: 60000 });
+    return new Proxy(frame, {
+      get: (f, key) => (key === "keyboard" ? page.keyboard : typeof f[key] === "function" ? f[key].bind(f) : f[key]),
+    });
+  };
+
   const settle = async (page) => {
     // Text metrics decide the boxes this audit compares, so wait for fonts,
     // then let the browser render two frames of the settled layout.
@@ -329,7 +353,7 @@ const audit = () => {
     }],
   ];
 
-  for (const [width, height] of VIEWPORTS) {
+  for (const { url, viewport: [width, height], tag } of RUNS) {
     // Measure a settled page: reduced motion disables the transitions and
     // animations the stylesheet already gates behind that preference, so a
     // background poll cannot repaint a row mid-measurement and leave
@@ -340,29 +364,39 @@ const audit = () => {
       reducedMotion: "reduce",
     });
     const page = await ctx.newPage();
-    await page.goto(URL, { waitUntil: "domcontentloaded" });
-    await page.fill("input[type=password]", KEY);
-    await page.click("button[type=submit]");
-    await page.waitForSelector("#page-overview .tc-check, #page-overview .tc-ready-line", { timeout: 60000 });
+    // Embedded, the console is in a frame, as in T3 Code's dialog: a host page
+    // on its own origin holds it, and the states below drive the frame (keys
+    // still go through the page, to whichever frame has focus).
+    const target = tag ? await framed(page, url) : page;
+    if (!tag) await page.goto(url, { waitUntil: "domcontentloaded" });
+    await target.fill("input[type=password]", KEY);
+    await target.click("button[type=submit]");
+    await target.waitForSelector("#page-overview .tc-check, #page-overview .tc-ready-line", { timeout: 60000 });
 
-    const label = `${width}x${height}`;
+    const label = `${width}x${height}${tag}`;
     let found = 0;
+    // Make sure the frame really is the embedded console, not the plain page.
+    if (tag && !(await target.evaluate(() => document.documentElement.getAttribute("data-embed") === "t3"
+      && [...document.querySelectorAll('[data-cmd="embed.close"]')].some((b) => b.getClientRects().length)))) {
+      console.log(`  ${label.padEnd(19)} the console in the frame is not embedded, or has no visible close button`);
+      found += 1;
+    }
     for (const [state, reach] of STATES) {
-      await reach(page);
-      await settle(page);
-      const findings = await page.evaluate(audit);
+      await reach(target);
+      await settle(target);
+      const findings = await target.evaluate(audit);
       if (!findings.length) continue;
       found += findings.length;
-      console.log(`  ${label.padEnd(10)} ${state}: ${findings.length} finding(s)`);
+      console.log(`  ${label.padEnd(19)} ${state}: ${findings.length} finding(s)`);
       for (const f of findings) {
         console.log(`      ${f.kind}: ${f.detail}`);
         if (f.where) console.log(`        at ${f.where}`);
       }
     }
-    if (!found) console.log(`  ${label.padEnd(10)} clean (${STATES.length} states)`);
+    if (!found) console.log(`  ${label.padEnd(19)} clean (${STATES.length} states)`);
     total += found;
     // The link this made is not for anyone; leave no unused link behind.
-    await page.evaluate(async () => {
+    await target.evaluate(async () => {
       const button = document.querySelector("#page-devices .tc-card-foot [data-cmd='link.revoke']");
       if (!button) return;
       await fetch((window.__T3_SETUP_BASE__ || "") + "/revoke", {

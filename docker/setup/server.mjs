@@ -15,6 +15,7 @@ import { timingSafeEqual, randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { gzip as gzipCallback } from "node:zlib";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import vm from "node:vm";
 import {
   withTimeout,
   createProviderCache,
@@ -26,6 +27,7 @@ import { createStorageFacts } from "./storage.mjs";
 import { createLatestCache } from "./latest.mjs";
 import { createT3Api } from "./t3-api.mjs";
 import { createAntigravity } from "./antigravity.mjs";
+import { createT3Sessions } from "./t3-session.mjs";
 
 const run = promisify(execFile);
 const gzip = promisify(gzipCallback);
@@ -112,6 +114,21 @@ const t3Api = createT3Api({
 const antigravity = createAntigravity({ api: t3Api });
 const T3_AGENT_IDS = new Set(["antigravity"]);
 const isConsoleSession = (session) => session?.subject === CONSOLE_SUBJECT;
+
+// A browser signed in to T3 Code with terminal access may use the console
+// without the key: see t3-session.mjs for why that grants nothing new.
+// T3_SETUP_ACCEPT_T3_SESSIONS=0 asks every browser for the key again.
+const ACCEPT_T3_SESSIONS = !/^(0|false|no|off)$/i.test(String(process.env.T3_SETUP_ACCEPT_T3_SESSIONS ?? "").trim());
+const t3Sessions = createT3Sessions({ baseUrl: `http://127.0.0.1:${T3_PORT}` });
+
+// The page's own view model, run here once so that the count T3 Code's
+// settings show beside Setup is the one the console's own badges add up to.
+const Model = (() => {
+  const { code } = ASSETS.console.find((script) => script.path === "client/model.js");
+  const context = vm.createContext({ URL });
+  vm.runInContext(`${code}\nthis.T3Model = T3Model;`, context, { filename: "client/model.js" });
+  return context.T3Model;
+})();
 
 const health = async () => {
   try {
@@ -1614,7 +1631,7 @@ const cancelLifecycle = (target, rawId) => {
   return { http: 404, body: { ok: false, code: "not-running", error: "Nothing is running or waiting for that row." } };
 };
 
-const ROUTES = ["/login", "/logout", "/status", "/pair", "/revoke", "/ports",
+const ROUTES = ["/login", "/logout", "/hello", "/status", "/pair", "/revoke", "/ports",
   "/ports/expose", "/ports/unexpose",
   "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses/enable", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
@@ -1643,7 +1660,9 @@ const sendPage = async (req, res, render) => {
     "content-security-policy": contentSecurityPolicy(nonce),
     "referrer-policy": "no-referrer",
     "x-content-type-options": "nosniff",
-    "x-frame-options": "DENY",
+    // T3 Code's settings open the console in a frame on the same origin;
+    // nothing else may (frame-ancestors says the same to newer browsers).
+    "x-frame-options": "SAMEORIGIN",
     vary: "accept-encoding, cookie",
   };
   if (/\bgzip\b/.test(String(req.headers["accept-encoding"] ?? ""))) {
@@ -1653,6 +1672,40 @@ const sendPage = async (req, res, render) => {
 };
 
 const wantsJson = (req) => /application\/json/.test(String(req.headers.accept ?? ""));
+
+// Where the browser says a request came from. A page on another site, or on a
+// sibling subdomain (which cookies count as the same site), can make the
+// browser send a request here with its cookies; nothing that changes state is
+// accepted unless it came from this origin. The in-container CLIs send no such
+// header, and authenticate with the key header rather than a cookie.
+const fetchSite = (req) => String(req.headers["sec-fetch-site"] ?? "");
+const fromElsewhere = (req) => !["", "same-origin", "none"].includes(fetchSite(req));
+const SAFE_METHODS = new Set(["GET", "HEAD"]);
+
+/**
+ * Who is asking: `{ via: "key" }` for the setup key (cookie or header),
+ * `{ via: "t3" }` for a T3 Code session T3 vouches for, otherwise null. A T3
+ * session only counts for a state change when the browser says the request
+ * came from this origin, because its cookie is not SameSite=Strict.
+ */
+const viewerOf = async (req) => {
+  if (keyMatches(cookieFrom(req)) || keyMatches(req.headers["x-t3-setup-key"])) return { via: "key" };
+  if (!ACCEPT_T3_SESSIONS) return null;
+  if (!SAFE_METHODS.has(req.method) && fetchSite(req) !== "same-origin") return null;
+  return (await t3Sessions.verify(req.headers.cookie)) ? { via: "t3" } : null;
+};
+
+// What needs the person, counted as the console's own badges count it, for
+// the T3 Code settings entry. Ports are left out: listing them is the costly
+// part of a poll, and a failed publish is rare. Kept briefly, since T3 asks
+// each time its settings open.
+let attentionCache = { at: 0, count: null };
+const attentionCount = async () => {
+  if (attentionCache.count !== null && Date.now() - attentionCache.at < 10_000) return attentionCache.count;
+  const count = Model.attentionCount(await status(), null, null);
+  attentionCache = { at: Date.now(), count };
+  return count;
+};
 
 /**
  * Work out which prefix this request arrived under, and which route it wants.
@@ -1699,12 +1752,29 @@ const server = createServer(async (req, res) => {
   // The page sends a cookie; the in-container CLIs send a header. Same key,
   // same comparison - so `t3-expose` and the page are the same client as far
   // as this server is concerned, and neither can act on state the other cannot.
-  const authed = keyMatches(cookieFrom(req)) || keyMatches(req.headers["x-t3-setup-key"]);
+  // A browser signed in to T3 Code may come in on that session instead.
+  const viewer = await viewerOf(req).catch(() => null);
+  const authed = Boolean(viewer);
+  // Opened inside T3 Code's settings rather than on its own.
+  const embed = raw.searchParams.get("embed") === "t3";
 
   try {
     // Don't answer asset probes with the page.
     if (route === "/" && /\.[a-z0-9]{1,5}$/i.test(raw.pathname)) {
       return sendJson(res, 404, { error: "not found" });
+    }
+
+    if (req.method === "POST" && fromElsewhere(req)) {
+      return sendJson(res, 403, { error: "This request came from another site." });
+    }
+
+    // T3 Code's client asks this to learn whether the console is routed on
+    // its origin, and whether this browser can open it without the key. A
+    // stranger learns only that the console exists, which its own page says.
+    if (req.method === "GET" && route === "/hello") {
+      const body = { service: "t3-setup", signedIn: authed };
+      if (authed) body.attention = await attentionCount().catch(() => null);
+      return sendJson(res, 200, body);
     }
 
     // The unlock form posts here. Without JavaScript it is a plain form post
@@ -1715,12 +1785,12 @@ const server = createServer(async (req, res) => {
       if (!keyMatches(body.get("key"))) {
         await throttle(ip);
         if (wantsJson(req)) return sendJson(res, 401, { ok: false, error: "That key was not accepted." });
-        return send(res, 303, "", { location: `${mount}/?error=1` });
+        return send(res, 303, "", { location: `${mount}/?${body.get("embed") === "t3" ? "embed=t3&" : ""}error=1` });
       }
       failures.delete(ip);
       const setCookie = cookie(req, mount, encodeURIComponent(KEY), 86400);
       if (wantsJson(req)) return sendJson(res, 200, { ok: true }, { "set-cookie": setCookie });
-      return send(res, 303, "", { location: `${mount}/`, "set-cookie": setCookie });
+      return send(res, 303, "", { location: `${mount}/${body.get("embed") === "t3" ? "?embed=t3" : ""}`, "set-cookie": setCookie });
     }
 
     // Lock console: forget this browser. Needs no key - signing out is never
@@ -1731,11 +1801,11 @@ const server = createServer(async (req, res) => {
     }
 
     if (route === "/") {
-      if (authed) return sendPage(req, res, (nonce) => renderConsole({ assets: ASSETS, nonce, mount }));
+      if (authed) return sendPage(req, res, (nonce) => renderConsole({ assets: ASSETS, nonce, mount, embed }));
       // The host the browser asked for, for the card's eyebrow; escaped by the template.
       const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? "").split(",")[0].trim().slice(0, 200);
       return sendPage(req, res, (nonce) => renderUnlock({
-        assets: ASSETS, nonce, mount, host, publicUrl: PUBLIC_URL, error: raw.searchParams.get("error") === "1",
+        assets: ASSETS, nonce, mount, host, publicUrl: PUBLIC_URL, error: raw.searchParams.get("error") === "1", embed,
       }));
     }
 
@@ -1744,7 +1814,9 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 401, { error: "unauthorized" });
     }
 
-    if (route === "/status") return sendJson(res, 200, await status());
+    // `viewer` says how this browser got in, so the page offers Lock only
+    // where locking would end something.
+    if (route === "/status") return sendJson(res, 200, { ...(await status()), viewer: { via: viewer.via } });
 
     if (req.method === "GET" && route === "/harnesses") {
       try {
@@ -1963,7 +2035,10 @@ const server = createServer(async (req, res) => {
 
     if (req.method === "POST" && route === "/revoke") {
       try {
-        return sendJson(res, 200, await revoke(JSON.parse((await readBody(req)) || "{}")));
+        const result = await revoke(JSON.parse((await readBody(req)) || "{}"));
+        // A revoked device must not stay trusted here for the cache's half minute.
+        t3Sessions.forget();
+        return sendJson(res, 200, result);
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }

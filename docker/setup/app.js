@@ -34,6 +34,23 @@
   const $ = (id) => document.getElementById(id);
   const now = () => Date.now();
 
+  // ------------------------------------------------------------- embedded --
+  // Opened from T3 Code's settings, in a dialog over T3 Code
+  // (docker/t3-client/setup-bridge.js), rather than on its own. The two
+  // documents share an origin and talk by message: this page says when it is
+  // ready, when the person asked to close it and how many things need them;
+  // T3 Code passes its theme. Nothing else is accepted from anywhere else.
+  const EMBED = document.documentElement.getAttribute('data-embed') === 't3' && window.parent !== window;
+  const toHost = (type, detail) => {
+    if (EMBED) window.parent.postMessage(Object.assign({ source: 't3-setup', type }, detail), location.origin);
+  };
+  // An embedded address opened in a tab of its own (copied, say) has nothing
+  // to close back to: show the page as itself.
+  if (!EMBED && document.documentElement.hasAttribute('data-embed')) {
+    location.replace(BASE + '/' + location.hash);
+    return;
+  }
+
   // ------------------------------------------------------------------ api --
   let locked = false;
   /**
@@ -57,7 +74,7 @@
     // cookie expired. The page itself asks for the key again.
     if (res.status === 401 && !locked) {
       locked = true;
-      location.replace(BASE + '/' + location.hash);
+      location.replace(BASE + '/' + location.search + location.hash);
     }
     const data = await res.json().catch(() => ({}));
     const ok = res.ok && data.ok !== false;
@@ -101,6 +118,9 @@
   // Where each kind of row's operations live in the API.
   const LIFECYCLE_PATH = { harness: 'harnesses', toolchain: 'toolchains', package: 'packages' };
 
+  /** Whether this browser came in on its T3 Code session rather than the key, so Lock would end nothing. */
+  const viaT3 = (s) => Boolean(s && s.viewer && s.viewer.via === 't3');
+
   /** Where "Open T3 Code" goes: the public URL, else T3 Code beside this page. */
   const t3Url = () => {
     const s = state.status;
@@ -137,6 +157,7 @@
         settleOperations(res.data);
         trackPairing(res.data);
         loadProvidersOnce();
+        tellAttention();
       } else if (!locked) {
         // Name the URL and the reason. "Could not read status" sent someone
         // hunting a migration bug when the page was calling the wrong path.
@@ -147,6 +168,14 @@
       if (!document.hidden && !locked) statusTimer = setTimeout(loadStatus, busyNow(state.status) ? FAST_MS : POLL_MS);
     })().finally(() => { statusLoading = null; });
     return statusLoading;
+  };
+
+  // T3 Code shows the count beside Setup; the closed dialog keeps the last one.
+  let toldAttention = null;
+  const tellAttention = () => {
+    const count = M.attentionCount(state.status, null, ui);
+    if (count !== toldAttention) toHost('attention', { count });
+    toldAttention = count;
   };
 
   // Polled separately and more often: a tunnel takes a few seconds to be
@@ -489,7 +518,7 @@
       <div class="tc-ready-line">
         <span class="tc-check-mark" aria-hidden="true">${icon('check')}</span>
         <div class="tc-row-main"><h1 class="tc-ready-line-title" id="ready-title">Ready</h1><span class="tc-status">${M.readySummary(s, ui)}</span></div>
-        <a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">Open T3 Code${icon('arrow-right')}</a>
+        ${EMBED ? '' : html`<a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">Open T3 Code${icon('arrow-right')}</a>`}
       </div>
     </section>`;
 
@@ -685,8 +714,10 @@
         <div class="tc-group tc-group--brand" data-key="pair-done"><div class="tc-card-body tc-pair-done">
           ${pairSteps(m)}
           ${emptyIcon('smartphone', 'tc-icon--lg')}
-          <div class="tc-pair-done-text"><h3 class="tc-pair-done-title">Paired with ${m.pairedName}</h3><p class="tc-page-lede">It is already signed in. You can close this page.</p></div>
-          <div class="tc-pair-done-actions"><a class="tc-btn tc-btn--primary" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a><button class="tc-btn tc-btn--ghost" type="button" data-cmd="pair.new">Pair another device</button></div>
+          <div class="tc-pair-done-text"><h3 class="tc-pair-done-title">Paired with ${m.pairedName}</h3><p class="tc-page-lede">It is already signed in.${EMBED ? '' : ' You can close this page.'}</p></div>
+          <div class="tc-pair-done-actions">${EMBED
+            ? html`<button class="tc-btn tc-btn--primary" type="button" data-cmd="embed.close">Done</button>`
+            : html`<a class="tc-btn tc-btn--primary" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a>`}<button class="tc-btn tc-btn--ghost" type="button" data-cmd="pair.new">Pair another device</button></div>
         </div></div>`;
     }
     if (m.outcome) {
@@ -961,7 +992,9 @@
         ${keySource ? html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Setup key</span><span class="tc-status tc-status--prose">${keySource === 'generated'
           ? html`Generated at boot, so it changes when the container is recreated. Set <code>T3_SETUP_KEY</code> to keep it.`
           : html`Pinned with <code>T3_SETUP_KEY</code>, so it survives a recreate.`}</span></div>${keySource === 'generated' ? html`<span class="tc-badge tc-badge--warn">Not pinned</span>` : html`<span class="tc-badge tc-badge--ok">Pinned</span>`}</div>` : ''}
-        <div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Lock console</span><span class="tc-status">Ends this browser’s session. You will need the setup key to come back.</span></div><button class="tc-btn tc-btn--sm" type="button" data-cmd="lock">${icon('lock')}Lock</button></div>
+        ${viaT3(s)
+          ? html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Signed in through T3 Code</span><span class="tc-status tc-status--prose">This browser is paired with T3 Code, which already gives it a terminal here, so the console did not ask for the key. Revoking the device under Devices ends both.</span></div></div>`
+          : html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Lock console</span><span class="tc-status">Ends this browser’s session. You will need the setup key to come back.</span></div><button class="tc-btn tc-btn--sm" type="button" data-cmd="lock">${icon('lock')}Lock</button></div>`}
         <div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Turn the console off</span><span class="tc-status tc-status--prose">Set <code>T3_SETUP_ENABLED=0</code> once you are set up. Pairing then needs <code>t3-pair</code> in a shell.</span></div>${copyButton('T3_SETUP_ENABLED=0', 'Copy T3_SETUP_ENABLED=0', { iconOnly: true, size: 'tc-btn--sm' })}</div>
       </div></div>`)}`;
   };
@@ -979,14 +1012,16 @@
         <a class="tc-linkrow" href="#toolchains">${icon('wrench')}Toolchains<span class="tc-linkrow-aside">${failedTools ? M.plural(failedTools, 'needs', 'need') + ' you' : tools + ' installed'}</span>${icon('chevron-right')}</a>
         <a class="tc-linkrow" href="#environment">${icon('settings-2')}Environment<span class="tc-linkrow-aside tc-truncate">${M.imageLabel(image).version || ''}</span>${icon('chevron-right')}</a>
       </div>`, { level: 'h1' })}
-      ${section('pm-app', 'Appearance', html`<div class="tc-group"><div class="tc-linkrow">Theme${themeSeg()}</div></div>`)}
+      ${section('pm-app', 'Appearance', html`<div class="tc-group"><div class="tc-linkrow">Theme${EMBED ? html`<span class="tc-linkrow-aside">Follows T3 Code</span>` : themeSeg()}</div></div>`)}
       ${section('pm-srv', 'This server', html`<div class="tc-group">
         <div class="tc-readouts tc-readouts--two">
           <div class="tc-readout"><span class="tc-readout-label">T3 Code</span><span class="tc-readout-value">${dot(server.ok ? 'ok' : 'danger')}${server.ok ? server.version || 'Running' : 'Down'}</span></div>
           <div class="tc-readout"><span class="tc-readout-label">Image</span><span class="tc-readout-value tc-mono tc-mono--body"><span class="tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || '—'}</span></span></div>
         </div>
-        <a class="tc-linkrow tc-linkrow--top" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code${icon('chevron-right')}</a>
-        <button class="tc-linkrow tc-linkrow--danger" type="button" data-cmd="lock">${icon('lock')}Lock console</button>
+        ${EMBED
+          ? html`<a class="tc-linkrow tc-linkrow--top" href="${BASE + '/' + location.hash}" target="_blank" rel="noopener" data-open-tab>${icon('external-link')}Open in a new tab${icon('chevron-right')}</a>`
+          : html`<a class="tc-linkrow tc-linkrow--top" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code${icon('chevron-right')}</a>`}
+        ${viaT3(s) ? '' : html`<button class="tc-linkrow tc-linkrow--danger" type="button" data-cmd="lock">${icon('lock')}Lock console</button>`}
       </div>`)}`;
   };
 
@@ -1025,6 +1060,7 @@
       <div class="tc-server-row"><span class="tc-mono tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || 'unversioned build'}</span></div>`);
     patch($('phone-status'), html`${dot(server.ok ? 'ok' : 'danger', server.ok && 'tc-dot--live')}${server.ok ? 'Running' : 'Down'}`);
     for (const link of document.querySelectorAll('[data-open-t3]')) if (link.getAttribute('href') !== t3Url()) link.setAttribute('href', t3Url());
+    for (const link of document.querySelectorAll('[data-open-tab]')) if (link.getAttribute('href') !== BASE + '/' + location.hash) link.setAttribute('href', BASE + '/' + location.hash);
 
     // The banner: what the first start is still installing.
     const banner = M.setupBanner(s);
@@ -1050,7 +1086,7 @@
       if (route === 'overview') {
         actions = M.readiness(s, ui).ready
           ? html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="pair.start">${icon('plus')}Pair a device</button>`
-          : html`<a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a>`;
+          : EMBED ? '' : html`<a class="tc-btn tc-btn--sm" href="${t3Url()}" target="_blank" rel="noopener">${icon('external-link')}Open T3 Code</a>`;
       } else if (route === 'agents' || route === 'toolchains') {
         const rows = route === 'agents' ? M.agentRows(s, ui, n) : [...M.toolchainRows(s, ui, n), ...M.packageRows(s, ui, n)];
         if (rows.some((r) => r.updateAvailable)) actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="${route === 'agents' ? 'harness.updateAll' : 'tools.updateAll'}">${icon('circle-arrow-up')}Update all</button>`;
@@ -1116,6 +1152,8 @@
   // ---------------------------------------------------------------- theme --
   const THEME_KEY = 't3-console-theme';
   const themeMode = () => {
+    // Inside T3 Code the theme is T3's (BOOT read it from the address).
+    if (EMBED) return document.documentElement.getAttribute('data-theme-mode') || 'system';
     try { return localStorage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; }
   };
   const SYSTEM_DARK = window.matchMedia('(prefers-color-scheme: dark)');
@@ -1132,7 +1170,9 @@
     }
   };
   const setTheme = (mode) => {
-    try { localStorage.setItem(THEME_KEY, mode); } catch { /* this session only */ }
+    if (!EMBED) {
+      try { localStorage.setItem(THEME_KEY, mode); } catch { /* this session only */ }
+    }
     applyTheme(mode);
     render();
   };
@@ -2018,7 +2058,9 @@
     theme: (a) => setTheme(a.mode),
     'theme.cycle': () => setTheme({ system: 'light', light: 'dark', dark: 'system' }[themeMode()]),
     palette: () => openPalette(),
-    'open.t3': () => window.open(t3Url(), '_blank', 'noopener'),
+    // Inside T3 Code, T3 Code is right behind the dialog.
+    'open.t3': () => (EMBED ? toHost('close') : window.open(t3Url(), '_blank', 'noopener')),
+    'embed.close': () => toHost('close'),
     lock: async () => {
       await fetch(BASE + '/logout', { method: 'POST', credentials: 'same-origin', redirect: 'manual' }).catch(() => {});
       locked = true;
@@ -2185,7 +2227,24 @@
   // Re-render when the layout crosses the phone breakpoint (menus and sheets
   // pick their shape at open time; rows pick theirs on render).
   Kit.PHONE.addEventListener('change', render);
+  if (EMBED) {
+    // T3 Code's theme as it changes; a message from any other window is not T3's.
+    window.addEventListener('message', (e) => {
+      const m = e.data;
+      if (e.source !== window.parent || e.origin !== location.origin || !m || m.source !== 't3-code') return;
+      if (m.type === 'theme' && (m.theme === 'light' || m.theme === 'dark') && m.theme !== themeMode()) setTheme(m.theme);
+    });
+    // Escape closes the dialog once nothing on this page wants it: an open
+    // menu, sheet or palette takes it first (Kit stops it there).
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !e.defaultPrevented && !e.isComposing) toHost('close');
+    });
+  }
   show(routeFromHash());
   loadStatus();
   loadPorts();
+  if (EMBED) {
+    $('main').focus({ preventScroll: true });
+    toHost('ready');
+  }
 })();

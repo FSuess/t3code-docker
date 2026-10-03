@@ -268,10 +268,11 @@ COPY docker/harness/ /opt/t3-harness/
 COPY docker/provider-integration/ /opt/t3-provider/
 COPY docker/setup/ /opt/t3-setup/
 COPY examples/ /opt/examples/
-# T3 Code's client has no link to the setup console, so a fresh install that
-# lands on the pairing screen has nowhere to go. The pill is injected into the
-# static shell - it probes for the console and hides itself when absent - and
-# patch.mjs fails the build if upstream moves the layout it relies on.
+# T3 Code's client has no link to the setup console. The setup bridge is
+# injected into its static shell: a Setup pill on the pairing screen, and a
+# Setup entry in Settings that opens the console in a dialog. It probes for the
+# console and changes nothing when it is absent, and patch.mjs fails the build
+# if upstream moves the layout it relies on.
 COPY docker/t3-client/ /usr/local/share/t3-client/
 RUN "$T3_INFRA_NODE" /usr/local/share/t3-client/patch.mjs
 # `t3` is the same immutable launcher under its user-facing name, for root's

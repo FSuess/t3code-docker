@@ -37,6 +37,9 @@ keeping everything up to date, without a shell in the container.
 
 - **Pair a phone from a web page.** The setup page creates a pairing link and
   QR code. No terminal needed.
+- **Reachable from T3 Code's settings.** Once a browser is paired, Settings has
+  a **Setup** entry that opens the setup page in a dialog, signed in with your
+  T3 Code session.
 - **Sign agents in from the browser.** The setup page runs each agent's own
   sign-in flow and shows you the link, QR code or code to enter. Credentials are
   stored on the state volume and survive a recreate.
@@ -180,18 +183,42 @@ at build time: the release tag in CI, or `dev` for a local build.
 **Environment** shows the public URL, where state and work are stored and
 whether those mounts survive a recreate, the agent browser, **Copy
 diagnostics** (the status with identifying details removed, for bug reports)
-and **Lock**, which signs this browser out.
+and **Lock**, which signs this browser out if it came in with the key.
 
 The page is a single self-contained document. It loads no fonts, scripts or
 styles from anywhere else, which helps over a slow tunnel.
 
+`T3_SETUP_ENABLED=0` turns the setup page off.
+
+### Opening it from T3 Code
+
 If the setup page is reachable at `/__setup` on the same hostname as T3 Code
 (see [Exposing it through one hostname](#exposing-it-through-one-hostname)),
-T3 Code's pairing screen shows a small **Setup** button in the bottom-left
-corner that links back here. It only appears on the pairing screens, and only
-when the setup page is routed there.
+T3 Code links to it in two places:
 
-`T3_SETUP_ENABLED=0` turns the setup page off.
+- Before a browser is paired, T3 Code's pairing screen has a small **Setup**
+  button in the bottom-left corner. It opens the setup page in a new tab, which
+  asks for the key.
+- Once paired, **Settings** has a **Setup** entry at the end of its list. It
+  opens the setup page in a dialog over T3 Code, in T3 Code's theme, without
+  asking for the key. On a phone the dialog fills the screen. The number beside
+  the entry counts what needs you: agents signed out or failing, tools that
+  failed. Available updates aren't counted. **Esc** or **✕** closes the
+  dialog, and **Open in a new tab** at the foot of its sidebar opens the page
+  on its own.
+
+The dialog doesn't ask for the key because the setup page accepts T3 Code's own
+session. It asks T3 Code about the browser's session cookie and lets the
+browser in only if T3 Code says the session is valid and includes terminal
+access. A browser with a terminal in the container can already read the key
+from the environment, so this gives it nothing new. A device revoked in T3 Code
+loses access here within half a minute, or immediately if you revoke it on the
+setup page. Requests that change something are only accepted from the setup
+page's own origin. Set `T3_SETUP_ACCEPT_T3_SESSIONS=0` to ask for the key every
+time.
+
+Neither link appears unless the setup page is routed on T3 Code's hostname, and
+neither changes anything else in T3 Code's pages.
 
 ### Signing agents in and keeping them up to date
 
@@ -309,7 +336,8 @@ option.
 
 **Treat the setup key like a password.** It can do everything a pairing link
 can, and it can create new links. `compose.yaml` binds the port to loopback;
-only publish it as far as you need to.
+only publish it as far as you need to. A browser already paired with T3 Code
+doesn't need the key (see [Opening it from T3 Code](#opening-it-from-t3-code)).
 
 ## Connecting a phone
 
@@ -633,6 +661,7 @@ Environment variables (all optional except where noted):
 | `T3_SETUP_KEY` | *(generated)* | Password for the setup page. Set it to keep it the same across recreates. |
 | `T3_SETUP_PORT` | `3774` | Setup page port inside the container |
 | `T3_SETUP_BASE_PATH` | — | Serve the setup page under a path, such as `/__setup` |
+| `T3_SETUP_ACCEPT_T3_SESSIONS` | `1` | Let a browser signed in to T3 Code with terminal access open the setup page without the key. `0` always asks for the key. |
 | `T3_ALLOW_SUDO` | `0` | Give agents passwordless sudo in the container |
 | `DEEPSEEK_API_KEY` | — | Used by the DeepSeek-through-OpenCode example |
 | `PUID` / `PGID` | `1000` | Owner of files in the workspace bind mount |
@@ -702,6 +731,9 @@ the only boundary. Keep in mind:
   with `t3 auth pairing revoke <id>` and `t3 auth session revoke <id>`.
 - **Don't publish port 3773 to the internet.** `compose.yaml` binds it to
   loopback for that reason. Put TLS in front of it, or use a tunnel.
+- **A paired browser can open the setup page without the key**, when both are
+  on one hostname. T3 Code already gives that browser a terminal, which can
+  read the key. `T3_SETUP_ACCEPT_T3_SESSIONS=0` turns this off.
 - **Provider credentials are stored on the home volume**, in plain or lightly
   encoded form, as they would be in your own home directory. Protect that volume
   accordingly.

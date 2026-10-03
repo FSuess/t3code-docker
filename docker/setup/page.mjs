@@ -54,8 +54,10 @@ export const escapeHtml = (value) =>
 
 // Resolve the theme before first paint. Left to the client scripts, the page
 // flashes light for as long as it takes them to parse, which on a phone over a
-// tunnel is long enough to see.
+// tunnel is long enough to see. Inside T3 Code the theme is T3's, passed in the
+// address (?theme=dark) and kept current by message, never saved here.
 const BOOT = `(function(){var r=document.documentElement;try{var m=localStorage.getItem("t3-console-theme")||"system";`
+  + `if(r.hasAttribute("data-embed")){var t=new URLSearchParams(location.search).get("theme");m=t==="dark"||t==="light"?t:"system";}`
   + `var d=m==="system"?(matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light"):m;`
   + `r.setAttribute("data-theme",d);r.setAttribute("data-theme-mode",m);}catch(e){r.setAttribute("data-theme","light");}})();`;
 // Touch density lives on .tc-root, which is <body>, so it is set first thing
@@ -79,11 +81,12 @@ export const contentSecurityPolicy = (nonce) => [
   "connect-src 'self'",
   "form-action 'self'",
   "base-uri 'none'",
-  "frame-ancestors 'none'",
+  // T3 Code's settings open the console in a frame; only this origin may.
+  "frame-ancestors 'self'",
 ].join("; ");
 
-const head = ({ nonce, css, mount }) => `<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+const head = ({ nonce, css, mount, embed }) => `<!doctype html>
+<html lang="en"${embed ? ' data-embed="t3"' : ""}><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="no-referrer">
@@ -118,15 +121,26 @@ const skeleton = (rows) => `<div class="tc-group" aria-hidden="true">${
     `<div class="tc-skel-row"><span class="tc-skel tc-skel--tile"></span><span class="tc-skel" style="width:${[38, 52, 30, 44][i % 4]}%"></span></div>`).join("")
 }</div>`;
 
-/** The console once unlocked: the shell, with every page awaiting its first status. */
-export function renderConsole({ assets, nonce, mount }) {
+// Inside T3 Code the console is a dialog over the app: it closes rather than
+// linking to T3, opens in a tab of its own on request, and leaves the theme to T3.
+const CLOSE = `<button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm tc-embed-close" type="button" data-cmd="embed.close" aria-label="Close" title="Close (Esc)"><i data-icon="x"></i></button>`;
+
+/**
+ * The console once unlocked: the shell, with every page awaiting its first
+ * status. `embed` is the variant T3 Code's settings open in a dialog.
+ */
+export function renderConsole({ assets, nonce, mount, embed = false }) {
   const nav = NAV.map(([route, label, icon, key]) =>
     `<a class="tc-nav-item" href="#${route}" data-nav="${route}" aria-keyshortcuts="G ${key}"><i data-icon="${icon}"></i>${label}<span class="tc-nav-count" id="nav-${route}" aria-live="off"></span></a>`).join("");
   const tabs = TABS.map(([route, label, icon]) =>
     `<a class="tc-tab" href="#${route}" data-nav="${route}"><span class="tc-tab-ico"><i data-icon="${icon}"></i><span class="tc-tab-badge" id="tab-${route}" hidden></span></span>${label}</a>`).join("");
   const pages = [...NAV.map(([route]) => route), "more"].map((route) =>
     `<section class="tc-page" id="page-${route}" data-route="${route}" aria-label="${route[0].toUpperCase()}${route.slice(1)}" hidden>${skeleton(route === "more" ? 2 : 3)}</section>`).join("\n");
-  return `${head({ nonce, css: assets.css, mount })}
+  const foot = embed
+    ? `<a class="tc-nav-item" id="open-tab" href="${escapeHtml(mount)}/" target="_blank" rel="noopener" data-open-tab><i data-icon="external-link"></i>Open in a new tab</a>`
+    : `<a class="tc-nav-item" id="open-t3" href="/" target="_blank" rel="noopener" data-open-t3><i data-icon="external-link"></i>Open T3 Code</a>
+        <button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" id="theme-toggle" data-cmd="theme.cycle" aria-label="Switch theme"><i data-icon="monitor"></i></button>`;
+  return `${head({ nonce, css: assets.css, mount, embed })}
 <body class="tc-root">
 <script nonce="${nonce}">${DENSITY}</script>
 <div class="tc-app" id="app">
@@ -137,8 +151,7 @@ export function renderConsole({ assets, nonce, mount }) {
     <div class="tc-sidebar-foot">
       <div class="tc-server" id="server-card"><div class="tc-server-row"><span class="tc-skel tc-skel--line"></span></div></div>
       <div class="tc-sidebar-row">
-        <a class="tc-nav-item" id="open-t3" href="/" target="_blank" rel="noopener" data-open-t3><i data-icon="external-link"></i>Open T3 Code</a>
-        <button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" id="theme-toggle" data-cmd="theme.cycle" aria-label="Switch theme"><i data-icon="monitor"></i></button>
+        ${foot}
       </div>
     </div>
   </nav>
@@ -147,13 +160,13 @@ export function renderConsole({ assets, nonce, mount }) {
       <ol class="tc-crumbs"><li>Setup</li><li aria-current="page" id="crumb">Overview</li></ol>
       <span class="tc-small tc-muted tc-truncate tc-topbar-summary" id="summary"></span>
       <span class="tc-spacer"></span>
-      <div class="tc-topbar-actions" id="page-actions"></div>
+      <div class="tc-topbar-actions" id="page-actions"></div>${embed ? `<span class="tc-topbar-sep" aria-hidden="true"></span>${CLOSE}` : ""}
     </header>
     <header class="tc-phonebar">
       <span class="tc-wordmark" aria-label="T3 Code"><span>Code</span></span><span class="tc-badge tc-badge--outline tc-badge--sm">Setup</span>
       <span class="tc-spacer"></span>
       <span class="tc-phone-status" id="phone-status"></span>
-      <button class="tc-btn tc-btn--ghost tc-btn--icon" type="button" data-cmd="palette" aria-label="Search"><i data-icon="search"></i></button>
+      <button class="tc-btn tc-btn--ghost tc-btn--icon" type="button" data-cmd="palette" aria-label="Search"><i data-icon="search"></i></button>${embed ? CLOSE.replace(" tc-btn--sm", "") : ""}
     </header>
     <div class="tc-banner" id="banner" role="status" hidden></div>
 ${pages}
@@ -171,20 +184,22 @@ ${scripts(assets.console, nonce)}
  * without JavaScript; unlock.js only keeps the user on the page to show a wrong
  * key in place, and reveals the key on request.
  */
-export function renderUnlock({ assets, nonce, mount, host, publicUrl, error }) {
-  const t3Url = publicUrl || (mount ? "/" : "");
+export function renderUnlock({ assets, nonce, mount, host, publicUrl, error, embed = false }) {
+  // Inside T3 Code there is no T3 Code to open: the dialog closes instead.
+  const t3Url = embed ? "" : publicUrl || (mount ? "/" : "");
   const invalid = error ? ' aria-invalid="true" aria-describedby="key-error"' : "";
-  return `${head({ nonce, css: assets.css, mount })}
+  return `${head({ nonce, css: assets.css, mount, embed })}
 <body class="tc-root">
 <script nonce="${nonce}">${DENSITY}</script>
 <main class="tc-standalone">
   <div class="tc-standalone-card">
-    <div class="tc-masthead"><div class="tc-masthead-in"><span class="tc-eyebrow">T3 Code · Setup</span></div></div>
+    <div class="tc-masthead"><div class="tc-masthead-in"><span class="tc-eyebrow">T3 Code · Setup</span>${embed ? CLOSE : ""}</div></div>
     <div class="tc-standalone-body">
       ${host ? `<span class="tc-eyebrow">${escapeHtml(host)}</span>` : ""}
       <h1 class="tc-standalone-title">Unlock the console</h1>
       <p class="tc-standalone-desc">Pair devices, sign agents in and publish ports on this server. Enter the setup key you set as <code>T3_SETUP_KEY</code>.</p>
-      <form class="tc-unlock-form" method="POST" action="${escapeHtml(mount)}/login" id="loginform" novalidate>
+      <form class="tc-unlock-form" method="POST" action="${escapeHtml(mount)}/login" id="loginform" novalidate>${embed ? `
+        <input type="hidden" name="embed" value="t3">` : ""}
         <div class="tc-field">
           <label class="tc-label" for="key">Setup key</label>
           <div class="tc-inputwrap">
