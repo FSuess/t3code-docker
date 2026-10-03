@@ -781,8 +781,16 @@ const T3Model = (() => {
     if (type === 'desktop') return 'laptop';
     return 'monitor';
   };
+  // T3 records how a session began as its subject ("one-time-token" for any
+  // browser paired by link), which is no name for a device; what the browser
+  // is, is.
+  const HOW_PAIRED = new Set(['one-time-token', 'desktop-bootstrap']);
+  const deviceLabel = (c) => (c.client && c.client.label) || c.label || (c.subject && !HOW_PAIRED.has(c.subject) ? c.subject : null);
+  /** What to call a paired device: its label, else what it is ("Safari on iOS"). */
+  const deviceName = (session) => deviceLabel(session || {}) || deviceKind((session || {}).client);
   const deviceRows = (sessions, now) => (sessions || []).map((c) => {
-    const name = (c.client && c.client.label) || c.label || c.subject || 'Device';
+    const label = deviceLabel(c);
+    const name = label || deviceKind(c.client);
     const seen = c.connected ? 'active now' : c.lastConnectedAt ? 'seen ' + relTime(c.lastConnectedAt, now) : 'not connected yet';
     const ends = toMs(c.expiresAt);
     const days = ends === null ? null : Math.round((ends - now) / 86400000);
@@ -793,7 +801,8 @@ const T3Model = (() => {
       icon: deviceIcon(c.client),
       connected: Boolean(c.connected),
       current: Boolean(c.current),
-      status: [deviceKind(c.client), seen].join(' · '),
+      // The kind once: as the name when there is no label, else beside it.
+      status: [label ? deviceKind(c.client) : null, seen].filter(Boolean).join(' · '),
       ends: ends === null ? null : (days <= 0 ? 'session ends today' : 'session ends ' + relTime(ends, now)),
       seenTitle: c.lastConnectedAt ? 'Seen ' + absTime(c.lastConnectedAt) : '',
     };
@@ -1229,7 +1238,7 @@ const T3Model = (() => {
     progressOf, progressText,
     agentRow, agentRows, toolRow, toolchainRow, toolchainRows, packageRows, portRows, looksLikeDatabase,
     monogram, managedOn, isVersionSpec, isToolSpec, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
-    deviceRows, linkRows, deviceKind,
+    deviceRows, linkRows, deviceKind, deviceName,
     readiness, readySummary, needsYou, activity, setupBanner,
     navBadges, attentionCount, summaries,
     paletteItems, searchPalette,

@@ -608,7 +608,7 @@ const noticeSessions = (sessions) => {
   if (knownSessions) {
     for (const session of sessions) {
       if (!knownSessions.has(session.sessionId)) {
-        recordEvent("device.paired", `Paired ${session.client?.label || session.subject || "a device"}`);
+        recordEvent("device.paired", `Paired ${Model.deviceName(session)}`);
       }
     }
   }

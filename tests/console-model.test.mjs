@@ -386,14 +386,22 @@ test("devices read as what they are and when they were last seen", () => {
     { sessionId: "a", client: { label: "iPhone", deviceType: "mobile", os: "iOS", browser: "Safari" }, connected: false, lastConnectedAt: new Date(NOW - 2 * 60 * MIN).toISOString(), expiresAt: new Date(NOW + 12 * DAY).toISOString() },
     { sessionId: "b", client: { label: "work-laptop", deviceType: "desktop", os: "macOS" }, connected: true },
     { sessionId: "c", client: { deviceType: "mobile" } },
+    { sessionId: "d", subject: "one-time-token", client: { deviceType: "desktop", os: "Linux", browser: "Chrome" }, connected: true },
+    { sessionId: "e", subject: "build-bot", client: { os: "Linux" } },
   ], NOW);
   assert.equal(rows[0].status, "Safari on iOS · seen 2 hours ago");
   assert.equal(rows[0].ends, "session ends in 12 days");
   assert.equal(rows[0].icon, "smartphone");
   assert.equal(rows[1].status, "macOS desktop app · active now");
   assert.equal(rows[1].icon, "laptop");
-  assert.equal(rows[2].name, "Device");
-  assert.equal(rows[2].status, "Mobile app · not connected yet");
+  assert.equal(rows[2].name, "Mobile app", "no label: what it is");
+  assert.equal(rows[2].status, "not connected yet", "and not said twice");
+  assert.equal(rows[3].name, "Chrome on Linux", "how T3 paired it is not a name");
+  assert.equal(rows[3].status, "active now");
+  assert.equal(rows[4].name, "build-bot", "a subject someone chose is");
+  assert.equal(M.deviceName({ subject: "one-time-token", client: { browser: "Safari", os: "iOS" } }), "Safari on iOS");
+  assert.equal(M.deviceName({ client: { label: "iPhone" } }), "iPhone");
+  assert.equal(M.deviceName(null), "Client");
 });
 
 // ------------------------------------------------------------------- palette --

@@ -623,7 +623,7 @@
     const fresh = sessions.find((c) => !m.baseline.has(c.sessionId));
     if (fresh) {
       m.outcome = 'paired';
-      m.pairedName = (fresh.client && fresh.client.label) || fresh.subject || 'your device';
+      m.pairedName = M.deviceName(fresh);
       pair.freshSession = fresh.sessionId;
       Kit.toast('Paired with ' + m.pairedName, { detail: 'It is already signed in.' });
       return;
@@ -2036,7 +2036,7 @@
     let label = id;
     if (kind === 'session') {
       const c = (s.sessions || []).find((x) => x.sessionId === id);
-      label = (c && ((c.client && c.client.label) || c.subject)) || 'this device';
+      label = c ? M.deviceName(c) : 'this device';
     } else {
       const l = (s.pairings || []).find((x) => x.id === id);
       label = (l && l.label) || 'Unlabelled';
