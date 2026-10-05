@@ -10,9 +10,9 @@ services:
     restart: unless-stopped
     hostname: ${T3_HOSTNAME:-t3code}
     environment:
-      # Public address clients reach this server on. `t3-pair` builds its
-      # pairing links from this; without it the links point at the container's
-      # own bridge address and nothing can use them.
+      # Public address clients reach this server on, which pairing links point
+      # at. Optional: leave it empty to set it on the setup page instead, where
+      # it takes effect without a restart. Set here, it is fixed.
       T3_PUBLIC_URL: ${T3_PUBLIC_URL:-}
       # Match these to the owner of your workspace bind mount.
       PUID: ${PUID:-1000}

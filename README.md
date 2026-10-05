@@ -79,7 +79,7 @@ keeping everything up to date, without a shell in the container.
 ```bash
 git clone https://github.com/dizys/t3code-docker
 cd t3code-docker
-cp .env.example .env      # then edit T3_PUBLIC_URL, PUID/PGID, T3_WORKSPACE_HOST
+cp .env.example .env      # then edit PUID/PGID and T3_WORKSPACE_HOST
 docker compose up -d --build
 ```
 
@@ -148,7 +148,6 @@ Set a key for it when you create the container:
 
 ```
 T3_SETUP_KEY=<something long>
-T3_PUBLIC_URL=https://t3.example.com
 ```
 
 If `T3_SETUP_KEY` is empty, a key is generated at startup and printed to the
@@ -156,7 +155,7 @@ log. Setting it yourself keeps it the same when the container is recreated.
 Open port 3774 and enter the key.
 
 **Overview** lists what's left before a phone can use the server: the server
-running, `T3_PUBLIC_URL` set, a device paired, and the agents signed in, with a
+running, a [public URL](#the-public-url) set, a device paired, and the agents signed in, with a
 button for the next step. When all four are done, the list collapses to a
 single **Ready** line and recent activity is shown instead. On a desktop the
 pages are in a sidebar (Overview, Devices, Agents, Toolchains, Ports,
@@ -189,6 +188,36 @@ The page is a single self-contained document. It loads no fonts, scripts or
 styles from anywhere else, which helps over a slow tunnel.
 
 `T3_SETUP_ENABLED=0` turns the setup page off.
+
+### The public URL
+
+A pairing link points at the address your phone or browser uses to reach the
+server, so the setup page needs that address before it can pair anything. It
+uses the first of these that is set:
+
+1. `T3_PUBLIC_URL` in the container's settings. The setup page shows it as set
+   there and doesn't offer to change it.
+2. An address saved on the setup page. It's stored on the volume
+   (`/home/t3/.t3/public-url`), takes effect at once, and survives a recreate.
+3. The address a hosting platform gives the service: Railway
+   (`RAILWAY_PUBLIC_DOMAIN`), Render (`RENDER_EXTERNAL_URL`), Koyeb
+   (`KOYEB_PUBLIC_DOMAIN`), Zeabur, Coolify, or Fly (`<app>.fly.dev`).
+
+If none is set, **Overview** asks for one. When you opened the setup page on
+T3 Code's own address (through `T3_SINGLE_PORT`, or a proxy that routes
+`/__setup` on the same hostname), it offers that address as a single button,
+having checked that T3 Code answers there. Otherwise **Set address** takes
+any address, such as `t3.example.com` or `http://192.168.1.20:3773`. Change it
+later under **Environment**.
+
+Before saving an address you typed, the setup page asks it for T3 Code's
+environment from inside the container. If a different T3 Code server answers,
+it refuses, because links there would pair with that server. If nothing
+answers, it saves the address anyway and says why: LAN and tailnet names often
+can't be reached from inside a container, and only your devices need to reach
+them.
+
+`t3-pair`, `t3-doctor` and the startup log use the same address.
 
 ### Opening it from T3 Code
 
@@ -335,7 +364,8 @@ Point your tunnel, reverse proxy or hosting platform at that port alone:
 With Cloudflare Tunnel that is one public hostname entry, `t3.example.com` to
 `http://127.0.0.1:8080`. The setup page is then at
 `https://t3.example.com/__setup`, and T3 Code's Settings find it there without
-any configuration.
+any configuration. Opened there, the setup page also offers
+`https://t3.example.com` as the [public URL](#the-public-url).
 
 What to expect from it:
 
@@ -403,7 +433,7 @@ Scan it with the T3 Code app
 [Android](https://play.google.com/store/apps/details?id=com.t3tools.t3code)), or
 paste the URL into **Add environment**.
 
-`t3-pair` uses `T3_PUBLIC_URL`. You can override it per command, for example
+`t3-pair` uses the [public URL](#the-public-url). You can override it per command, for example
 `t3-pair --base-url https://other.host --ttl 7d --label "my phone"`.
 
 **Ignore the server's startup banner.** It shows the container's internal
@@ -413,7 +443,7 @@ is up. `t3-pair` fixes both.
 ### Pairing without a shell in the container
 
 If your host panel makes `docker exec` awkward, set
-`T3_PRINT_PAIRING_ON_START=1` along with `T3_PUBLIC_URL`. Each start then
+`T3_PRINT_PAIRING_ON_START=1` once a public URL is set. Each start then
 creates a 30-day link and writes it to the container log, where any log viewer
 shows it:
 
@@ -458,12 +488,12 @@ Use `t3-login connect` rather than `t3 connect` directly: `docker exec` runs as
 root, and Connect writes into the state directory, where root-owned files
 would stop the server from writing.
 
-**Tailscale.** Run Tailscale on the host and set `T3_PUBLIC_URL` to the
+**Tailscale.** Run Tailscale on the host and set the public URL to the
 machine's tailnet name. (`t3 serve --tailscale-serve` needs `tailscaled` inside
 the container, which this image doesn't include.)
 
-**Nothing.** On a trusted LAN, set `T3_BIND_ADDR=0.0.0.0` and
-`T3_PUBLIC_URL=http://<server-lan-ip>:3773`. The pairing token is then sent
+**Nothing.** On a trusted LAN, set `T3_BIND_ADDR=0.0.0.0` and the public URL
+to `http://<server-lan-ip>:3773`. The pairing token is then sent
 unencrypted, so only do this on a network you control.
 
 ## Publishing a port
@@ -687,7 +717,7 @@ Environment variables (all optional except where noted):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `T3_PUBLIC_URL` | — | Public base URL for pairing links. Set this. |
+| `T3_PUBLIC_URL` | — | The address pairing links point at. Optional: without it, the one saved on the setup page or the hosting platform's is used. Setting it here fixes it. See [The public URL](#the-public-url). |
 | `T3CODE_PORT` | `3773` | Server port inside the container |
 | `T3CODE_HOST` | `0.0.0.0` | Bind interface inside the container |
 | `T3CODE_HOME` | `/home/t3/.t3` | State directory (`userdata/state.sqlite`) |
@@ -789,7 +819,7 @@ the only boundary. Keep in mind:
 **A pairing link doesn't work, or says "Invalid pairing token".** The likely
 causes, most likely first: the token came from the server's startup banner,
 which expires five minutes after startup (use `t3-pair`); the link uses a
-`172.x` or `192.0.2.x` address, which means `T3_PUBLIC_URL` isn't set; or the
+`172.x` or `192.0.2.x` address, which means no public URL was set when it was made; or the
 token was already used. Tokens are single-use, so create one per device.
 
 **A provider is missing from Settings → Providers.** Each provider must be

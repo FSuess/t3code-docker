@@ -460,10 +460,13 @@ if [ "$T3_PRINT_PAIRING_ON_START" = "1" ]; then
 fi
 
 log "starting T3 Code ${T3CODE_HOST}:${T3CODE_PORT} (state: ${T3CODE_HOME})"
-if [ -n "${T3_PUBLIC_URL:-}" ]; then
-  log "public URL: ${T3_PUBLIC_URL} - pair a device with: t3-pair"
+# Resolved as the setup page resolves it: T3_PUBLIC_URL, the address saved on
+# the setup page, or the hosting platform's (docker/setup/public-url.mjs).
+public_url="$("$T3_INFRA_NODE" /opt/t3-setup/public-url.mjs --describe 2>/dev/null || true)"
+if [ -n "$public_url" ]; then
+  log "public URL: ${public_url} - pair a device on the setup page, or with t3-pair"
 else
-  log "T3_PUBLIC_URL is unset; run 't3-pair --base-url https://your.host' to pair"
+  log "no public URL yet; set it on the setup page (or T3_PUBLIC_URL) to pair a device"
 fi
 # The server's own banner follows, advertising its bridge address and a token
 # that lives five minutes. Both are useless from outside the container.

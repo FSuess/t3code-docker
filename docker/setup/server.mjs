@@ -29,6 +29,9 @@ import { createT3Api } from "./t3-api.mjs";
 import { createAntigravity } from "./antigravity.mjs";
 import { createT3Sessions } from "./t3-session.mjs";
 import { clientAddress } from "./client-address.mjs";
+import {
+  checkReaches, clearSaved, parsePublicUrl, platformUrl, readSaved, resolvePublicUrl, writeSaved,
+} from "./public-url.mjs";
 
 const run = promisify(execFile);
 const gzip = promisify(gzipCallback);
@@ -42,7 +45,6 @@ const ASSETS = loadAssets();
 const PORT = Number(process.env.T3_SETUP_PORT ?? 3774);
 const KEY = process.env.T3_SETUP_KEY ?? "";
 const T3_PORT = process.env.T3CODE_PORT ?? "3773";
-const PUBLIC_URL = (process.env.T3_PUBLIC_URL ?? "").replace(/\/+$/, "");
 const COOKIE = "t3setup";
 // Lets a single public hostname route a path prefix here instead of needing a
 // second subdomain: e.g. Cloudflare Tunnel sending /__setup* to this port.
@@ -60,6 +62,11 @@ const WORKSPACE = process.env.T3_WORKSPACE || "/workspace";
 // The entrypoint generates a key when T3_SETUP_KEY is empty and says so; a
 // generated key changes on every recreate, which the Environment page warns of.
 const SETUP_KEY_SOURCE = process.env.T3_SETUP_KEY_GENERATED === "1" ? "generated" : "env";
+
+// Where pairing links point: T3_PUBLIC_URL, else the address saved from this
+// page, else the hosting platform's (public-url.mjs). Read on every use, so a
+// change from this page, or from another process, applies at once.
+const publicUrl = () => resolvePublicUrl({ env: process.env, saved: readSaved(STATE_DIR) });
 
 if (!KEY) {
   console.error("[setup] T3_SETUP_KEY is empty; refusing to start");
@@ -150,7 +157,7 @@ const health = async () => {
     );
     if (!res.ok) return { ok: false, detail: `HTTP ${res.status}` };
     const body = await res.json();
-    return { ok: true, version: body.serverVersion, label: body.label };
+    return { ok: true, version: body.serverVersion, label: body.label, environmentId: body.environmentId ?? null };
   } catch (error) {
     return { ok: false, detail: String(error?.message ?? error) };
   }
@@ -628,6 +635,7 @@ const noticeSessions = (sessions) => {
 };
 
 const status = async () => {
+  const where = publicUrl();
   // Concurrently, and each failure contained: an empty list and "could not
   // read" are different facts, and reporting the first when the second is true
   // is how a console tells you a comfortable lie. Whatever answers, answers.
@@ -701,7 +709,12 @@ const status = async () => {
       variant: process.env.T3_IMAGE_VARIANT || null,
     },
     platform: `${process.platform}/${process.arch}`,
-    publicUrl: PUBLIC_URL || null,
+    publicUrl: where.url,
+    // "env" (T3_PUBLIC_URL), "saved" (from this page) or "platform".
+    publicUrlSource: where.source,
+    // The platform's own address, also when something else overrides it, so
+    // the page can offer to go back to it.
+    publicUrlPlatform: platformUrl(process.env),
     t3: { port: Number(T3_PORT), bind: `${process.env.T3CODE_HOST || "0.0.0.0"}:${T3_PORT}` },
     setupPort: PORT,
     // T3_SINGLE_PORT: both services behind one listener, this page under
@@ -775,12 +788,11 @@ const revoke = async ({ kind, id }) => {
 };
 
 const mintPairing = async ({ ttl, label }) => {
-  if (!PUBLIC_URL) {
-    throw new Error(
-      "T3_PUBLIC_URL is not set, so a pairing link would point at this container's own address. Set it and restart.",
-    );
+  const { url } = publicUrl();
+  if (!url) {
+    throw new Error("Set the public URL first: a pairing link points at it, and without it a device has nowhere to go.");
   }
-  const args = ["auth", "pairing", "create", "--base-url", PUBLIC_URL, "--json"];
+  const args = ["auth", "pairing", "create", "--base-url", url, "--json"];
   if (ttl) args.push("--ttl", ttl);
   if (label) args.push("--label", label);
   const { stdout } = await t3(args);
@@ -795,6 +807,45 @@ const mintPairing = async ({ ttl, label }) => {
   return { ...issued, qr };
 };
 
+/**
+ * Save the address pairing links point at, or clear it (url null) to fall
+ * back to the platform's. Refused while T3_PUBLIC_URL pins it, since the
+ * container's configuration would win anyway, and refused when the address
+ * answers as a different T3 Code server, which is always a mistake. An address
+ * the container cannot reach itself is still saved: LAN and tailnet names
+ * often cannot be, and the devices that use them are elsewhere.
+ *
+ * `check: false` skips asking the address: the page sends it for the address
+ * it is open on, which the browser has just seen answer as this server.
+ */
+const setPublicUrl = async (value, { check: shouldCheck = true } = {}) => {
+  if (String(process.env.T3_PUBLIC_URL ?? "").trim()) {
+    return { http: 409, body: { ok: false, code: "pinned", error: "T3_PUBLIC_URL sets it in the container's configuration. Change it there, or remove it to set the address here." } };
+  }
+  if (value === null) {
+    clearSaved(STATE_DIR);
+    const where = publicUrl();
+    recordEvent("url.cleared", where.url ? `Public URL back to ${where.platform}'s` : "Public URL cleared", where.url ? hostOf(where.url) : null);
+    return { http: 200, body: { ok: true, publicUrl: where.url, publicUrlSource: where.source } };
+  }
+  const parsed = parsePublicUrl(value);
+  if (parsed.error) return { http: 400, body: { ok: false, code: "invalid", error: parsed.error } };
+  const check = shouldCheck ? await checkReaches(parsed.url, { localId: (await health()).environmentId }) : null;
+  if (check?.reaches === "other") {
+    return { http: 409, body: { ok: false, code: "other-server", check, error: `${hostOf(parsed.url)} answers as a different T3 Code server${check.label ? ` (${check.label})` : ""}. Pairing links there would pair with that one.` } };
+  }
+  writeSaved(STATE_DIR, parsed.url);
+  recordEvent("url.set", "Public URL set", hostOf(parsed.url));
+  return { http: 200, body: { ok: true, publicUrl: parsed.url, publicUrlSource: "saved", check } };
+};
+
+const hostOf = (url) => {
+  try {
+    return new URL(url).host;
+  } catch {
+    return String(url);
+  }
+};
 
 // --- agent authentication ---------------------------------------------------
 //
@@ -1647,6 +1698,7 @@ const cancelLifecycle = (target, rawId) => {
 };
 
 const ROUTES = ["/login", "/logout", "/hello", "/status", "/pair", "/revoke", "/ports",
+  "/public-url/clear", "/public-url",
   "/ports/expose", "/ports/unexpose",
   "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses/enable", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
@@ -1821,7 +1873,7 @@ const server = createServer(async (req, res) => {
       // The host the browser asked for, for the card's eyebrow; escaped by the template.
       const host = String(req.headers["x-forwarded-host"] ?? req.headers.host ?? "").split(",")[0].trim().slice(0, 200);
       return sendPage(req, res, (nonce) => renderUnlock({
-        assets: ASSETS, nonce, mount, host, publicUrl: PUBLIC_URL, error: raw.searchParams.get("error") === "1", embed,
+        assets: ASSETS, nonce, mount, host, publicUrl: publicUrl().url, error: raw.searchParams.get("error") === "1", embed,
       }));
     }
 
@@ -2058,6 +2110,12 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }
+    }
+
+    if (req.method === "POST" && (route === "/public-url" || route === "/public-url/clear")) {
+      const input = route === "/public-url" ? JSON.parse((await readBody(req)) || "{}") : {};
+      const answer = await setPublicUrl(route === "/public-url/clear" ? null : input.url, { check: input.check !== false });
+      return sendJson(res, answer.http, answer.body);
     }
 
     if (req.method === "POST" && route === "/pair") {

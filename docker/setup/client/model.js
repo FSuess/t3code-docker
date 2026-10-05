@@ -839,6 +839,29 @@ const T3Model = (() => {
     expiresTitle: 'Expires ' + absTime(l.expiresAt),
   }));
 
+  // ----------------------------------------------------------- public url --
+  /** Where the public URL came from, as the page says it: "set here", "from Railway". */
+  const publicUrlSource = (s) => {
+    switch (s && s.publicUrlSource) {
+      case 'env': return 'T3_PUBLIC_URL';
+      case 'saved': return 'set here';
+      case 'platform': return 'from ' + ((s.publicUrlPlatform && s.publicUrlPlatform.platform) || 'the host');
+      default: return null;
+    }
+  };
+
+  /**
+   * The address this page is open on, when it is T3 Code's too: `ui.here` is
+   * { url, local } once the page has confirmed that T3 Code answers on its own
+   * origin with this server's environment. `local` means only this computer
+   * can open it (localhost), which pairs a browser here and nothing else.
+   */
+  const hereOffer = (s, ui) => {
+    const here = ui && ui.here;
+    if (!here || !here.url || (s && s.publicUrl === here.url)) return null;
+    return here;
+  };
+
   // ------------------------------------------------------------ readiness --
   /**
    * The four steps from a fresh container to a working phone. Exactly one is
@@ -854,6 +877,23 @@ const T3Model = (() => {
     const setupRunning = Boolean(s.setup && s.setup.state === 'running');
     const server = s.server || {};
 
+    const urlStep = () => {
+      const here = hereOffer(s, ui);
+      if (s.publicUrl) return { id: 'url', title: 'Public URL set', done: true, aside: publicUrlSource(s) };
+      const step = { id: 'url', title: 'Public URL set', done: false };
+      if (here && !here.local) {
+        step.desc = 'Pairing links point at it. This page is open at ' + hostOf(here.url) + ', and T3 Code answers there too.';
+        step.action = { cmd: 'url.use', label: 'Use ' + hostOf(here.url), icon: 'check' };
+        step.alt = { cmd: 'url.edit', label: 'Other address' };
+      } else {
+        step.desc = here
+          ? 'Pairing links point at it. ' + hostOf(here.url) + ' only opens on this computer, so a phone needs an address it can reach.'
+          : 'Pairing links point at it: the address your phone or browser uses to reach this server.';
+        step.action = { cmd: 'url.edit', label: 'Set address', icon: 'globe' };
+      }
+      return step;
+    };
+
     const steps = [
       {
         id: 'server',
@@ -863,14 +903,7 @@ const T3Model = (() => {
         desc: server.ok ? null : 'T3 Code is not answering yet' + (server.detail ? ' (' + server.detail + ')' : '') + '. It usually takes a few seconds after a start.',
         action: server.ok ? null : { cmd: 'refresh', label: 'Check again', icon: 'refresh-cw' },
       },
-      {
-        id: 'url',
-        title: 'Public URL set',
-        done: Boolean(s.publicUrl),
-        aside: 'T3_PUBLIC_URL',
-        desc: s.publicUrl ? null : 'Pairing links point at the address in T3_PUBLIC_URL. Set it to the URL your devices use, then recreate the container.',
-        action: s.publicUrl ? null : { cmd: 'copy', label: 'Copy the variable', icon: 'copy', copy: 'T3_PUBLIC_URL=https://' },
-      },
+      urlStep(s, ui),
       {
         id: 'pair',
         title: 'Pair a device',
@@ -898,12 +931,12 @@ const T3Model = (() => {
       else step.state = step.id === 'agents' && notSigned.length ? 'warn' : '';
       // Only the next step's button is primary; a later step keeps an outline.
       if (step.action) step.action.variant = step.state === 'todo' ? 'primary' : undefined;
-      if (step.state === 'done') step.action = null;
+      if (step.state === 'done') { step.action = null; step.alt = null; }
     });
     const done = steps.filter((x) => x.done).length;
     const headlines = {
       server: ['Waiting for T3 Code to start', 'The server answers on its own port inside the container. This page notices as soon as it does.'],
-      url: ['Set the public URL', 'A paired phone reaches this server at T3_PUBLIC_URL, so a pairing link needs it before anything else.'],
+      url: ['Set the public URL', 'A paired phone reaches this server at its public URL, so a pairing link needs one before anything else.'],
       pair: ['Pair your first device', 'A phone is enough to drive this server. Pairing takes one scan and no shell in the container.'],
       agents: ['Sign in your agents', 'Each agent signs in with its own flow, driven from here. Credentials stay on the volume.'],
     };
@@ -1185,6 +1218,7 @@ const T3Model = (() => {
     add('Actions', 'Theme: follow the system', 'monitor', { cmd: 'theme', mode: 'system' });
     add('Actions', 'Lock console', 'lock', { cmd: 'lock' });
     if (s.publicUrl) add('Environment', 'Copy public URL', 'copy', { cmd: 'copy', text: s.publicUrl, toast: 'Public URL copied' }, { meta: { text: hostOf(s.publicUrl), mono: true } });
+    if (s.publicUrlSource !== 'env') add('Environment', s.publicUrl ? 'Change public URL' : 'Set public URL', 'globe', { cmd: 'url.edit' }, { meta: s.publicUrl ? { text: publicUrlSource(s) } : { text: 'not set', dot: 'warn' }, attention: !s.publicUrl });
     add('Environment', 'Copy diagnostics', 'copy', { cmd: 'diagnostics' });
 
     const pages = [['Overview', 'overview', 'layout-dashboard', 'O'], ['Devices', 'devices', 'smartphone', 'D'], ['Agents', 'agents', 'bot', 'A'],
@@ -1264,6 +1298,7 @@ const T3Model = (() => {
     monogram, managedOn, isVersionSpec, isToolSpec, specPrefix, SPEC_SAMPLES, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind, deviceName,
     readiness, readySummary, needsYou, activity, setupBanner,
+    publicUrlSource, hereOffer,
     navBadges, attentionCount, summaries,
     paletteItems, searchPalette,
     redactedDiagnostics,

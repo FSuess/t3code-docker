@@ -128,7 +128,9 @@ if [ -n "${T3_LEGACY_ENV:-}" ]; then
 fi
 printf '  %-22s %s\n' "state dir" "${T3CODE_HOME:-unset}"
 printf '  %-22s %s\n' "bind" "${T3CODE_HOST:-unset}:${T3CODE_PORT:-unset}"
-printf '  %-22s %s\n' "public URL" "${T3_PUBLIC_URL:-<unset - t3-pair will warn>}"
+# Resolved as the setup page and t3-pair resolve it, with where it came from.
+public_url="$("${T3_INFRA_NODE:-/usr/local/bin/node}" /opt/t3-setup/public-url.mjs --describe 2>/dev/null || true)"
+printf '  %-22s %s\n' "public URL" "${public_url:-<unset - set it on the setup page>}"
 if [ -n "${T3_SINGLE_PORT:-}" ]; then
   if [ "${T3_SETUP_ENABLED:-1}" = 1 ]; then
     printf '  %-22s %s\n' "one port" "${T3_SINGLE_PORT} (T3 Code at /, the setup page under its prefix)"

@@ -93,7 +93,21 @@ html.tc-locked { overflow: hidden; }
 
 /* Readiness: the heading stack, and the phone's full-width next step. */
 .tc-ready-heading { display: flex; flex-direction: column; gap: var(--space-1); min-width: 0; }
-.tc-ready-cta { margin-top: var(--space-1); }
+.tc-ready-cta { margin-top: var(--space-1); display: grid; gap: var(--space-2); }
+/* A checklist step with a second, quieter way to do it beside its button. */
+.tc-check > .tc-check-actions { grid-column: 3; grid-row: 1 / span 2; display: flex; align-items: center; gap: var(--space-2); }
+/* A choice of buttons beside the text it answers while there is room, and
+   under it on a phone, rather than squeezing the text to a word a line. When
+   the buttons themselves wrap, the primary (last in the markup, rightmost on
+   one line) comes out on top. A lone notice button keeps the design system's
+   tighter fit. */
+.tc-choice { flex-wrap: wrap-reverse; margin-left: auto; }
+.tc-notice:has(> .tc-choice), .tc-kv > dd:has(> .tc-choice) { flex-wrap: wrap; }
+.tc-notice:has(> .tc-choice) > .tc-notice-body, .tc-kv > dd:has(> .tc-choice) > .tc-kv-fill { flex: 1 1 14rem; }
+.tc-notice > .tc-choice .tc-btn { margin: 0; }
+.tc-kv-fill { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+/* Advice under a field that isn't an error: the field still saves. */
+.tc-hint--warn { color: var(--warn-text); }
 
 /* The pairing ceremony: QR on the right on desktop, first on a phone. */
 .tc-pair-body { gap: 20px; }

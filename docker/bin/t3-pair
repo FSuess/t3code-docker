@@ -24,7 +24,12 @@ if [ "$EUID" -eq 0 ] && command -v gosu >/dev/null 2>&1 && id t3 >/dev/null 2>&1
   exec env PATH="$inherited_path" "$(command -v gosu)" t3 "$0" "$@"
 fi
 
-base_url="${T3_PUBLIC_URL:-}"
+# Where links point: T3_PUBLIC_URL, else the address saved on the setup page,
+# else the hosting platform's. The setup page decides the same way, through the
+# same module, so a link from either points at the same place.
+: "${T3_INFRA_NODE:=/usr/local/bin/node}"
+: "${T3_PUBLIC_URL_RESOLVER:=/opt/t3-setup/public-url.mjs}"
+base_url="$("$T3_INFRA_NODE" "$T3_PUBLIC_URL_RESOLVER" 2>/dev/null || true)"
 ttl="${T3_PAIR_TTL:-30d}"
 label=""
 show_qr=1
@@ -34,7 +39,8 @@ usage() {
 Usage: t3-pair [--base-url URL] [--ttl DURATION] [--label TEXT] [--no-qr]
 
   --base-url URL   Public base URL clients will reach, e.g. https://t3.example.com
-                   (default: $T3_PUBLIC_URL)
+                   (default: the public URL: $T3_PUBLIC_URL, else the one set on
+                   the setup page, else the hosting platform's)
   --ttl DURATION   How long the link stays valid: 5m, 1h, 30d (default: 30d)
   --label TEXT     Label shown in the server's connections list
   --no-qr          Print the URL only, no QR code
@@ -61,8 +67,8 @@ if [ -z "$base_url" ]; then
 [t3-pair] No public URL set, falling back to the container address:
 [t3-pair]   ${base_url}
 [t3-pair] That address is only reachable from inside this container's network.
-[t3-pair] Set T3_PUBLIC_URL (or pass --base-url) to the address your phone or
-[t3-pair] browser can actually reach.
+[t3-pair] Set the public URL on the setup page (Environment), set T3_PUBLIC_URL,
+[t3-pair] or pass --base-url: the address your phone or browser can reach.
 WARN
 fi
 

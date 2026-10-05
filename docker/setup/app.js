@@ -109,6 +109,8 @@
     expandedPorts,
     providerNames: [],
     signingIn: null,
+    // This page's own address, once confirmed to be T3 Code's too: see checkHere.
+    here: null,
   };
 
   const harness = (id) => ((state.status && state.status.harnesses) || []).find((h) => h.id === id) || null;
@@ -149,6 +151,30 @@
     || (s.toolchains || []).some((t) => t.inProgress)
     || (s.packages || []).some((p) => p.inProgress)));
 
+  // The address this page is open on can be offered as the public URL when it
+  // is T3 Code's too: the console under a prefix on T3's own origin (one port,
+  // or a proxy routing by path), or inside T3 Code's dialog. Confirmed rather
+  // than assumed: this origin's /.well-known/t3/environment has to name the
+  // environment the server reports for its own T3 Code.
+  let hereChecked = false;
+  const LOOPBACK_HOST = /^(localhost|.+\.localhost|127(\.\d{1,3}){3}|\[::1\])$/i;
+  const checkHere = async () => {
+    const s = state.status;
+    const id = s && s.server && s.server.environmentId;
+    if (hereChecked || !id || !(BASE || EMBED)) return;
+    hereChecked = true;
+    try {
+      const res = await fetch('/.well-known/t3/environment', { cache: 'no-store', credentials: 'same-origin', headers: { accept: 'application/json' } });
+      const body = res.ok ? await res.json() : null;
+      if (!body || body.environmentId !== id) return;
+      ui.here = { url: location.origin, local: LOOPBACK_HOST.test(location.hostname) };
+      render();
+    } catch {
+      // Not answering right now; the next poll asks again.
+      hereChecked = false;
+    }
+  };
+
   const loadStatus = () => {
     if (statusLoading) return statusLoading;
     statusLoading = (async () => {
@@ -160,6 +186,7 @@
         trackPairing(res.data);
         loadProvidersOnce();
         tellAttention();
+        checkHere();
       } else if (!locked) {
         // Name the URL and the reason. "Could not read status" sent someone
         // hunting a migration bug when the page was calling the wrong path.
@@ -484,7 +511,7 @@
   // ------------------------------------------------------------- overview --
   const stepAction = (a, size) => {
     if (!a) return '';
-    const cls = cx('tc-btn', a.variant === 'primary' && 'tc-btn--primary', size || 'tc-btn--sm');
+    const cls = cx('tc-btn', a.variant === 'primary' && 'tc-btn--primary', a.variant === 'ghost' && 'tc-btn--ghost', size || 'tc-btn--sm');
     if (a.cmd === 'goto') return html`<a class="${cls}" href="#${a.route}">${a.icon ? icon(a.icon) : ''}${a.label}</a>`;
     return html`<button class="${cls}" type="button" data-cmd="${a.cmd}"${a.copy ? html` data-text="${a.copy}"` : ''}>${a.icon ? icon(a.icon) : ''}${a.label}</button>`;
   };
@@ -500,7 +527,7 @@
             <div class="tc-ready-meter" aria-hidden="true">${r.steps.map((step) => html`<span${step.done ? raw(' data-done') : ''}></span>`)}</div>
           </div>
           <p class="tc-page-lede">${r.lede}</p>
-          ${next && next.action ? html`<div class="tc-phone-only tc-ready-cta">${stepAction(next.action, 'tc-btn--block')}</div>` : ''}
+          ${next && next.action ? html`<div class="tc-phone-only tc-ready-cta">${stepAction(next.action, 'tc-btn--block')}${next.alt ? stepAction(Object.assign({ variant: 'ghost' }, next.alt), 'tc-btn--block') : ''}</div>` : ''}
         </div>
         <ol class="tc-checklist">
           ${r.steps.map((step, i) => html`
@@ -508,7 +535,7 @@
               <span class="tc-check-mark">${step.done ? icon('check') : String(i + 1)}</span>
               <span class="tc-check-title">${step.title}</span>
               ${step.done && step.aside ? html`<span class="tc-check-aside tc-mono tc-muted">${step.aside}</span>` : ''}
-              ${stepAction(step.action)}
+              ${step.alt ? html`<span class="tc-check-actions">${stepAction(Object.assign({ variant: 'ghost' }, step.alt))}${stepAction(step.action)}</span>` : stepAction(step.action)}
               ${!step.done && step.desc ? html`<span class="tc-check-desc">${step.desc}</span>` : ''}
             </li>`)}
         </ol>
@@ -580,6 +607,7 @@
       'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'harness.enabled': 'circle-check', 'signin.ok': 'log-in', 'setup.finished': 'download',
       'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
       'package.installed': 'download', 'package.updated': 'circle-arrow-up', 'package.uninstalled': 'trash-2', 'package.failed': 'circle-alert',
+      'url.set': 'globe', 'url.cleared': 'globe',
     };
     return section('recent-title', 'Recent', html`<div class="tc-group"><ol class="tc-log">${events.slice(0, 8).map((e) => html`
       <li data-key="ev-${e.at}-${e.kind}">${icon(ICONS[e.kind] || 'activity')}<span class="tc-truncate">${e.text}${e.detail ? html` <span class="tc-mono">${e.detail}</span>` : ''}</span><time datetime="${new Date(e.at).toISOString()}" title="${M.absTime(e.at)}">${M.relTime(e.at, n)}</time></li>`)}</ol></div>`,
@@ -642,7 +670,7 @@
     const s = state.status;
     if (pair.minting) return;
     if (s && !s.publicUrl) {
-      pair.error = 'Set T3_PUBLIC_URL first: a pairing link points at it, and without it a device has nowhere to go.';
+      pair.error = 'Set the public URL first: a pairing link points at it, and without it a device has nowhere to go.';
       render();
       return;
     }
@@ -704,8 +732,8 @@
           <div class="tc-field"><label class="tc-label" for="pair-label">Label <span class="tc-label-opt">optional</span></label><input id="pair-label" class="tc-input" placeholder="e.g. iPhone" maxlength="64" autocomplete="off" spellcheck="false"></div>
           <div class="tc-field"><span class="tc-label" id="ttl-label">Expires in</span><div class="tc-seg" role="group" aria-labelledby="ttl-label">${TTLS.map(([value, label]) => html`<button type="button" aria-pressed="${String(pair.ttl === value)}" data-cmd="pair.ttl" data-value="${value}">${label}</button>`)}</div></div>
         </div>
-        <button class="tc-btn tc-btn--primary" type="button" data-cmd="pair.start" data-key="pair-create"${pair.minting || noUrl ? raw(' disabled') : ''}>${pair.minting ? html`<span class="tc-spinner" aria-hidden="true"></span>` : icon('link')}Create pairing link<span class="tc-kbd tc-desk-only" aria-hidden="true">P</span></button>
-        ${noUrl ? html`<div class="tc-pair-form-note">${notice('warn', 'triangle-alert', 'Set T3_PUBLIC_URL first', 'A pairing link points at the address in T3_PUBLIC_URL. Set it to the URL your devices use, then recreate the container.')}</div>` : ''}
+        <button class="${cx('tc-btn', !noUrl && 'tc-btn--primary')}" type="button" data-cmd="pair.start" data-key="pair-create"${pair.minting || noUrl ? raw(' disabled') : ''}>${pair.minting ? html`<span class="tc-spinner" aria-hidden="true"></span>` : icon('link')}Create pairing link<span class="tc-kbd tc-desk-only" aria-hidden="true">P</span></button>
+        ${noUrl ? html`<div class="tc-pair-form-note">${notice('warn', 'triangle-alert', 'Set the public URL first', 'A pairing link points at it: the address your phone or browser uses to reach this server.', urlButtons(s, 'tc-btn--sm', 'tc-choice'))}</div>` : ''}
         ${pair.error && !noUrl ? html`<p class="tc-hint tc-hint--err tc-pair-form-note" role="alert">${pair.error}</p>` : ''}
       </div></div>`;
   };
@@ -975,8 +1003,8 @@
         ${Number.isFinite(server.uptimeSeconds) ? readout('Uptime', M.duration(server.uptimeSeconds)) : ''}
       </div></div>`)}
       ${section('ev-access', 'Access', html`<div class="tc-group"><dl class="tc-kv">
-        <dt>Public URL</dt><dd>${s.publicUrl ? html`<span class="tc-mono tc-mono--body tc-truncate">${s.publicUrl}</span><span class="tc-spacer"></span>${copyButton(s.publicUrl, 'Copy public URL', { iconOnly: true })}`
-          : html`${dot('warn')}<span>Not set. Pairing links need <code>T3_PUBLIC_URL</code>.</span>`}</dd>
+        <dt>Public URL</dt><dd>${s.publicUrl ? html`<span class="tc-mono tc-mono--body tc-truncate">${s.publicUrl}</span><span class="tc-kv-aside">${M.publicUrlSource(s)}</span><span class="tc-spacer"></span>${s.publicUrlSource === 'env' ? '' : html`<button class="tc-btn tc-btn--ghost tc-btn--xs" type="button" data-cmd="url.edit">Change</button>`}${copyButton(s.publicUrl, 'Copy public URL', { iconOnly: true })}`
+          : html`<span class="tc-kv-fill">${dot('warn')}<span>Not set. Pairing links need it.</span></span>${urlButtons(s, 'tc-btn--xs', 'tc-choice')}`}</dd>
         ${s.singlePort ? html`<dt>One port</dt><dd><span class="tc-mono tc-mono--body">${s.singlePort.port}</span><span class="tc-kv-aside">T3_SINGLE_PORT · T3 Code at /, this console at ${s.singlePort.prefix}</span></dd>` : ''}
         ${t3.bind ? html`<dt>T3 Code</dt><dd><span class="tc-mono tc-mono--body">${t3.bind}</span><span class="tc-kv-aside">${/^(127\.|localhost|\[?::1)/.test(t3.bind) ? 'loopback, behind your proxy' : 'every interface in the container'}</span></dd>` : ''}
         <dt>Setup console</dt><dd><span class="tc-mono tc-mono--body">${consolePath}</span><span class="tc-kv-aside">${BASE ? 'on the same hostname · ' : ''}port ${s.setupPort || 3774}</span></dd>
@@ -1607,6 +1635,149 @@
     ? 'Verified with ' + M.listOf(types.map((t) => SECURITY[t] || t.replace(/_/g, ' ')))
     : 'mise checks no checksum or signature for this source');
 
+  // ------------------------------------------------------------ public url --
+  /**
+   * The buttons that set a missing public URL: one tap for this page's own
+   * address when it is T3 Code's, and a sheet for any other.
+   */
+  const urlButtons = (s, size = 'tc-btn--sm', cls = '') => {
+    const here = M.hereOffer(s, ui);
+    return html`<span class="${cx('tc-row-actions tc-row-actions--wrap', cls)}">${here && !here.local
+      ? html`<button class="${cx('tc-btn tc-btn--ghost', size)}" type="button" data-cmd="url.edit">Other address</button><button class="${cx('tc-btn tc-btn--primary', size)}" type="button" data-cmd="url.use">${icon('check')}Use ${M.hostOf(here.url)}</button>`
+      : html`<button class="${cx('tc-btn', size)}" type="button" data-cmd="url.edit">${icon('globe')}Set address</button>`}</span>`;
+  };
+
+  // What the check from inside the container found, said as a toast's detail.
+  const reachDetail = (check) => !check ? null
+    : check.reaches === 'this' ? 'Checked: it reaches this server.'
+      : 'Couldn’t confirm it from inside the container: ' + check.why + '. That’s normal for LAN and tailnet addresses; only your devices need to reach it.';
+
+  /**
+   * Take the server's answer about the public URL at once, rather than leave
+   * the old offer on screen until the next status read lands (a second or
+   * more, long enough to click it again). The read that follows confirms it.
+   */
+  const applyUrl = (data) => {
+    if (state.status) Object.assign(state.status, { publicUrl: data.publicUrl, publicUrlSource: data.publicUrlSource });
+    render();
+    loadStatus();
+  };
+
+  /**
+   * Save an address, from the one-tap offer or the sheet. Resolves to the API
+   * answer. `seen` is for this page's own address: the browser has just reached
+   * T3 Code there, so the server need not ask it again.
+   */
+  let urlSaving = false;
+  const saveUrl = async (url, { seen } = {}) => {
+    if (urlSaving) return { ok: false, error: null };
+    urlSaving = true;
+    const res = await api('/public-url', { body: seen ? { url, check: false } : { url } });
+    urlSaving = false;
+    if (!res.ok) return res;
+    Kit.toast('Pairing links now point at ' + M.hostOf(res.data.publicUrl), seen ? {} : { detail: reachDetail(res.data.check) });
+    applyUrl(res.data);
+    return res;
+  };
+
+  const urlSheet = { layer: null, saving: false, error: null, http: false };
+
+  const urlSheetBody = () => {
+    const s = state.status || {};
+    const here = M.hereOffer(s, ui);
+    const platform = s.publicUrlPlatform;
+    const back = s.publicUrlSource === 'saved'
+      ? html`<button class="tc-btn tc-btn--ghost" type="button" data-sheet="clear">${platform ? 'Use ' + platform.platform + '’s address' : 'Clear'}</button>`
+      : '';
+    const hint = urlSheet.error ? html`<p class="tc-hint tc-hint--err" role="alert">${urlSheet.error}</p>`
+      : urlSheet.http ? html`<span class="tc-hint tc-hint--warn">Over http://, a pairing link’s token travels unencrypted. Fine on your own network; use https:// anywhere else.</span>`
+        : html`<span class="tc-hint">A domain, a tunnel’s host name, or a LAN address such as http://192.168.1.20:3773.</span>`;
+    return html`
+      <div class="tc-sheet-head"><span class="tc-tile tc-tile--icon tc-tile--lg" aria-hidden="true">${icon('globe')}</span><div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="url-title">Public URL</h2><span class="tc-small tc-muted">Where your devices reach this server. Pairing links point here.</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
+      <div class="tc-sheet-body">
+        <div class="tc-field"><label class="tc-label" for="url-input">Address</label>
+          <input id="url-input" name="url" class="tc-input tc-input--mono" type="text" inputmode="url" placeholder="https://t3.example.com" value="${s.publicUrlSource === 'env' ? '' : s.publicUrl || ''}" autocomplete="off" spellcheck="false" autocapitalize="off" aria-describedby="url-hint">
+          <div id="url-hint">${hint}</div></div>
+        ${here ? html`<div class="tc-group"><div class="tc-list"><div class="tc-row tc-row--compact" data-key="url-here"><span class="tc-tile tc-tile--icon" aria-hidden="true">${icon(here.local ? 'laptop' : 'globe')}</span><div class="tc-row-main"><span class="tc-row-name">This page’s address</span><span class="tc-status tc-mono">${here.url}</span>${here.local ? html`<span class="tc-status">Only this computer can open it.</span>` : ''}</div><button class="tc-btn tc-btn--sm" type="button" data-sheet="here">Use</button></div></div></div>` : ''}
+        ${platform && s.publicUrlSource === 'platform' ? html`<p class="tc-small tc-muted">${platform.platform} gives this service ${html`<span class="tc-mono">${M.hostOf(platform.url)}</span>`}. Set an address here only to use another, such as your own domain.</p>` : ''}
+      </div>
+      <div class="tc-sheet-foot">${back}<span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Cancel</button><button class="tc-btn tc-btn--primary" type="submit" data-key="url-save">${urlSheet.saving ? html`<span class="tc-spinner" aria-hidden="true"></span>Checking` : 'Save'}</button></div>`;
+  };
+
+  const syncUrlSheet = () => {
+    const panel = urlSheet.layer && urlSheet.layer.panel;
+    if (!panel) return;
+    const input = panel.querySelector('#url-input');
+    const value = input ? input.value.trim() : '';
+    const http = /^http:\/\//i.test(value);
+    if (http !== urlSheet.http) { urlSheet.http = http; urlSheet.layer.render(); }
+    const save = panel.querySelector('[data-key="url-save"]');
+    if (save) save.disabled = urlSheet.saving || !value;
+  };
+
+  const openUrlSheet = (trigger) => {
+    if (urlSheet.layer || (state.status && state.status.publicUrlSource === 'env')) return;
+    Object.assign(urlSheet, { saving: false, error: null, http: /^http:\/\//i.test((state.status && state.status.publicUrl) || '') });
+    urlSheet.layer = Kit.open({
+      kind: 'sheet',
+      panel: { tag: 'form', class: 'tc-sheet ' + (Kit.isPhone() ? 'tc-sheet--bottom' : 'tc-sheet--inset'), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'url-title', novalidate: true },
+      returnTo: trigger,
+      backdrop: 'ignore',
+      render: urlSheetBody,
+      focus: '#url-input',
+      onClose: () => { urlSheet.layer = null; },
+    });
+    const panel = urlSheet.layer.panel;
+    const input = panel.querySelector('#url-input');
+    if (input) input.select();
+    syncUrlSheet();
+    panel.addEventListener('input', () => {
+      if (urlSheet.error) { urlSheet.error = null; urlSheet.layer.render(); }
+      syncUrlSheet();
+    });
+    panel.addEventListener('click', async (e) => {
+      const action = e.target.closest('[data-sheet]');
+      if (!action) return;
+      const what = action.getAttribute('data-sheet');
+      if (what === 'close') urlSheet.layer.close('cancel');
+      else if (what === 'here') {
+        const here = M.hereOffer(state.status, ui);
+        const field = panel.querySelector('#url-input');
+        if (here && field) { field.value = here.url; field.focus(); }
+        urlSheet.error = null;
+        syncUrlSheet();
+        urlSheet.layer.render();
+      } else if (what === 'clear') {
+        const res = await api('/public-url/clear', { body: {} });
+        if (!res.ok) { urlSheet.error = res.error; urlSheet.layer.render(); return; }
+        urlSheet.layer.close('saved');
+        Kit.toast(res.data.publicUrl ? 'Pairing links point at ' + M.hostOf(res.data.publicUrl) + ' again' : 'Public URL cleared');
+        applyUrl(res.data);
+      }
+    });
+    panel.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const value = panel.querySelector('#url-input').value.trim();
+      if (!value || urlSheet.saving) return;
+      urlSheet.saving = true;
+      urlSheet.error = null;
+      urlSheet.layer.render();
+      syncUrlSheet();
+      const here = M.hereOffer(state.status, ui);
+      const res = await saveUrl(value, { seen: Boolean(here && here.url === value) });
+      urlSheet.saving = false;
+      if (!urlSheet.layer) return;
+      if (!res.ok) {
+        // Left on screen with the address still in it.
+        urlSheet.error = res.error;
+        urlSheet.layer.render();
+        syncUrlSheet();
+        return;
+      }
+      urlSheet.layer.close('saved');
+    });
+  };
+
   const toolSheet = { layer: null };
   const spinnerNote = (text) => html`<div class="tc-combobox-note"><span class="tc-spinner tc-info" aria-hidden="true"></span>${text}</div>`;
   // A backend spec wraps after its colon and slashes, not mid-name.
@@ -2147,6 +2318,15 @@
     // A failed first install never reached the config: nothing to confirm.
     'package.dismiss': (a) => callLifecycle('package', 'uninstall', a.id),
     'op.cancel': (a) => cancelOperation(a.target, a.id),
+
+    // The browser just reached T3 Code there, so there is nothing to check.
+    'url.use': async () => {
+      const here = ui.here;
+      if (!here) return;
+      const res = await saveUrl(here.url, { seen: true });
+      if (!res.ok && res.error) Kit.toast('Could not set the public URL', { tone: 'danger', detail: res.error });
+    },
+    'url.edit': (a, el) => openUrlSheet(el),
 
     'pair.start': () => {
       if (state.route !== 'devices') go('devices');

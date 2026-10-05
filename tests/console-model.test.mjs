@@ -287,6 +287,49 @@ test("readiness has exactly one next step, and collapses when everything is done
   assert.equal(M.readiness(cases[4], ui()).title, "Ready");
 });
 
+test("the public URL step offers this page's address when T3 Code answers on it, and a form otherwise", () => {
+  const unset = statusWith({ publicUrl: null, publicUrlSource: null, sessions: [] });
+  const step = (s, extra) => plain(M.readiness(s, ui(extra)).steps.find((x) => x.id === "url"));
+
+  const plainStep = step(unset);
+  assert.deepEqual(plainStep.action, { cmd: "url.edit", label: "Set address", icon: "globe", variant: "primary" });
+  assert.equal(plainStep.alt, undefined);
+  assert.match(plainStep.desc, /the address your phone or browser uses/);
+
+  const offered = step(unset, { here: { url: "https://t3.example.net", local: false } });
+  assert.deepEqual(offered.action, { cmd: "url.use", label: "Use t3.example.net", icon: "check", variant: "primary" });
+  assert.deepEqual(offered.alt, { cmd: "url.edit", label: "Other address" }, "another address is one click away");
+  assert.match(offered.desc, /open at t3\.example\.net, and T3 Code answers there too/);
+
+  const local = step(unset, { here: { url: "http://localhost:8080", local: true } });
+  assert.equal(local.action.cmd, "url.edit", "localhost is not offered as the one-tap answer");
+  assert.match(local.desc, /localhost:8080 only opens on this computer/);
+
+  const fromPlatform = step(statusWith({ publicUrl: "https://t3.up.railway.app", publicUrlSource: "platform", publicUrlPlatform: { url: "https://t3.up.railway.app", platform: "Railway" } }));
+  assert.equal(fromPlatform.done, true);
+  assert.equal(fromPlatform.aside, "from Railway");
+  assert.equal(fromPlatform.action, null);
+  assert.equal(step(statusWith({ publicUrlSource: "env" })).aside, "T3_PUBLIC_URL");
+  assert.equal(step(statusWith({ publicUrlSource: "saved" })).aside, "set here");
+});
+
+test("this page's address is only offered when it would change something", () => {
+  const here = { url: "https://t3.example.com", local: false };
+  assert.equal(M.hereOffer(statusWith({ publicUrl: "https://t3.example.com" }), ui({ here })), null, "already the public URL");
+  assert.deepEqual(plain(M.hereOffer(statusWith({ publicUrl: "https://old.example.com" }), ui({ here }))), here);
+  assert.equal(M.hereOffer(statusWith(), ui()), null, "not confirmed to be T3 Code's");
+});
+
+test("the palette sets or changes the public URL, unless T3_PUBLIC_URL pins it", () => {
+  const find = (s, label) => plain(M.paletteItems(s, null, ui(), NOW)).find((item) => item.label === label);
+  const set = find(statusWith({ publicUrl: null, publicUrlSource: null }), "Set public URL");
+  assert.equal(set.cmd.cmd, "url.edit");
+  assert.equal(set.attention, true);
+  const change = find(statusWith({ publicUrlSource: "saved" }), "Change public URL");
+  assert.equal(change.meta.text, "set here");
+  assert.equal(find(statusWith({ publicUrlSource: "env" }), "Change public URL"), undefined);
+});
+
 test("a later step that needs the user is a warning, not a second todo", () => {
   const s = statusWith({ sessions: [], harnesses: [harness("grok", { signedIn: false }), harness("cursor", { signedIn: false })] });
   const r = M.readiness(s, ui());

@@ -1142,6 +1142,16 @@ setup_stayed_up() {
   ! docker logs "$NAME" 2>&1 | grep -q "setup service exited"
 }
 check "the setup service did not crash-loop" setup_stayed_up
+
+# T3_PUBLIC_URL is the container's own configuration: the page cannot change it.
+url_is_pinned() {
+  local answer
+  answer="$(docker exec "$NAME" sh -c "curl -sS --max-time 10 -b /tmp/jar -H 'content-type: application/json' \
+    -d '{\"url\":\"https://other.example.com\"}' http://127.0.0.1:3774/public-url")" || return 1
+  [ "$(jq -r '.code' <<<"$answer")" = pinned ] || return 1
+  [ "$(status_json | jq -r '"\(.publicUrl) \(.publicUrlSource)"')" = "${PUBLIC_URL} env" ]
+}
+check "a T3_PUBLIC_URL in the container's settings can't be changed from the page" url_is_pinned
 rm -f "$SETUP_JAR"
 
 # T3_SINGLE_PORT: one listener in front of both services, the way a hosting
@@ -1154,8 +1164,11 @@ ONE_PORT="${SMOKE_ONE_PORT:-13780}"
 ONE_URL="http://127.0.0.1:${ONE_PORT}"
 ONE_JAR="$(mktemp)"
 docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
+# Without T3_PUBLIC_URL, and with the variable Railway sets: the public URL
+# checks below run against this container too.
+ONE_PLATFORM_URL="https://t3-smoke.up.railway.app"
 docker run -d --name "${NAME}-one" -e T3_PREINSTALL=none \
-  -e T3_SINGLE_PORT=8080 -e "T3_SETUP_KEY=${SETUP_KEY}" -e "T3_PUBLIC_URL=${PUBLIC_URL}" \
+  -e T3_SINGLE_PORT=8080 -e "T3_SETUP_KEY=${SETUP_KEY}" -e "RAILWAY_PUBLIC_DOMAIN=${ONE_PLATFORM_URL#https://}" \
   -p "127.0.0.1:${ONE_PORT}:8080" "$IMAGE" >/dev/null
 one_up=0
 for _ in $(seq 1 40); do
@@ -1229,6 +1242,45 @@ one_healthy() {
 }
 check "the docker healthcheck asks through it and reports healthy" one_healthy
 check "the router did not crash-loop" "! output_has 'docker logs ${NAME}-one' 'router exited'"
+
+# The public URL without T3_PUBLIC_URL: the platform's, then one saved on the
+# setup page, which applies at once, reaches t3-pair, and survives a restart,
+# then the platform's again once it is cleared.
+printf '\nPublic URL\n'
+one_status() {
+  curl -fsS --noproxy '*' --max-time 25 -b "$ONE_JAR" -H 'accept: application/json' "${ONE_URL}/__setup/status"
+}
+one_public_url() { one_status | jq -r '"\(.publicUrl) \(.publicUrlSource)"'; }
+one_set_url() {
+  curl -sS --noproxy '*' --max-time 25 -b "$ONE_JAR" -H 'content-type: application/json' \
+    -d "$1" "${ONE_URL}/__setup/public-url${2:-}"
+}
+check "the hosting platform's address is the public URL when nothing else is" \
+  "[ \"\$(one_public_url)\" = '${ONE_PLATFORM_URL} platform' ]"
+check "the startup log names it and where it came from" \
+  "output_has 'docker logs ${NAME}-one' 'public URL: ${ONE_PLATFORM_URL} (from Railway)'"
+one_saves_url() {
+  local answer
+  answer="$(one_set_url '{"url":"http://127.0.0.1:8080"}')" || return 1
+  # The container asks the address itself, and finds this server there.
+  [ "$(jq -r '.check.reaches' <<<"$answer")" = this ] || return 1
+  [ "$(one_public_url)" = "http://127.0.0.1:8080 saved" ]
+}
+check "an address saved on the setup page is checked and applies at once" one_saves_url
+check "a path is refused, saying what to use instead" \
+  "one_set_url '{\"url\":\"https://t3.example.com/app\"}' | jq -e '.code == \"invalid\" and (.error | contains(\"use https://t3.example.com\"))'"
+check "t3-pair builds its link from it" \
+  "output_has 'docker exec ${NAME}-one t3-pair --no-qr --ttl 5m' 'Pairing URL: http://127.0.0.1:8080/pair#token='"
+check "t3-doctor shows it with where it came from" \
+  "output_has 'docker exec ${NAME}-one t3-doctor' 'http://127.0.0.1:8080 (set on the setup page)'"
+one_url_survives_restart() {
+  docker restart "${NAME}-one" >/dev/null || return 1
+  retry 30 "curl -fsS --noproxy '*' --max-time 3 -o /dev/null ${ONE_URL}/.well-known/t3/environment" || return 1
+  retry 15 "[ \"\$(one_public_url)\" = 'http://127.0.0.1:8080 saved' ]"
+}
+check "and it survives a restart" one_url_survives_restart
+check "clearing it goes back to the platform's" \
+  "one_set_url '{}' /clear >/dev/null && [ \"\$(one_public_url)\" = '${ONE_PLATFORM_URL} platform' ]"
 docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
 
 # A port the router cannot serve must stop the container with the reason, not
