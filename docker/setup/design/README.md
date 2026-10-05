@@ -51,11 +51,13 @@ Not in the handoff. Keep them when syncing.
 - **Agent marks.** `T3C.agentMark(id)` draws an agent's own mark (Claude Code,
   Codex, OpenCode, Grok, Cursor, Antigravity) as T3 Code's provider settings
   draw it, from `AGENT_MARKS` in `ui.js`, and `.tc-tile--mark` sets it on a
-  neutral tile in place of a monogram. The Source control page's hosts
-  (`github`, `gitlab`, `forgejo`, `gitea`) are there too, from Simple Icons
-  (CC0); Azure DevOps keeps a monogram, since Microsoft's marks are not offered
-  for this. One-colour marks fill with `currentColor` so they follow the theme;
-  Claude, GitLab, Forgejo and Gitea keep their colours, OpenCode's two tones
-  are `--agentmark-ink` and `--agentmark-hole` in `tokens.css`, and
+  neutral tile in place of a monogram. One-colour marks fill with
+  `currentColor` so they follow the theme; Claude keeps its orange, OpenCode's
+  two tones are `--agentmark-ink` and `--agentmark-hole` in `tokens.css`, and
   Antigravity's gradient mark is a 64px image. The class is `tc-agentmark`
   rather than `tc-brand`, which is the sidebar's brand block.
+- **Provider marks.** The same function draws the source control providers'
+  marks (GitHub, GitLab, Forgejo, Azure DevOps) from `PROVIDER_MARKS`, as T3
+  Code's Source Control settings draw them. T3 has none for Gitea, which it
+  files under Forgejo; Gitea's is its repository's `assets/logo.svg`. A mark's
+  gradient ids start `ID-`, which `agentMark` makes unique per drawing.

@@ -889,6 +889,8 @@ test("a source control CLI says which host it is for and who is signed in", () =
     ],
   });
   assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => r.id)), ["gh", "glab", "fj", "tea", "az"], "in the server's order, which is its catalogue's");
+  // Each wears its provider's mark, as in T3 Code, and Gitea its own.
+  assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => r.mark)), ["github", "gitlab", "forgejo", "gitea", "azure-devops"]);
 
   const glab = scmRow(s, "glab");
   assert.equal(glab.provider, "GitLab");
@@ -915,9 +917,6 @@ test("a source control CLI says which host it is for and who is signed in", () =
   assert.equal(gh.status.text, "Not signed in");
   assert.equal(gh.badge.text, "In the image");
 
-  // Each host's own mark; Azure DevOps has none to use, so az keeps its monogram.
-  assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => [r.id, r.mark])),
-    [["gh", "github"], ["glab", "gitlab"], ["fj", "forgejo"], ["tea", "gitea"], ["az", null]]);
 
   const tea = scmRow(s, "tea");
   assert.equal(tea.state, "missing");

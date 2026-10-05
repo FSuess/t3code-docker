@@ -42,7 +42,7 @@ const T3Model = (() => {
   // for one host (`tokenCommand`, handed over as `handover` says; `host` is
   // the one most people mean, and `tokenPage` makes a token there with
   // `scopes` ticked, where the host lets a link do that). `mark` is the
-  // host's mark (design/ui.js); az keeps its monogram.
+  // host's mark (design/ui.js), as T3 Code's Source Control settings draw it.
   const SOURCE_CONTROL = {
     gh: { name: 'GitHub CLI', mono: 'gh', mark: 'github', hue: '--id-toolchain', provider: 'GitHub', flow: 'device', command: 'gh auth login --web',
       host: 'github.com', tokenCommand: 'gh auth login --with-token', handover: 'on stdin',
@@ -53,7 +53,7 @@ const T3Model = (() => {
       tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
     tea: { name: 'Gitea CLI', mono: 'tea', mark: 'gitea', hue: '--id-toolchain', provider: 'Gitea', flow: 'token', host: 'gitea.com', tokenCommand: 'tea login add', handover: 'in its environment',
       tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
-    az: { name: 'Azure CLI', mono: 'az', hue: '--id-toolchain', provider: 'Azure DevOps', flow: 'device', command: 'az login --use-device-code' },
+    az: { name: 'Azure CLI', mono: 'az', mark: 'azure-devops', hue: '--id-toolchain', provider: 'Azure DevOps', flow: 'device', command: 'az login --use-device-code' },
   };
 
   const DONE = { install: 'Installed', update: 'Updated', uninstall: 'Uninstalled' };
@@ -499,6 +499,7 @@ const T3Model = (() => {
       target,
       name: meta.name,
       mono: meta.mono,
+      mark: meta.mark || null,
       hue: '--id-toolchain',
       version,
       latest: updateAvailable ? latest : null,
@@ -615,7 +616,7 @@ const T3Model = (() => {
     if (c.inImage || added) {
       const present = c.inImage ? c.installed : true;
       row = {
-        id: c.id, key: 'toolchain:' + c.id, target: 'toolchain', name: meta.name, mono: meta.mono, hue: '--id-toolchain',
+        id: c.id, key: 'toolchain:' + c.id, target: 'toolchain', name: meta.name, mono: meta.mono, mark: meta.mark || null, hue: '--id-toolchain',
         version: (added ? added.version : c.version) || null, latest: null, updateAvailable: false, state: present ? 'ok' : 'missing',
         status: { dot: null, text: '' }, badge: { tone: null, text: added ? 'Added tool' : 'In the image' }, action: null, menu: [],
         progress: null, cancellable: false, attention: false, dim: !present, description: null, bins: [],
