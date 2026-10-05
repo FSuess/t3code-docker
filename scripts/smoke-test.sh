@@ -902,6 +902,33 @@ added_tool_installs() {
 }
 check "any mise tool installs from the page, pinned exactly, and runs in a login shell" added_tool_installs
 check "and the CLI lists it" "output_has 'docker exec $NAME t3-harness packages' '^shfmt'"
+
+# The CLI T3 Code drives for each source control host: the image's gh, and
+# glab, fj, tea and az installed like a toolchain when asked.
+source_control_listed() {
+  status_json | jq -e '[.sourceControl[].id] == ["gh", "glab", "fj", "tea", "az"]' >/dev/null || return 1
+  status_json | jq -e '.sourceControl[] | select(.id == "gh" and .inImage and .installed)' >/dev/null
+}
+check "the page lists one source control CLI per host, gh from the image" source_control_listed
+check "and the CLI lists them" "output_has 'docker exec $NAME t3-harness source-control' '^gh'"
+glab_refused_as_added_tool() {
+  [ "$(package_post install glab)" = 400 ] || return 1
+  docker exec "$NAME" jq -e '.code == "managed-elsewhere"' /tmp/package.json >/dev/null
+}
+check "glab is refused as an added tool" glab_refused_as_added_tool
+glab_installs() {
+  local code state=""
+  code="$(docker exec "$NAME" sh -c "curl -sS -o /dev/null -w '%{http_code}' -b /tmp/jar \
+    -H 'content-type: application/json' -d '{\"id\":\"glab\"}' http://127.0.0.1:3774/toolchains/install")"
+  [ "$code" = 202 ] || return 1
+  for _ in $(seq 1 90); do
+    state="$(status_json | jq -r '.operations["toolchain:glab"].state // ""')"
+    case "$state" in running|queued|"") sleep 2 ;; *) break ;; esac
+  done
+  [ "$state" = ok ] || return 1
+  docker exec -u t3 "$NAME" bash -lc 'cd /tmp && glab --version' >/dev/null 2>&1
+}
+check "glab installs from the page and runs in a login shell" glab_installs
 added_tool_refused_under_an_agents_name() {
   [ "$(package_post install claude-code)" = 400 ] || return 1
   docker exec "$NAME" jq -e '.code == "managed-elsewhere"' /tmp/package.json >/dev/null
