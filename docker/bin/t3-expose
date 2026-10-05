@@ -44,11 +44,21 @@ fi
 api() {
   local method="$1" path="$2" body="${3:-}"
   if [ -n "$body" ]; then
-    curl -fsS --max-time 20 -X "$method" -H "x-t3-setup-key: ${key}" \
+    curl -sS --fail-with-body --max-time 20 -X "$method" -H "x-t3-setup-key: ${key}" \
       -H 'content-type: application/json' -d "$body" "${API}${path}"
   else
-    curl -fsS --max-time 20 -X "$method" -H "x-t3-setup-key: ${key}" "${API}${path}"
+    curl -sS --fail-with-body --max-time 20 -X "$method" -H "x-t3-setup-key: ${key}" "${API}${path}"
   fi
+}
+
+# For a change the setup server may refuse. A refusal (curl's 22: an HTTP
+# error, with the server's JSON saying why on stdout) is an answer to show; only
+# failing to get one at all means the server is unreachable. curl's own line
+# about either adds nothing to what is printed below, so it is left out.
+answer() {
+  local rc=0
+  out="$(api "$@" 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 22 ] || unreachable
 }
 
 unreachable() {
@@ -92,7 +102,7 @@ case "${1:-}" in
   stop|unexpose)
     port="${2:-}"
     [ -n "$port" ] || { echo "usage: t3-expose stop <port>" >&2; exit 2; }
-    out="$(api POST /ports/unexpose "{\"port\":${port}}")" || unreachable
+    answer POST /ports/unexpose "{\"port\":${port}}"
     if [ "$(printf '%s' "$out" | jq -r '.ok // false')" = "true" ]; then
       printf 'Stopped publishing port %s.\n' "$port"
     else
@@ -109,7 +119,7 @@ case "$port" in
   ''|*[!0-9]*) echo "t3-expose: '$port' is not a port number" >&2; exit 2 ;;
 esac
 
-out="$(api POST /ports/expose "{\"port\":${port}}")" || unreachable
+answer POST /ports/expose "{\"port\":${port}}"
 err="$(printf '%s' "$out" | jq -r '.error // ""')"
 if [ -n "$err" ]; then
   echo "t3-expose: $err" >&2
