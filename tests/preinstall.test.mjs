@@ -56,6 +56,7 @@ function fakeManager({ installed = [], fail = {}, busyFor = {}, declined = [] } 
   });
   const manager = side("agent");
   manager.toolchains = side("toolchain");
+  manager.sourceControl = side("source-control");
   manager.calls = calls;
   manager.present = present;
   return manager;
@@ -92,6 +93,30 @@ test("T3_PREINSTALL parses groups, ids, and off switches", () => {
   // Order follows the catalogue, not the variable, and duplicates collapse.
   assert.deepEqual(ids("go, claude rust claude"), ["agent:claude", "toolchain:go", "toolchain:rust"]);
   assert.deepEqual(parsePreinstall("claude,python,java").unknown, ["python", "java"]);
+});
+
+test("source control CLIs are installed only when named, never by default or all", () => {
+  const ids = (value) => parsePreinstall(value).items.map((item) => `${item.kind}:${item.id}`);
+  const scm = ["source-control:glab", "source-control:fj", "source-control:tea", "source-control:az"];
+  assert.deepEqual(ids("source-control"), scm);
+  assert.deepEqual(ids("scm"), scm);
+  for (const value of [undefined, "default", "all", "toolchains"]) {
+    assert.equal(ids(value).some((id) => id.startsWith("source-control:")), false, String(value));
+  }
+  assert.deepEqual(ids("az, claude, glab"), ["agent:claude", "source-control:glab", "source-control:az"]);
+  assert.deepEqual(parsePreinstall("gh").unknown, ["gh"], "the image's gh is not installed");
+});
+
+test("a named source control CLI installs after the rest, through its own surface", async () => {
+  const fs = memoryFs();
+  const manager = fakeManager();
+  const summary = await run(manager, fs, { T3_PREINSTALL: "glab,go" });
+  assert.deepEqual(manager.calls, ["toolchain:go", "source-control:glab"]);
+  assert.deepEqual(summary.installed, ["toolchain:go", "source-control:glab"]);
+  const shown = await readPreinstall({ stateDir: STATE_DIR, fs });
+  assert.deepEqual(shown.items.map((item) => [item.kind, item.id, item.name, item.state]), [
+    ["toolchain", "go", "Go", "done"], ["source-control", "glab", "GitLab CLI", "done"],
+  ]);
 });
 
 test("a first start installs the default set, agents first, and syncs each agent", async () => {
