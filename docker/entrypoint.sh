@@ -263,8 +263,11 @@ register_projects
 # Agent credentials default to $HOME - ~/.claude, ~/.codex and friends - which
 # only survives a recreate if the whole home is mounted. The state directory is
 # the one path every deployment mounts, so anchor them there and link them back.
-# Whatever you mounted, signing in once stays signed in.
+# Whatever you mounted, signing in once stays signed in. The same goes for the
+# source control CLIs T3 Code opens pull requests through: gh, glab, tea, fj
+# and az keep their sign-ins in these.
 AGENT_DIRS=".claude .codex .cursor .grok .config/opencode .local/share/opencode"
+AGENT_DIRS="$AGENT_DIRS .config/gh .config/glab-cli .config/tea .local/share/forgejo-cli .azure"
 
 persist_agent_credentials() {
   [ "$T3_PERSIST_AGENT_CREDENTIALS" = "1" ] || return 0
