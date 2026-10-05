@@ -274,7 +274,7 @@ const audit = () => {
   let total = 0;
 
   // What to measure at each size: every route, then the overlays.
-  const ROUTES = ["overview", "devices", "agents", "toolchains", "ports", "environment", "more"];
+  const ROUTES = ["overview", "devices", "agents", "toolchains", "sourcecontrol", "ports", "environment", "more"];
   /** A host page on the console's origin holding the console in a frame; the frame, with the page's keyboard. */
   const framed = async (page, url) => {
     const host = new globalThis.URL("/__ui-audit-host", url).href;

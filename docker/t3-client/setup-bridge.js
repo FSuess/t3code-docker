@@ -73,6 +73,7 @@
     { id: 'agents', route: 'agents', title: 'Agents', meta: 'Setup · sign in, install and update', words: ['agents'] },
     { id: 'pair', route: 'devices', title: 'Pair a device', meta: 'Setup · Devices', words: ['pair', 'pairing', 'devices'] },
     { id: 'toolchains', route: 'toolchains', title: 'Toolchains', meta: 'Setup · Go, Rust, Bun, Deno, uv and any mise tool', words: ['toolchains', 'mise'] },
+    { id: 'sourcecontrol', route: 'sourcecontrol', title: 'Source control', meta: 'Setup · the GitLab, Forgejo, Gitea and Azure DevOps CLIs, and their sign-ins', words: ['gitlab', 'forgejo', 'gitea', 'azure', 'glab'] },
     { id: 'ports', route: 'ports', title: 'Ports', meta: 'Setup · publish a dev server', words: ['ports', 'publish'] },
   ];
 

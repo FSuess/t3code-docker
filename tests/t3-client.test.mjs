@@ -84,6 +84,8 @@ test("Setup's commands answer to their own words in T3's palette, and not to T3'
   assert.deepEqual(found("publish"), ["ports", true]);
   assert.deepEqual(found("console"), ["setup", true]);
   for (const q of ["settings", "open", "sign", "go to", "new thread", "setup ports x", "theme"]) assert.deepEqual(found(q), ["", false], q);
+  assert.deepEqual(found("gitlab"), ["sourcecontrol", true]);
+  assert.deepEqual(found("setup azure"), ["sourcecontrol", true]);
   for (const item of B.PALETTE_ITEMS) assert.ok(item.route === null || /^[a-z]+$/.test(item.route), item.id);
 });
 

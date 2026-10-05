@@ -867,3 +867,130 @@ test("Antigravity reads as an agent T3 Code installs and signs in itself", () =>
   assert.equal(downloading.progress.pct, 50, "T3's own download, even one started in its settings");
   assert.equal(at(ag(), { signingIn: "antigravity" }).status.text, "Waiting for the Google sign-in");
 });
+
+// ----------------------------------------------------------- source control --
+
+const scm = (id, overrides = {}) => ({
+  id, name: M.SOURCE_CONTROL[id].name, provider: M.SOURCE_CONTROL[id].provider, inImage: id === "gh",
+  installed: true, version: "1.0.0", latestVersion: null, failed: false, failure: null, operation: null,
+  inProgress: false, missingExtensions: [], auth: { status: "authenticated", account: "ana", host: "gitlab.com", detail: null },
+  ...overrides,
+});
+const scmRow = (status, id, extra) => M.sourceControlRows(status, ui(extra), NOW).find((r) => r.id === id);
+
+test("a source control CLI says which host it is for and who is signed in", () => {
+  const s = statusWith({
+    sourceControl: [
+      scm("az", { auth: { status: "unauthenticated", account: null, host: null, detail: "ERROR: Please run 'az login'" } }),
+      scm("glab", { latestVersion: "1.1.0" }),
+      scm("gh", { version: "2.102.0", auth: { status: "unauthenticated", account: null, host: null, detail: null } }),
+      scm("tea", { installed: false, version: null, auth: null }),
+      scm("fj", { auth: { status: "unknown", account: null, host: null, detail: "timed out" } }),
+    ],
+  });
+  assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => r.id)), ["gh", "glab", "fj", "tea", "az"], "in the catalogue's order");
+
+  const glab = scmRow(s, "glab");
+  assert.equal(glab.provider, "GitLab");
+  assert.equal(glab.status.text, "Signed in as ana on gitlab.com · 1.1.0 is available");
+  assert.equal(glab.action.cmd, "toolchain.update");
+
+  // Installed and signed out: T3 Code cannot use it, so it wants the user.
+  const az = scmRow(s, "az");
+  assert.equal(az.state, "signin");
+  assert.equal(az.attention, true);
+  assert.deepEqual(plain(az.status), { dot: "warn", text: "Not signed in" });
+
+  assert.deepEqual(plain(az.action), { variant: "primary", cmd: "scm.signin", label: "Sign in", icon: "log-in" });
+
+  // The image's gh is never a warning, and has nothing to install or remove:
+  // signing it in is offered quietly.
+  const gh = scmRow(s, "gh");
+  assert.equal(gh.inImage, true);
+  assert.equal(gh.state, "ok");
+  assert.equal(gh.attention, false);
+  assert.deepEqual(plain(gh.action), { cmd: "scm.signin", label: "Sign in", icon: "log-in" });
+  assert.deepEqual(plain(gh.menu), []);
+  assert.equal(gh.status.text, "Not signed in");
+  assert.equal(gh.badge.text, "In the image");
+
+  const tea = scmRow(s, "tea");
+  assert.equal(tea.state, "missing");
+  assert.deepEqual(plain(tea.status), { dot: null, text: "Not installed" }, "never left out of T3_PREINSTALL: nothing installs it unasked");
+  assert.equal(tea.action.cmd, "toolchain.install");
+
+  assert.equal(scmRow(s, "fj").status.text, "Installed · sign-in could not be checked");
+});
+
+test("an az without its extension offers to repair it", () => {
+  const s = statusWith({ sourceControl: [scm("az", { missingExtensions: ["azure-devops"] })] });
+  const az = scmRow(s, "az");
+  assert.equal(az.state, "failed");
+  assert.equal(az.status.text, "Missing the azure-devops extension");
+  assert.equal(az.action.label, "Repair");
+  assert.equal(az.action.cmd, "toolchain.update");
+});
+
+test("source control counts with the toolchains: needs-you, badges, update all, and the palette", () => {
+  const s = statusWith({
+    sourceControl: [
+      scm("gh", { auth: { status: "unauthenticated" } }),
+      scm("glab", { auth: { status: "unauthenticated" } }),
+      scm("fj", { latestVersion: "1.1.0" }),
+      scm("tea", { installed: false, version: null, auth: null }),
+    ],
+  });
+  assert.deepEqual(plain(M.needsYou(s, null, ui()).map((i) => i.id)), ["glab", "fj"], "gh signed out is not owed anything");
+  // Its own page, with its own badge; the Toolchains page is not blamed for it.
+  const badges = M.navBadges(s, null, ui());
+  assert.deepEqual(plain(badges.sourcecontrol), { tone: "warn", count: 1 });
+  assert.equal(badges.toolchains.tone, undefined);
+  assert.equal(badges.more.count, 1, "on a phone, More carries it");
+  assert.equal(M.attentionCount(s, null, ui()), 1);
+  assert.equal(M.summaries(s, null, ui(), NOW).sourcecontrol.text, "1 of 3 CLIs signed in");
+  const labels = M.paletteItems(s, null, ui(), NOW).map((i) => i.label);
+  assert.ok(labels.includes("Install Gitea CLI"));
+  assert.ok(labels.includes("Update Forgejo CLI to 1.1.0"));
+  assert.ok(labels.includes("Update all source control CLIs"));
+  assert.ok(!labels.includes("Update all toolchains"), "the toolchains have nothing to update");
+  const items = M.paletteItems(s, null, ui(), NOW);
+  assert.equal(items.find((i) => i.label === "Install Gitea CLI").group, "Source control");
+  assert.deepEqual(plain(items.find((i) => i.label === "Source control" && i.group === "Go to").cmd), { cmd: "goto", route: "sourcecontrol" });
+  assert.ok(!labels.some((l) => /(Install|Update|Uninstall) GitHub CLI/.test(l)), "the image's gh is not installed here");
+  assert.ok(labels.includes("Sign in GitHub CLI"));
+  assert.ok(labels.includes("Sign in GitLab CLI"));
+  assert.ok(M.searchPalette(M.paletteItems(s, null, ui(), NOW), "gitlab").some((i) => i.label === "Uninstall GitLab CLI…"));
+});
+
+test("a source control CLI the first start installs shows as queued, and finished work names it", () => {
+  const s = statusWith({
+    sourceControl: [scm("glab", { installed: false, version: null, auth: null })],
+    setup: { state: "running", items: [{ kind: "source-control", id: "glab", name: "GitLab CLI", state: "pending" }] },
+    operations: { "toolchain:fj": { kind: "install", state: "ok", finishedAt: NOW - MIN } },
+  });
+  assert.equal(scmRow(s, "glab").state, "queued");
+  assert.ok(M.activity(s, ui(), NOW).finished.some((f) => f.text === "Installed Forgejo CLI"));
+  assert.equal(M.managedOn("azure-cli"), "Source control");
+  assert.equal(M.managedOn("glab"), "Source control");
+});
+
+test("a signed-in CLI offers another host and signing out; az signs in with a device code", () => {
+  const s = statusWith({
+    sourceControl: [
+      scm("glab"),
+      scm("az", { auth: { status: "authenticated", account: "ana@example.com", host: "dev.azure.com" } }),
+    ],
+  });
+  const glab = scmRow(s, "glab");
+  assert.equal(glab.flow, "token");
+  assert.deepEqual(plain(glab.menu.filter((m) => m.cmd && m.cmd.startsWith("scm.")).map((m) => m.label)), ["Sign in to another host…", "Sign out of gitlab.com…"]);
+  assert.equal(glab.menu.at(-1).cmd, "toolchain.uninstall", "Uninstall stays last, after the separator");
+  const az = scmRow(s, "az");
+  assert.equal(az.flow, "device");
+  assert.deepEqual(plain(az.menu.filter((m) => m.cmd && m.cmd.startsWith("scm.")).map((m) => m.label)), ["Sign in again…", "Sign out…"]);
+  const signing = scmRow(s, "az", { signingIn: "az" });
+  assert.equal(signing.state, "signing");
+  assert.equal(signing.badge.text, "Signing in");
+  assert.ok(M.paletteItems(s, null, ui(), NOW).some((i) => i.label === "Sign GitLab CLI out of gitlab.com…"));
+  assert.match(M.SOURCE_CONTROL.glab.tokenPage("gitlab.example.com"), /^https:\/\/gitlab\.example\.com\/-\/user_settings\/personal_access_tokens\?/);
+});

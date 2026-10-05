@@ -32,6 +32,27 @@ const T3Model = (() => {
     uv: { name: 'uv', mono: 'uv' },
   };
 
+  // The CLI T3 Code drives for each source control host (its Settings >
+  // Source Control). gh is part of the image; the rest install like a
+  // toolchain, when someone asks for them. Bitbucket has none: T3 talks to
+  // its API with a token saved in T3 Code itself.
+  //
+  // How each signs in here: a token for one host (`host` is the one most
+  // people mean; `tokenPage` makes one there with `scopes` ticked, where the
+  // host lets a link do that), or az's device code.
+  const SOURCE_CONTROL = {
+    gh: { name: 'GitHub CLI', mono: 'gh', hue: '--id-toolchain', provider: 'GitHub', flow: 'token', host: 'github.com', command: 'gh auth login', handover: 'on stdin',
+      tokenPage: (host) => 'https://' + host + '/settings/tokens/new?scopes=repo,read:org,workflow&description=T3+Code', scopes: 'repo, read:org, workflow' },
+    glab: { name: 'GitLab CLI', mono: 'GL', hue: '--id-toolchain', provider: 'GitLab', flow: 'token', host: 'gitlab.com', command: 'glab auth login', handover: 'on stdin',
+      tokenPage: (host) => 'https://' + host + '/-/user_settings/personal_access_tokens?name=T3+Code&scopes=api,write_repository', scopes: 'api, write_repository' },
+    fj: { name: 'Forgejo CLI', mono: 'fj', hue: '--id-toolchain', provider: 'Forgejo', flow: 'token', host: 'codeberg.org', command: 'fj auth add-token', handover: 'on stdin',
+      tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
+    tea: { name: 'Gitea CLI', mono: 'tea', hue: '--id-toolchain', provider: 'Gitea', flow: 'token', host: 'gitea.com', command: 'tea login add', handover: 'in its environment',
+      tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
+    az: { name: 'Azure CLI', mono: 'az', hue: '--id-toolchain', provider: 'Azure DevOps', flow: 'device', how: 'device code', command: 'az login --use-device-code' },
+  };
+  const SOURCE_CONTROL_ORDER = ['gh', 'glab', 'fj', 'tea', 'az'];
+
   const DONE = { install: 'Installed', update: 'Updated', uninstall: 'Uninstalled' };
   const WORKING = { install: 'Installing', update: 'Updating', uninstall: 'Removing' };
   const FAILED = { install: 'Install failed', update: 'Update failed', uninstall: 'Uninstall failed' };
@@ -180,7 +201,9 @@ const T3Model = (() => {
     const kind = (op && op.state === 'running' && op.kind) || null;
     const serverQueued = Boolean(op && op.state === 'queued');
     const setup = status.setup || {};
-    const item = (setup.items || []).find((i) => i.kind === (target === 'harness' ? 'agent' : 'toolchain') && i.id === id);
+    // The first start's source control CLIs install as toolchains.
+    const kinds = target === 'harness' ? ['agent'] : ['toolchain', 'source-control'];
+    const item = (setup.items || []).find((i) => kinds.includes(i.kind) && i.id === id);
     const queued = Boolean(setup.state === 'running' && item && item.state === 'pending');
     const installingFromSetup = Boolean(setup.state === 'running' && item && item.state === 'installing');
     return {
@@ -453,7 +476,7 @@ const T3Model = (() => {
     const isPackage = target === 'package';
     const meta = isPackage
       ? { name: t.name || t.id, mono: monogram(t.name || t.id), detail: providesText(t.name || t.id, t.bins) }
-      : TOOLCHAINS[t.id] || { name: t.name || t.id, mono: String(t.id || '?').slice(0, 2) };
+      : TOOLCHAINS[t.id] || SOURCE_CONTROL[t.id] || { name: t.name || t.id, mono: String(t.id || '?').slice(0, 2) };
     const cmd = (verb) => target + '.' + verb;
     const act = activityOf(status, target, t.id, ui);
     const version = t.version || null;
@@ -462,7 +485,7 @@ const T3Model = (() => {
     const held = t.installed ? heldRelease(t, version, status, now) : null;
     const runningKind = act.serverQueued ? null : (act.ownOp && act.ownOp.kind) || (act.pending && act.pending.kind)
       || (t.inProgress ? t.operation || 'install' : null) || (act.fromSetup ? 'install' : null) || act.busy;
-    const planned = ((status.setup && status.setup.items) || []).some((i) => i.kind === 'toolchain' && i.id === t.id);
+    const planned = ((status.setup && status.setup.items) || []).some((i) => (i.kind === 'toolchain' || i.kind === 'source-control') && i.id === t.id);
     // What the global config asks for when it is not an exact version
     // (`latest`, `3`): the row says so instead of implying a pin.
     const follows = isPackage && t.requestedVersion && version && t.requestedVersion !== version ? t.requestedVersion : null;
@@ -559,6 +582,87 @@ const T3Model = (() => {
 
   const toolchainRow = (t, status, ui, now) => toolRow(t, 'toolchain', status, ui, now);
   const toolchainRows = (status, ui, now) => ((status && status.toolchains) || []).map((t) => toolRow(t, 'toolchain', status, ui, now));
+  // ------------------------------------------------------- source control --
+  /** "Signed in as ana on gitlab.com", with what the CLI says of itself. */
+  const signedInText = (a) => 'Signed in' + (a.account ? ' as ' + a.account : '') + (a.host ? (a.account ? ' on ' : ' to ') + a.host : '');
+
+  /**
+   * One source control CLI. The ones mise installs are toolchain rows (same
+   * verbs, queue and commands) that also say which host they are for and who
+   * is signed in; one that is installed and signed out needs the user, since
+   * T3 Code cannot use it. The image's gh has no verbs, and is never a
+   * warning: plenty of servers never talk to GitHub.
+   */
+  const sourceControlRow = (c, status, ui, now) => {
+    const meta = SOURCE_CONTROL[c.id] || { name: c.name || c.id, mono: String(c.id || '?').slice(0, 2), provider: c.provider || '' };
+    const auth = c.auth || null;
+    const signIn = { cmd: 'scm.signin', label: 'Sign in', icon: 'log-in' };
+    let row;
+    if (c.inImage) {
+      row = {
+        id: c.id, key: 'toolchain:' + c.id, target: 'toolchain', name: meta.name, mono: meta.mono, hue: '--id-toolchain',
+        version: c.version || null, latest: null, updateAvailable: false, state: c.installed ? 'ok' : 'missing',
+        status: { dot: null, text: '' }, badge: { tone: null, text: 'In the image' }, action: null, menu: [],
+        progress: null, cancellable: false, attention: false, dim: !c.installed, description: null, bins: [],
+      };
+      row.status.text = !c.installed ? 'Not found on PATH'
+        : auth && auth.status === 'authenticated' ? signedInText(auth)
+          : auth && auth.status === 'unauthenticated' ? 'Not signed in'
+            : 'Part of the image';
+      // Offered, never pressed on anyone: a quiet button, not a primary one.
+      if (c.installed && auth && auth.status === 'unauthenticated') row.action = signIn;
+    } else {
+      row = toolRow(c, 'toolchain', status, ui, now);
+      if (row.state === 'missing') row.status = { dot: null, text: 'Not installed' };
+      const settled = row.state === 'ok' || row.state === 'update';
+      const missing = (c.missingExtensions || []).filter(Boolean);
+      if (settled && missing.length) {
+        // az without azure-devops cannot reach a repository: installing it
+        // again adds the extension.
+        row.state = 'failed';
+        row.attention = true;
+        row.status = { dot: 'warn', text: 'Missing the ' + listOf(missing) + ' extension' };
+        row.action = { cmd: 'toolchain.update', label: 'Repair', icon: 'wrench', variant: 'warning' };
+      } else if (settled && auth && auth.status === 'authenticated') {
+        row.status = { dot: null, text: [signedInText(auth), row.updateAvailable ? row.latest + ' is available' : null].filter(Boolean).join(' · ') };
+      } else if (settled && auth && auth.status === 'unauthenticated') {
+        row.state = 'signin';
+        row.attention = true;
+        row.status = { dot: 'warn', text: 'Not signed in' + (auth.host ? ' to ' + auth.host : '') };
+        // Signed out wins the one visible verb; an update stays in the menu.
+        row.action = Object.assign({ variant: 'primary' }, signIn);
+      } else if (settled && auth && auth.status === 'unknown') {
+        row.status = { dot: null, text: [row.status.text, 'sign-in could not be checked'].filter(Boolean).join(' · ') };
+      }
+    }
+    if (ui && ui.signingIn === c.id && c.installed) {
+      row.state = 'signing';
+      row.badge = { tone: 'info', text: 'Signing in', spinner: true };
+      row.status = { dot: null, text: 'Waiting for approval on another device' };
+      row.action = null;
+      row.menu = [];
+    } else if (c.installed && !c.inProgress && auth && (auth.status === 'authenticated' || auth.status === 'unknown')) {
+      // Signed in (or not known): another host, or another account, and out again.
+      const extra = [{ cmd: 'scm.signin', label: meta.flow === 'device' ? 'Sign in again…' : 'Sign in to another host…', icon: 'log-in' }];
+      if (auth.status === 'authenticated') extra.push({ cmd: 'scm.signout', label: 'Sign out' + (auth.host && meta.flow !== 'device' ? ' of ' + auth.host : '') + '…', icon: 'log-out' });
+      const at = row.menu.findIndex((m) => m.sep);
+      row.menu = at === -1 ? [...row.menu, ...extra] : [...row.menu.slice(0, at), ...extra, ...row.menu.slice(at)];
+    }
+    row.provider = meta.provider;
+    row.command = meta.command;
+    row.flow = meta.flow;
+    row.inImage = Boolean(c.inImage);
+    row.auth = auth;
+    return row;
+  };
+  const sourceControlRows = (status, ui, now) => {
+    const list = (status && status.sourceControl) || [];
+    const rank = (id) => { const at = SOURCE_CONTROL_ORDER.indexOf(id); return at === -1 ? SOURCE_CONTROL_ORDER.length : at; };
+    return [...list].sort((a, b) => rank(a.id) - rank(b.id)).map((c) => sourceControlRow(c, status || {}, ui, now));
+  };
+  /** The source control rows that are managed like a toolchain: not the image's gh. */
+  const managedSourceControlRows = (status, ui, now) => sourceControlRows(status, ui, now).filter((row) => !row.inImage);
+
   /** The name a tool's row shows: its registry name, or the last part of a backend spec (npm:@biomejs/biome -> biome). */
   const toolName = (id) => {
     const spec = String(id || '');
@@ -601,6 +705,9 @@ const T3Model = (() => {
     claude: 'Agents', 'claude-code': 'Agents', codex: 'Agents', opencode: 'Agents', grok: 'Agents', cursor: 'Agents',
     'cursor-agent': 'Agents', 'cursor-cli': 'Agents',
     go: 'Toolchains', rust: 'Toolchains', bun: 'Toolchains', deno: 'Toolchains', uv: 'Toolchains',
+    // The source control CLIs, under every name mise knows them by.
+    glab: 'Source control', 'azure-cli': 'Source control', azure: 'Source control', 'pipx:azure-cli': 'Source control',
+    'pypi:azure-cli': 'Source control', 'forgejo:forgejo-contrib/forgejo-cli': 'Source control', 'forgejo:gitea/tea': 'Source control',
   };
   const managedOn = (name) => MANAGED_ON[String(name || '')] || null;
 
@@ -1036,6 +1143,7 @@ const T3Model = (() => {
     const items = [
       ...agents.filter((a) => a.state in rank),
       ...tools.filter((t) => t.state === 'failed' || t.state === 'update'),
+      ...managedSourceControlRows(s, ui, 0).filter((c) => c.state in rank),
     ];
     if (ports) {
       for (const p of portRows(ports, ui, 0)) {
@@ -1051,7 +1159,7 @@ const T3Model = (() => {
     const s = status || {};
     const running = [];
     const queued = [];
-    for (const row of [...agentRows(s, ui, now), ...toolchainRows(s, ui, now), ...packageRows(s, ui, now)]) {
+    for (const row of [...agentRows(s, ui, now), ...toolchainRows(s, ui, now), ...managedSourceControlRows(s, ui, now), ...packageRows(s, ui, now)]) {
       if (row.state === 'running') running.push(row);
       else if (row.state === 'queued') queued.push(row);
     }
@@ -1063,7 +1171,7 @@ const T3Model = (() => {
       const target = key.slice(0, key.indexOf(':'));
       const id = key.slice(key.indexOf(':') + 1);
       const name = target === 'harness' ? (AGENTS[id] || {}).name || id
-        : target === 'toolchain' ? (TOOLCHAINS[id] || {}).name || id
+        : target === 'toolchain' ? (TOOLCHAINS[id] || SOURCE_CONTROL[id] || {}).name || id
           : ((s.packages || []).find((p) => p.id === id) || {}).name || toolName(id);
       finished.push({
         key,
@@ -1078,10 +1186,12 @@ const T3Model = (() => {
       if (done.length) {
         const agents = done.filter((i) => i.kind === 'agent').length;
         const tools = done.filter((i) => i.kind === 'toolchain').length;
+        const scm = done.filter((i) => i.kind === 'source-control').length;
         finished.push({
           key: 'setup',
           ok: true,
-          text: 'First start finished: ' + [agents ? plural(agents, 'agent') : null, tools ? plural(tools, 'toolchain') : null].filter(Boolean).join(' and '),
+          text: 'First start finished: ' + listOf([agents ? plural(agents, 'agent') : null, tools ? plural(tools, 'toolchain') : null,
+            scm ? plural(scm, 'source control CLI') : null].filter(Boolean)),
           at: toMs(setup.finishedAt),
         });
       }
@@ -1116,10 +1226,15 @@ const T3Model = (() => {
     const s = status || {};
     const agents = agentRows(s, ui, 0);
     const tools = [...toolchainRows(s, ui, 0), ...packageRows(s, ui, 0)];
+    const scm = sourceControlRows(s, ui, 0);
     const portList = ports ? portRows(ports, ui, 0) : [];
     const agentAttention = agents.filter((a) => a.attention).length;
     const toolsRunning = tools.filter((t) => t.state === 'running').length;
     const toolsFailed = tools.filter((t) => t.state === 'failed').length;
+    // A source control CLI someone installed and has not signed in is as
+    // unusable to T3 Code as a failed one. The image's gh never counts.
+    const scmAttention = scm.filter((c) => c.attention).length;
+    const scmRunning = scm.filter((c) => c.state === 'running' || c.state === 'signing').length;
     const published = portList.filter((p) => p.state === 'open').length;
     const portsFailed = portList.filter((p) => p.state === 'failed').length;
     return {
@@ -1128,12 +1243,14 @@ const T3Model = (() => {
       agents: agentAttention ? { tone: 'warn', count: agentAttention } : { count: agents.filter((a) => a.version && a.state !== 'missing').length },
       toolchains: toolsFailed ? { tone: 'warn', count: toolsFailed }
         : toolsRunning ? { tone: 'info', count: toolsRunning } : { count: tools.filter((t) => t.version).length },
+      sourcecontrol: scmAttention ? { tone: 'warn', count: scmAttention }
+        : scmRunning ? { tone: 'info', count: scmRunning } : { count: scm.filter((c) => c.version && c.state !== 'missing').length },
       ports: portsFailed ? { tone: 'warn', count: portsFailed }
         : published ? { tone: 'info', count: published } : ports ? { count: portList.length } : null,
       // Settings an older image left in the container's environment.
       environment: (s.legacyEnv || []).length ? { tone: 'warn', count: 1 } : null,
-      more: toolsFailed + ((s.legacyEnv || []).length ? 1 : 0)
-        ? { tone: 'warn', count: toolsFailed + ((s.legacyEnv || []).length ? 1 : 0) } : null,
+      more: toolsFailed + scmAttention + ((s.legacyEnv || []).length ? 1 : 0)
+        ? { tone: 'warn', count: toolsFailed + scmAttention + ((s.legacyEnv || []).length ? 1 : 0) } : null,
     };
   };
 
@@ -1146,7 +1263,7 @@ const T3Model = (() => {
    */
   const attentionCount = (status, ports, ui) => {
     const badges = navBadges(status, ports, ui);
-    return ['agents', 'toolchains', 'ports', 'environment']
+    return ['agents', 'toolchains', 'sourcecontrol', 'ports', 'environment']
       .reduce((n, route) => n + (badges[route] && badges[route].tone === 'warn' ? badges[route].count : 0), 0);
   };
 
@@ -1166,6 +1283,11 @@ const T3Model = (() => {
       devices: { text: sessions || links ? [sessions + ' paired', links ? plural(links, 'link') + ' waiting' : null].filter(Boolean).join(' · ') : 'No devices yet' },
       agents: { text: installed.length ? signed + ' of ' + installed.length + ' signed in' : 'None installed yet' },
       toolchains: { text: [tools.filter((t) => t.installed).length + ' of ' + tools.length + ' installed', added ? added + ' added' : null, 'through mise'].filter(Boolean).join(' · ') },
+      sourcecontrol: { text: (() => {
+        const scm = (s.sourceControl || []).filter((c) => c.installed);
+        const signed = scm.filter((c) => c.auth && c.auth.status === 'authenticated').length;
+        return scm.length ? signed + ' of ' + plural(scm.length, 'CLI') + ' signed in' : 'Not readable yet';
+      })() },
       ports: { text: ports ? (ports.available === false ? 'Publishing unavailable' : [portList.filter((p) => p.listening).length + ' listening', portList.filter((p) => p.state === 'open').length ? portList.filter((p) => p.state === 'open').length + ' published' : null].filter(Boolean).join(' · ')) : '' },
       environment: { text: 'Read from the container at boot' },
       more: { text: '' },
@@ -1185,7 +1307,7 @@ const T3Model = (() => {
     const KEYWORDS = {
       'harness.signin': 'login log in auth authenticate', 'harness.apikey': 'api key token credential provider',
       'harness.install': 'add download', 'harness.uninstall': 'remove delete', 'harness.update': 'upgrade',
-      'toolchain.install': 'add download', 'toolchain.uninstall': 'remove delete', 'toolchain.update': 'upgrade',
+      'toolchain.install': 'add download', 'toolchain.uninstall': 'remove delete', 'toolchain.update': 'upgrade', 'scm.updateAll': 'upgrade',
       'package.add': 'install new tool package mise registry', 'package.install': 'add download', 'package.uninstall': 'remove delete',
       'package.update': 'upgrade', 'package.version': 'pin downgrade older release', 'tools.updateAll': 'upgrade',
       'port.publish': 'expose share tunnel open', 'port.stop': 'unpublish unexpose close tunnel', 'port.qr': 'scan phone',
@@ -1235,6 +1357,20 @@ const T3Model = (() => {
         add('Toolchains', 'Uninstall ' + t.name + '…', 'trash-2', { cmd: 'package.uninstall', id: t.id });
       }
     }
+    for (const c of managedSourceControlRows(s, ui, now)) {
+      const keywords = 'source control git ' + c.provider + ' ' + c.id + ' ' + (KEYWORDS[c.action ? c.action.cmd : ''] || '');
+      if (c.state === 'missing') add('Source control', 'Install ' + c.name, 'download', { cmd: 'toolchain.install', id: c.id }, { meta: { text: c.provider }, keywords: keywords + ' add download' });
+      if (c.updateAvailable) add('Source control', 'Update ' + c.name + ' to ' + c.latest, 'circle-arrow-up', { cmd: 'toolchain.update', id: c.id }, { meta: { text: c.version, mono: true }, attention: true, keywords: keywords + ' upgrade' });
+      if (c.state === 'failed' && c.action) add('Source control', (c.action.label === 'Repair' ? 'Repair ' : 'Retry ') + c.name, c.action.icon || 'refresh-cw', { cmd: c.action.cmd, id: c.id }, { meta: { text: 'failed', dot: 'danger' }, attention: true, keywords });
+      if (c.version && c.state !== 'running') add('Source control', 'Uninstall ' + c.name + '…', 'trash-2', { cmd: 'toolchain.uninstall', id: c.id }, { keywords: keywords + ' remove delete' });
+    }
+    for (const c of sourceControlRows(s, ui, now)) {
+      const keywords = 'source control git login log in auth token ' + c.provider + ' ' + c.id;
+      if (c.action && c.action.cmd === 'scm.signin') add('Source control', 'Sign in ' + c.name, 'log-in', { cmd: 'scm.signin', id: c.id }, { meta: { text: 'not signed in', dot: c.inImage ? null : 'warn' }, attention: !c.inImage, keywords });
+      for (const m of c.menu) {
+        if (m.cmd === 'scm.signout') add('Source control', m.label.replace('Sign out', 'Sign ' + c.name + ' out'), 'log-out', { cmd: 'scm.signout', id: c.id }, { keywords: keywords + ' log out logout' });
+      }
+    }
     // The registry, once loaded: anything mise can install, reachable by name,
     // command or description. Only offered for a query; a thousand tools would
     // bury everything else.
@@ -1265,6 +1401,8 @@ const T3Model = (() => {
     const agentUpdates = agentRows(s, ui, now).filter((a) => a.updateAvailable).length;
     if (agentUpdates) add('Actions', 'Update all agents', 'circle-arrow-up', { cmd: 'harness.updateAll' }, { meta: { text: plural(agentUpdates, 'update') }, attention: true });
     const toolUpdates = toolchainRows(s, ui, now).filter((t) => t.updateAvailable).length;
+    const scmUpdates = managedSourceControlRows(s, ui, now).filter((c) => c.updateAvailable).length;
+    if (scmUpdates) add('Actions', 'Update all source control CLIs', 'circle-arrow-up', { cmd: 'scm.updateAll' }, { meta: { text: plural(scmUpdates, 'update') } });
     const packageUpdates = packageRows(s, ui, now).filter((t) => t.updateAvailable).length;
     if (toolUpdates + packageUpdates) {
       add('Actions', packageUpdates ? 'Update all toolchains and tools' : 'Update all toolchains', 'circle-arrow-up', { cmd: 'tools.updateAll' },
@@ -1288,12 +1426,12 @@ const T3Model = (() => {
     add('Environment', 'Copy diagnostics', 'copy', { cmd: 'diagnostics' });
 
     const pages = [['Overview', 'overview', 'layout-dashboard', 'O'], ['Devices', 'devices', 'smartphone', 'D'], ['Agents', 'agents', 'bot', 'A'],
-      ['Toolchains', 'toolchains', 'wrench', 'T'], ['Ports', 'ports', 'ethernet-port', 'P'], ['Environment', 'environment', 'settings-2', 'E']];
+      ['Toolchains', 'toolchains', 'wrench', 'T'], ['Source control', 'sourcecontrol', 'git-pull-request', 'S'], ['Ports', 'ports', 'ethernet-port', 'P'], ['Environment', 'environment', 'settings-2', 'E']];
     for (const [label, route, icon, key] of pages) add('Go to', label, icon, { cmd: 'goto', route }, { shortcut: 'G ' + key });
     return items;
   };
 
-  const GROUP_ORDER = ['Agents', 'Toolchains', 'Ports', 'Devices', 'Actions', 'Environment', 'Go to', 'Install from mise'];
+  const GROUP_ORDER = ['Agents', 'Toolchains', 'Source control', 'Ports', 'Devices', 'Actions', 'Environment', 'Go to', 'Install from mise'];
   // Registry results are capped: the best few, after everything the console itself offers.
   const SEARCH_ONLY_LIMIT = 6;
 
@@ -1356,11 +1494,11 @@ const T3Model = (() => {
   };
 
   return {
-    AGENTS, TOOLCHAINS, DONE, WORKING, FAILED,
+    AGENTS, TOOLCHAINS, SOURCE_CONTROL, DONE, WORKING, FAILED,
     compareVersions, isNewer,
     relTime, absTime, shortDate, duration, countdown, formatBytes, listOf, hostOf, plural, toMs, imageLabel,
     progressOf, progressText,
-    agentRow, agentRows, toolRow, toolchainRow, toolchainRows, packageRows, portRows, looksLikeDatabase,
+    agentRow, agentRows, toolRow, toolchainRow, toolchainRows, sourceControlRows, managedSourceControlRows, packageRows, portRows, looksLikeDatabase,
     monogram, managedOn, isVersionSpec, isToolSpec, specPrefix, SPEC_SAMPLES, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind, deviceName,
     readiness, readySummary, needsYou, activity, setupBanner,

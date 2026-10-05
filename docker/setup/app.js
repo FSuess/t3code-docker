@@ -114,11 +114,13 @@
   };
 
   const harness = (id) => ((state.status && state.status.harnesses) || []).find((h) => h.id === id) || null;
-  const toolchain = (id) => ((state.status && state.status.toolchains) || []).find((t) => t.id === id) || null;
+  // A toolchain, or a source control CLI: both are run as toolchains.
+  const toolchain = (id) => [...((state.status && state.status.toolchains) || []), ...((state.status && state.status.sourceControl) || [])]
+    .find((t) => t.id === id) || null;
   const addedTool = (id) => ((state.status && state.status.packages) || []).find((p) => p.id === id) || null;
   const nameOf = (target, id) => target === 'harness' ? (M.AGENTS[id] || {}).name || (harness(id) || {}).name || id
     : target === 'package' ? (addedTool(id) || {}).name || M.toolName(id)
-      : (M.TOOLCHAINS[id] || {}).name || (toolchain(id) || {}).name || id;
+      : (M.TOOLCHAINS[id] || M.SOURCE_CONTROL[id] || {}).name || (toolchain(id) || {}).name || id;
   // Where each kind of row's operations live in the API.
   const LIFECYCLE_PATH = { harness: 'harnesses', toolchain: 'toolchains', package: 'packages' };
 
@@ -279,7 +281,7 @@
       } else {
         const text = op.error || 'Could not ' + op.kind + ' ' + pending.name;
         notices.set(key, { tone: 'danger', text });
-        const route = target === 'harness' ? 'agents' : 'toolchains';
+        const route = target === 'harness' ? 'agents' : M.SOURCE_CONTROL[id] ? 'sourcecontrol' : 'toolchains';
         Kit.toast(M.FAILED[op.kind] + ': ' + pending.name, {
           tone: 'danger',
           detail: text,
@@ -348,6 +350,17 @@
         ],
         confirm: 'Uninstall',
       }
+      : M.SOURCE_CONTROL[id]
+      ? {
+        title: 'Uninstall ' + name + '?',
+        body: 'Removes ' + name + (version ? ' ' + version : '') + ' from the volume. T3 Code stops offering ' + M.SOURCE_CONTROL[id].provider + ' pull requests until it is installed again.',
+        consequences: [
+          { icon: 'trash-2', text: 'Removed: every release this console installed' },
+          { icon: 'shield-check', text: 'Kept: its sign-in, so installing again signs you straight back in' },
+          { icon: 'lock', text: 'Stays uninstalled across restarts' },
+        ],
+        confirm: 'Uninstall',
+      }
       : target === 'harness'
       ? {
         title: 'Uninstall ' + name + '?',
@@ -374,11 +387,13 @@
 
   /**
    * "Update all": one request each; the server runs them one after another.
-   * `tools` is the Toolchains page's: the toolchains and the added tools.
+   * `tools` is the Toolchains page's: the toolchains and the added tools;
+   * `scm` the Source control page's CLIs.
    */
   const updateAll = async (target) => {
     const rows = target === 'harness' ? M.agentRows(state.status, ui, now())
-      : [...M.toolchainRows(state.status, ui, now()), ...M.packageRows(state.status, ui, now())];
+      : target === 'scm' ? M.managedSourceControlRows(state.status, ui, now())
+        : [...M.toolchainRows(state.status, ui, now()), ...M.packageRows(state.status, ui, now())];
     const due = rows.filter((r) => r.updateAvailable && r.state !== 'running' && r.state !== 'queued');
     if (!due.length) { Kit.toast('Everything is up to date', { tone: 'info' }); return; }
     for (const row of due) await callLifecycle(row.target, 'update', row.id);
@@ -483,7 +498,7 @@
         'Could not read ' + M.listOf(s.degraded.map((d) => d.what)) + '. Those parts show as empty; the container may still be starting.'));
     }
     const setup = s.setup;
-    if (setup && (route === 'overview' || route === 'agents' || route === 'toolchains')) {
+    if (setup && (route === 'overview' || route === 'agents' || route === 'toolchains' || route === 'sourcecontrol')) {
       const items = setup.items || [];
       // After a finished run, anything still pending was not tried: the run
       // stops after three failures in a row, which is nearly always no network.
@@ -605,7 +620,7 @@
     if (!events.length) return '';
     const ICONS = {
       'device.paired': 'smartphone', 'port.published': 'globe', 'port.stopped': 'circle-stop', 'harness.updated': 'circle-arrow-up',
-      'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'harness.enabled': 'circle-check', 'signin.ok': 'log-in', 'setup.finished': 'download',
+      'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'harness.enabled': 'circle-check', 'signin.ok': 'log-in', 'signin.out': 'log-out', 'setup.finished': 'download',
       'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
       'package.installed': 'download', 'package.updated': 'circle-arrow-up', 'package.uninstalled': 'trash-2', 'package.failed': 'circle-alert',
       'url.set': 'globe', 'url.cleared': 'globe', 'key.replaced': 'key-round',
@@ -844,7 +859,7 @@
   // ----------------------------------------------------------- toolchains --
   const INCLUDED = [
     ['terminal', 'Node and Python', 'with npm, pip'],
-    ['terminal', 'git, git-lfs, gh, ssh', 'source control'],
+    ['terminal', 'git, git-lfs, ssh', 'version control'],
     ['wrench', 'clang, CMake, GDB', 'native builds'],
     ['server', 'psql, redis-cli', 'databases'],
     ['activity', 'ffmpeg, ImageMagick', 'media'],
@@ -890,6 +905,29 @@
     <div class="tc-chips" role="group" aria-label="Suggestions">${QUICK_ADD.map((name) => html`<button class="tc-chip-btn" type="button" data-cmd="package.add" data-id="${name}">${name}</button>`)}</div>
     <button class="tc-btn tc-btn--primary tc-btn--sm tc-empty-cta" type="button" data-cmd="package.add">${icon('plus')}Add a tool</button>
   </div>`;
+
+  // ------------------------------------------------------- source control --
+  // The CLI T3 Code drives for each source control host. A row tells the
+  // provider apart from the CLI's name, and who it is signed in as.
+  const sourceControlPage = (s, n) => {
+    const rows = M.sourceControlRows(s, ui, n);
+    const withProvider = (row) => Object.assign({}, row, {
+      status: Object.assign({}, row.status, { text: [row.provider, row.status.text].filter(Boolean).join(' · ') }),
+    });
+    return html`
+      ${pageNotices('sourcecontrol')}
+      ${section('sc-title', 'Source control', html`<div class="tc-group">
+        ${rows.length ? html`<div class="tc-list">${rows.map((row) => resourceRow(withProvider(row)))}</div>`
+          : html`<div class="tc-empty tc-empty--compact"><span class="tc-empty-desc">Source control state is not readable right now.</span></div>`}
+        <div class="tc-card-foot">${icon('info', 'tc-icon--sm')}<span>T3 Code opens pull requests through these. Bitbucket needs none: add its token in T3 Code under Settings → Source Control.</span></div>
+      </div>`)}
+      ${section('sc-how', 'How sign-in works', html`<div class="tc-group"><dl class="tc-kv">
+        <dt>Tokens</dt><dd class="tc-kv-prose">GitHub, GitLab, Forgejo and Gitea take a token you make on the server. It goes to the CLI on stdin, and the server has to accept it before it counts.</dd>
+        <dt>Azure DevOps</dt><dd class="tc-kv-prose">A device code, approved on Microsoft’s page.</dd>
+        <dt>Credentials</dt><dd class="tc-kv-prose">On the state volume at <code>${(s.paths && s.paths.volume) || '/home/t3'}</code>. They survive a recreate.</dd>
+        <dt>From a shell</dt><dd><code>t3-harness source-control</code></dd>
+      </dl></div>`)}`;
+  };
 
   // ---------------------------------------------------------------- ports --
   const portRow = (p) => {
@@ -1078,9 +1116,13 @@
     const image = s.image || {};
     const server = s.server || {};
     const failedTools = M.toolchainRows(s, ui, now()).filter((t) => t.state === 'failed' || t.state === 'running').length;
+    const scm = M.sourceControlRows(s, ui, now());
+    const scmAttention = scm.filter((c) => c.attention).length;
+    const scmSigned = scm.filter((c) => c.auth && c.auth.status === 'authenticated').length;
     return html`
       ${section('pm-title', 'More', html`<div class="tc-group">
         <a class="tc-linkrow" href="#toolchains">${icon('wrench')}Toolchains<span class="tc-linkrow-aside">${failedTools ? M.plural(failedTools, 'needs', 'need') + ' you' : tools + ' installed'}</span>${icon('chevron-right')}</a>
+        <a class="tc-linkrow" href="#sourcecontrol">${icon('git-pull-request')}Source control<span class="tc-linkrow-aside">${scmAttention ? M.plural(scmAttention, 'needs', 'need') + ' you' : scmSigned + ' signed in'}</span>${icon('chevron-right')}</a>
         <a class="tc-linkrow" href="#environment">${icon('settings-2')}Environment<span class="tc-linkrow-aside tc-truncate">${M.imageLabel(image).version || ''}</span>${icon('chevron-right')}</a>
       </div>`, { level: 'h1' })}
       ${section('pm-app', 'Appearance', html`<div class="tc-group"><div class="tc-linkrow">Theme${EMBED ? html`<span class="tc-linkrow-aside">Follows T3 Code</span>` : themeSeg()}</div></div>`)}
@@ -1097,11 +1139,11 @@
   };
 
   // ---------------------------------------------------------------- shell --
-  const ROUTES = ['overview', 'devices', 'agents', 'toolchains', 'ports', 'environment', 'more'];
-  const TITLES = { overview: 'Overview', devices: 'Devices', agents: 'Agents', toolchains: 'Toolchains', ports: 'Ports', environment: 'Environment', more: 'More' };
-  const PAGES = { overview: overviewPage, devices: devicesPage, agents: agentsPage, toolchains: toolchainsPage, ports: portsPage, environment: environmentPage, more: morePage };
-  // On a phone, Toolchains and Environment live under More.
-  const TAB_OF = { toolchains: 'more', environment: 'more' };
+  const ROUTES = ['overview', 'devices', 'agents', 'toolchains', 'sourcecontrol', 'ports', 'environment', 'more'];
+  const TITLES = { overview: 'Overview', devices: 'Devices', agents: 'Agents', toolchains: 'Toolchains', sourcecontrol: 'Source control', ports: 'Ports', environment: 'Environment', more: 'More' };
+  const PAGES = { overview: overviewPage, devices: devicesPage, agents: agentsPage, toolchains: toolchainsPage, sourcecontrol: sourceControlPage, ports: portsPage, environment: environmentPage, more: morePage };
+  // On a phone, Toolchains, Source control and Environment live under More.
+  const TAB_OF = { toolchains: 'more', sourcecontrol: 'more', environment: 'more' };
 
   const navBadge = (b) => {
     if (!b) return { cls: 'tc-nav-count', text: '', hidden: true };
@@ -1161,6 +1203,8 @@
       } else if (route === 'agents' || route === 'toolchains') {
         const rows = route === 'agents' ? M.agentRows(s, ui, n) : [...M.toolchainRows(s, ui, n), ...M.packageRows(s, ui, n)];
         if (rows.some((r) => r.updateAvailable)) actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="${route === 'agents' ? 'harness.updateAll' : 'tools.updateAll'}">${icon('circle-arrow-up')}Update all</button>`;
+      } else if (route === 'sourcecontrol') {
+        if (M.managedSourceControlRows(s, ui, n).some((r) => r.updateAvailable)) actions = html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="scm.updateAll">${icon('circle-arrow-up')}Update all</button>`;
       } else if (route === 'ports') {
         actions = html`<span class="tc-small tc-muted">Same list as <code>t3-expose</code></span>`;
       } else if (route === 'environment') {
@@ -1270,8 +1314,10 @@
         : sheetWaiting('Waiting for the code…'))}`;
   };
 
+  /** What signs in through this sheet: an agent, or az's device code. */
+  const signinMeta = (id) => M.AGENTS[id] || M.SOURCE_CONTROL[id] || {};
   const signinSheet = () => {
-    const meta = M.AGENTS[signin.agent] || {};
+    const meta = signinMeta(signin.agent);
     const st = signin.session || {};
     const host = M.hostOf(st.url);
     const qr = sheetQr(st);
@@ -1359,7 +1405,7 @@
     const st = res.data;
     signin.session = Object.assign({}, signin.session, st, { expiresAt: st.expiresAt || signin.session.expiresAt });
     if (st.state === 'done') {
-      const name = (M.AGENTS[signin.agent] || {}).name || signin.agent;
+      const name = signinMeta(signin.agent).name || signin.agent;
       signin.layer.close('done');
       Kit.toast('Signed in to ' + name);
       loadStatus();
@@ -1442,7 +1488,7 @@
       signin.pasteError = null;
       signin.layer.render();
       const res = await api('/auth/code', { body: { id: signin.session.id, code } });
-      if (!res.ok && (M.AGENTS[signin.agent] || {}).flow === 'redirect') {
+      if (!res.ok && signinMeta(signin.agent).flow === 'redirect') {
         // T3 keeps the sign-in waiting after a wrong address: say why, and
         // let the right one be pasted.
         signin.phase = 'awaiting';
@@ -1457,9 +1503,126 @@
     });
     // The device code's countdown.
     signin.tick = setInterval(() => {
-      if (signin.layer && signin.session && (signin.session.code || (M.AGENTS[signin.agent] || {}).flow === 'redirect')) signin.layer.render();
+      if (signin.layer && signin.session && (signin.session.code || signinMeta(signin.agent).flow === 'redirect')) signin.layer.render();
     }, 1000);
     beginSignin();
+  };
+
+  // ------------------------------------------------ source control sign-in --
+  // gh, glab, fj and tea sign in with a token for one host, made on that host
+  // with the scopes T3 Code needs. The setup service hands it to the CLI on
+  // stdin and asks the host whether it took it; az uses the device-code sheet
+  // above.
+  const scmSheet = { layer: null, id: null, host: '', reveal: false, saving: false, error: null };
+  const scmHostOf = () => {
+    const field = scmSheet.layer && scmSheet.layer.panel.querySelector('#scm-host');
+    return ((field ? field.value : scmSheet.host) || '').trim().replace(/^https:\/\//i, '').replace(/\/+$/, '').toLowerCase();
+  };
+  const scmSheetBody = () => {
+    const meta = M.SOURCE_CONTROL[scmSheet.id] || {};
+    const host = scmHostOf() || meta.host;
+    const page = meta.tokenPage ? meta.tokenPage(host) : null;
+    return html`
+      <div class="tc-sheet-head">${tile(Object.assign({}, meta, { hue: '--id-toolchain' }), 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="scm-title">Sign in to ${meta.provider}</h2><span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you, the token ${meta.handover}</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
+      <div class="tc-sheet-body">
+        <div class="tc-sheet-step" data-state="done"><span class="tc-step-mark">1</span><div class="tc-sheet-step-body"><label class="tc-sheet-step-title" for="scm-host">Server</label>
+          <input id="scm-host" name="host" class="tc-input tc-input--mono" value="${scmSheet.host}" placeholder="${meta.host}" autocomplete="off" spellcheck="false" autocapitalize="off" inputmode="url">
+          <span class="tc-hint">${meta.host} unless yours runs somewhere else.</span></div></div>
+        <div class="tc-sheet-step" data-state="active"><span class="tc-step-mark">2</span><div class="tc-sheet-step-body"><span class="tc-sheet-step-title">Make a token there</span>
+          ${page ? html`<a class="tc-btn tc-btn--sm tc-self-start" href="${page}" target="_blank" rel="noopener" data-key="scm-page">${icon('external-link')}Open ${host}’s token page</a>` : ''}
+          <span class="tc-hint">With these scopes: ${meta.scopes}.</span></div></div>
+        <div class="tc-sheet-step"><span class="tc-step-mark">3</span><div class="tc-sheet-step-body"><label class="tc-sheet-step-title" for="scm-token">Paste it here</label>
+          <div class="tc-inputwrap"><input id="scm-token" name="token" class="tc-input tc-input--mono" type="${scmSheet.reveal ? 'text' : 'password'}" placeholder="Token" autocomplete="off" spellcheck="false" autocapitalize="off"><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--xs" type="button" data-sheet="reveal" aria-label="${scmSheet.reveal ? 'Hide' : 'Show'} token" aria-pressed="${String(scmSheet.reveal)}">${icon(scmSheet.reveal ? 'eye-off' : 'eye')}</button></div>
+          ${scmSheet.error ? html`<p class="tc-hint tc-hint--err" role="alert">${scmSheet.error}</p>` : html`<span class="tc-hint">Kept by ${meta.name} on the state volume, and checked with ${host || meta.host} before it counts.</span>`}</div></div>
+      </div>
+      <div class="tc-sheet-foot"><button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Cancel</button><button class="tc-btn tc-btn--primary" type="submit" data-key="scm-save" disabled>${scmSheet.saving ? html`<span class="tc-spinner" aria-hidden="true"></span>Checking` : 'Sign in'}</button></div>`;
+  };
+  const syncScmSave = () => {
+    const panel = scmSheet.layer && scmSheet.layer.panel;
+    if (!panel) return;
+    const token = panel.querySelector('#scm-token');
+    const save = panel.querySelector('[data-key="scm-save"]');
+    if (save) save.disabled = scmSheet.saving || !(token && token.value.trim());
+  };
+  const renderScmSheet = () => { if (scmSheet.layer) { scmSheet.layer.render(); syncScmSave(); } };
+  const openScmSheet = (id, trigger) => {
+    if (scmSheet.layer) return;
+    const facts = toolchain(id) || {};
+    // Another host is a fresh field; signing in again keeps the host it had.
+    const signedIn = facts.auth && facts.auth.status === 'authenticated';
+    Object.assign(scmSheet, { id, host: signedIn ? '' : (facts.auth && facts.auth.host) || '', reveal: false, saving: false, error: null });
+    scmSheet.layer = Kit.open({
+      kind: 'sheet',
+      panel: { tag: 'form', class: 'tc-sheet ' + (Kit.isPhone() ? 'tc-sheet--bottom' : 'tc-sheet--inset'), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'scm-title', novalidate: true },
+      returnTo: trigger,
+      backdrop: 'ignore',
+      render: scmSheetBody,
+      focus: '#scm-token',
+      onClose: () => { scmSheet.layer = null; },
+    });
+    syncScmSave();
+    const panel = scmSheet.layer.panel;
+    panel.addEventListener('input', (e) => {
+      if (e.target.id === 'scm-host') {
+        // The token page follows the server typed.
+        scmSheet.host = e.target.value;
+        const link = panel.querySelector('[data-key="scm-page"]');
+        const meta = M.SOURCE_CONTROL[scmSheet.id] || {};
+        const host = scmHostOf() || meta.host;
+        if (link && meta.tokenPage) {
+          link.setAttribute('href', meta.tokenPage(host));
+          link.lastChild.textContent = 'Open ' + host + '’s token page';
+        }
+      }
+      if (scmSheet.error && e.target.id === 'scm-token') { scmSheet.error = null; renderScmSheet(); }
+      syncScmSave();
+    });
+    panel.addEventListener('click', (e) => {
+      const action = e.target.closest('[data-sheet]');
+      if (!action) return;
+      const what = action.getAttribute('data-sheet');
+      if (what === 'close') scmSheet.layer.close('cancel');
+      else if (what === 'reveal') { scmSheet.reveal = !scmSheet.reveal; renderScmSheet(); }
+    });
+    panel.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const token = panel.querySelector('#scm-token').value.trim();
+      if (!token || scmSheet.saving) return;
+      const meta = M.SOURCE_CONTROL[scmSheet.id] || {};
+      scmSheet.saving = true;
+      scmSheet.error = null;
+      renderScmSheet();
+      const res = await api('/source-control/signin', { body: { id: scmSheet.id, host: scmHostOf() || meta.host, token } });
+      scmSheet.saving = false;
+      if (!scmSheet.layer) return;
+      if (!res.ok) {
+        // Leave a refused token on screen, to fix or replace.
+        scmSheet.error = res.error;
+        renderScmSheet();
+        return;
+      }
+      const auth = res.data.sourceControl && res.data.sourceControl.auth;
+      scmSheet.layer.close('saved');
+      Kit.toast('Signed in to ' + (res.data.host || meta.provider) + (auth && auth.account ? ' as ' + auth.account : ''),
+        res.data.warning ? { detail: res.data.warning } : undefined);
+      loadStatus();
+    });
+  };
+
+  const confirmScmSignOut = async (id) => {
+    const meta = M.SOURCE_CONTROL[id] || {};
+    const auth = (toolchain(id) || {}).auth || {};
+    const host = id === 'az' ? null : auth.host || meta.host;
+    const ok = await Kit.confirm({
+      title: 'Sign ' + meta.name + ' out' + (host ? ' of ' + host : '') + '?',
+      body: 'T3 Code stops opening ' + meta.provider + ' pull requests' + (host ? ' on ' + host : '') + ' until it is signed in again.' + (id === 'gh' ? ' git push over HTTPS to it stops working too.' : ''),
+      confirm: 'Sign out',
+    });
+    if (!ok) return;
+    const res = await api('/source-control/signout', { body: { id, host } });
+    if (!res.ok) Kit.toast('Could not sign ' + meta.name + ' out', { tone: 'danger', detail: res.error });
+    else Kit.toast('Signed ' + meta.name + ' out' + (host ? ' of ' + host : ''));
+    loadStatus();
   };
 
   // ------------------------------------------------------------- API keys --
@@ -2453,7 +2616,7 @@
   // ------------------------------------------------------------- commands --
   const rowFor = (target, id) => (target === 'harness' ? M.agentRows(state.status, ui, now())
     : target === 'package' ? M.packageRows(state.status, ui, now())
-      : M.toolchainRows(state.status, ui, now())).find((r) => r.id === id);
+      : [...M.toolchainRows(state.status, ui, now()), ...M.sourceControlRows(state.status, ui, now())]).find((r) => r.id === id);
 
   const confirmRevoke = async (kind, id) => {
     const s = state.status || {};
@@ -2533,6 +2696,9 @@
     'toolchain.update': (a) => callLifecycle('toolchain', 'update', a.id),
     'toolchain.uninstall': (a) => confirmUninstall('toolchain', a.id),
     'toolchain.updateAll': () => updateAll('tools'),
+    'scm.signin': (a, el) => ((M.SOURCE_CONTROL[a.id] || {}).flow === 'device' ? openSignin(a.id, el) : openScmSheet(a.id, el)),
+    'scm.signout': (a) => confirmScmSignOut(a.id),
+    'scm.updateAll': () => updateAll('scm'),
     'tools.updateAll': () => updateAll('tools'),
     'package.add': (a, el) => openToolSheet({ id: a.id, trigger: el }),
     'package.install': (a) => callLifecycle('package', 'install', a.id),
@@ -2689,7 +2855,7 @@
   // ------------------------------------------------------------ shortcuts --
   Kit.bind('mod+k', openPalette);
   Kit.bind('/', openPalette);
-  for (const [key, route] of [['o', 'overview'], ['d', 'devices'], ['a', 'agents'], ['t', 'toolchains'], ['p', 'ports'], ['e', 'environment']]) {
+  for (const [key, route] of [['o', 'overview'], ['d', 'devices'], ['a', 'agents'], ['t', 'toolchains'], ['s', 'sourcecontrol'], ['p', 'ports'], ['e', 'environment']]) {
     Kit.bind('g ' + key, () => { keyboardNav = true; go(route); });
   }
   Kit.bind('p', () => {
