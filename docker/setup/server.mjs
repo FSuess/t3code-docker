@@ -349,6 +349,9 @@ const latestCache = createLatestCache({
   keys: () => [
     ...[...HARNESS_IDS].map((id) => `harness:${id}`),
     ...[...TOOLCHAIN_IDS].map((id) => `toolchain:${id}`),
+    // Source control CLIs only once installed: nobody waits on a release of
+    // one they never asked for, and gitea.com and codeberg.org are not asked.
+    ...[...knownSourceControl].map((id) => `toolchain:${id}`),
     // The tools added beyond those, as the last status read listed them.
     ...[...knownPackages].map((id) => `package:${id}`),
   ],
@@ -490,6 +493,23 @@ const harnessCache = createHarnessCache({
  * skip the auth refresh and answer from local state only. Returns the public
  * card rows plus the freshness of the answer.
  */
+// The source control CLIs' facts, the same way: who each is signed in as is
+// a CLI run per host (glab asks its API), so it is refreshed in the background
+// and a poll answers from what is known, or from a cheap read naming none.
+const sourceControlCache = createHarnessCache({
+  full: async () => {
+    const { sourceControl, degraded } = await (await loadHarness()).sourceControl.status();
+    return { harnesses: sourceControl, degraded };
+  },
+  cheap: async () => {
+    const { sourceControl, degraded } = await (await loadHarness()).sourceControl.status({ authenticate: false });
+    return { harnesses: sourceControl, degraded };
+  },
+  budgetMs: HARNESS_BUDGET_MS,
+});
+/** The mise-installed source control CLIs the last status read found installed. */
+const knownSourceControl = new Set();
+
 const harnessLifecycleStatus = async (authenticate = true) => {
   const snap = authenticate === false
     ? await harnessCache.snapshotCheap()
@@ -672,7 +692,7 @@ const status = async () => {
   // Antigravity, as T3 reports it, read beside the rest. Its own short cache:
   // a poll waits on T3 only for the very first read.
   const antigravityRead = attempt("Antigravity", () => antigravity.status(), null);
-  const [server, harnessSnap, pairings, sessions, toolchainSnap, setup] = await Promise.all([
+  const [server, harnessSnap, pairings, sessions, toolchainSnap, setup, scmSnap] = await Promise.all([
     attempt("server health", health, { ok: false, detail: "health check failed" }),
     attempt("agent probes", () => harnessLifecycleStatus(true), {
       harnesses: [], degraded: [],
@@ -687,6 +707,7 @@ const status = async () => {
       const manager = await loadHarness();
       return harnessModule.readPreinstall({ stateDir: manager.paths.stateDir });
     }, null),
+    attempt("source control", () => sourceControlCache.snapshot(), { harnesses: [], degraded: [] }),
   ]);
   const antigravityRow = await antigravityRead;
   const devices = Array.isArray(sessions) ? sessions.filter((session) => !isConsoleSession(session)) : sessions;
@@ -701,6 +722,9 @@ const status = async () => {
   // console (the row says so); while T3 itself is down the page already says.
   const t3Agents = antigravityRow && (antigravityRow.available || (!antigravityRow.reachable && server?.ok)) ? [antigravityRow] : [];
   const harnesses = harnessSnap?.harnesses ?? [];
+  const sourceControl = scmSnap?.harnesses ?? [];
+  knownSourceControl.clear();
+  for (const row of sourceControl) if (row.installed && !row.inImage) knownSourceControl.add(row.id);
   const disk = storage.snapshot();
   for (const entry of harnessSnap?.degraded ?? []) {
     degraded.push({ what: `harness ${entry.what}`, error: String(entry.error ?? "").slice(0, 200) });
@@ -767,6 +791,11 @@ const status = async () => {
       refreshing: harnessSnap?.cache?.refreshing ?? false,
     },
     toolchains: withLatest("toolchain", toolchainSnap?.toolchains ?? []),
+    // The CLI T3 Code drives for each source control host: the image's gh,
+    // and glab, fj, tea and az, installed and updated like a toolchain. `auth`
+    // is null until a background check has asked the CLI.
+    sourceControl: withLatest("toolchain", sourceControl),
+    sourceControlCache: { at: scmSnap?.at ?? null, stale: scmSnap?.stale ?? true, source: scmSnap?.source ?? "unavailable" },
     // How long mise waits before offering a new release as the newest.
     releaseAgeMs,
     // Every other tool in the global mise config, added here or with `mise use -g`.
@@ -944,6 +973,77 @@ const connectFacts = async () => {
  * The link it saves is made on T3 Code's next start; the page offers that
  * restart once this is done.
  */
+// --- source control sign-in ----------------------------------------------------
+//
+// gh, glab, fj and tea sign in with a token for one host, which the manager
+// hands to the CLI on stdin (sourceControl.signIn). az has no token sign-in T3
+// Code would see - T3 asks `az account show` - so it runs the device flow:
+// `az login --use-device-code` prints a page and a code, then waits for the
+// approval and exits. That is a sign-in session like an agent's.
+const AZ_CODE = /enter the code\s+([A-Z0-9]{6,12})\b/i;
+const startAzSignin = async () => {
+  const executable = await (await loadHarness()).sourceControl.executable("az");
+  if (!executable) throw new Error("Azure CLI is not installed");
+  const child = spawn(executable, ["login", "--use-device-code", "--allow-no-subscriptions", "--output", "none"], {
+    env: { ...process.env, NO_COLOR: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const id = randomBytes(9).toString("hex");
+  const session = {
+    id, agentId: "az", state: "starting", url: null, code: null, needsCode: false,
+    output: "", error: null, child, startedAt: Date.now(),
+  };
+  const absorb = (chunk) => {
+    session.output = (session.output + stripAnsi(String(chunk))).slice(-8000);
+    if (!session.url) {
+      session.url = findUrl(session.output, session.output);
+      if (session.url) {
+        run("qrencode", ["-t", "SVG", "-m", "1", "-o", "-", session.url])
+          .then(({ stdout }) => { session.qr = stdout; })
+          .catch(() => {});
+      }
+    }
+    session.code ??= AZ_CODE.exec(session.output)?.[1] ?? null;
+    if (session.url && session.code && session.state === "starting") session.state = "awaiting-browser";
+  };
+  child.stdout.on("data", absorb);
+  child.stderr.on("data", absorb);
+  child.on("error", (error) => { session.state = "failed"; session.error = String(error.message); });
+  child.on("close", (code) => {
+    forgetSignInState("az");
+    void sourceControlCache.invalidate().catch(() => {});
+    if (TERMINAL_STATES.has(session.state)) return;
+    session.state = code === 0 ? "done" : "failed";
+    if (code === 0) recordEvent("signin.ok", "Signed in Azure CLI");
+    else session.error = session.output.trim().split("\n").slice(-3).join(" ").slice(0, 300) || `exited with code ${code}`;
+  });
+  sessions.set(id, session);
+  setTimeout(() => {
+    if (!TERMINAL_STATES.has(session.state)) {
+      try { child.kill(); } catch {}
+      session.state = "failed";
+      session.error = "Timed out waiting for the approval.";
+    }
+  }, SESSION_TTL_MS).unref?.();
+  return session;
+};
+
+/** Sign a source control CLI in with a token, or out; either way the next poll sees it. */
+const sourceControlSignIn = async (input, out = false) => {
+  const manager = await loadHarness();
+  const id = String(input?.id ?? "");
+  const result = out
+    ? await manager.sourceControl.signOut(id, { host: input?.host })
+    : await manager.sourceControl.signIn(id, { host: input?.host, token: input?.token });
+  forgetSignInState(id);
+  try { await sourceControlCache.invalidate(); } catch { /* the next poll refreshes */ }
+  const name = result.sourceControl?.name ?? SOURCE_CONTROL_NAMES[id] ?? id;
+  if (result.ok) recordEvent(out ? "signin.out" : "signin.ok", `${out ? "Signed out" : "Signed in"} ${name}`, result.host ?? input?.host ?? null);
+  const http = result.ok ? 200 : ["invalid-host", "invalid-token", "unsupported"].includes(result.code) ? 400
+    : result.code === "unknown-toolchain" ? 404 : result.code === "not-installed" ? 409 : 422;
+  return { http, body: result };
+};
+
 const startConnectLink = () => {
   const child = spawn(T3_LAUNCHER, ["connect", "link", "--headless"], {
     env: { ...process.env, NO_COLOR: "1" },
@@ -1626,7 +1726,12 @@ const syncWarning = (id, sync) => {
 const operations = new Map(); // "harness:claude" -> { kind, state, error, progress, ... }
 const TOOLCHAIN_IDS = new Set(["go", "rust", "bun", "deno", "uv"]);
 const LIFECYCLE_PATHS = { harnesses: "harness", toolchains: "toolchain", packages: "package" };
-const TOOLCHAIN_NAMES = { go: "Go", rust: "Rust", bun: "Bun", deno: "Deno", uv: "uv" };
+// The source control CLIs mise installs run as toolchains (the image's gh is
+// not one): the same routes, queue and lock.
+const SOURCE_CONTROL_NAMES = { glab: "GitLab CLI", fj: "Forgejo CLI", tea: "Gitea CLI", az: "Azure CLI" };
+const TOOLCHAIN_NAMES = { go: "Go", rust: "Rust", bun: "Bun", deno: "Deno", uv: "uv", ...SOURCE_CONTROL_NAMES };
+const MANAGED_TOOL_IDS = new Set([...TOOLCHAIN_IDS, ...Object.keys(SOURCE_CONTROL_NAMES)]);
+const isSourceControlJob = (job) => job.target === "toolchain" && Object.hasOwn(SOURCE_CONTROL_NAMES, job.id);
 const lifecycleName = (target, id) =>
   (target === "harness" ? AGENTS[id]?.name : target === "toolchain" ? TOOLCHAIN_NAMES[id] : harnessModule?.displayName?.(id)) ?? id;
 
@@ -1724,6 +1829,7 @@ const runJob = async (job) => {
       markStarted(null);
       // Let the next poll see the lock instead of the facts from before it.
       void harnessCache.invalidate().catch(() => {});
+      if (isSourceControlJob(job)) void sourceControlCache.invalidate().catch(() => {});
     },
     onProgress: (progress) => {
       const op = operations.get(job.key);
@@ -1744,6 +1850,9 @@ const runJob = async (job) => {
     // sees "ok" also sees the agent installed.
     forgetSignInState(job.id);
     try { await harnessCache.invalidate(); } catch { /* the next poll refreshes */ }
+    if (isSourceControlJob(job)) {
+      try { await sourceControlCache.invalidate(); } catch { /* the next poll refreshes */ }
+    }
     return { result, sync };
   }, (error) => ({ result: { ok: false, code: "failed", error: String(error?.message ?? error) }, sync: null }));
 
@@ -1812,7 +1921,7 @@ const lifecycleId = async (target, rawId) => {
     return { id: normalized.id };
   }
   if (target === "harness" && T3_AGENT_IDS.has(id)) return { id };
-  const ids = target === "harness" ? HARNESS_IDS : TOOLCHAIN_IDS;
+  const ids = target === "harness" ? HARNESS_IDS : MANAGED_TOOL_IDS;
   if (!ids.has(id)) {
     const code = target === "harness" ? "unknown-harness" : "unknown-toolchain";
     return { refused: { http: 404, body: { ok: false, code, error: `unknown ${target}: ${id}` } } };
@@ -1895,6 +2004,7 @@ const ROUTES = ["/login", "/logout", "/hello", "/status", "/pair", "/revoke", "/
   "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses/enable", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
   "/auth/apikey/remove", "/auth/apikey", "/auth/signin", "/auth/session", "/auth/code", "/auth/cancel",
+  "/source-control/signin", "/source-control/signout",
   "/providers", "/updates/check",
   "/packages/install", "/packages/update", "/packages/uninstall", "/packages/cancel",
   "/packages/registry", "/packages/versions", "/packages/info"];
@@ -2234,6 +2344,7 @@ const server = createServer(async (req, res) => {
         const input = JSON.parse((await readBody(req)) || "{}");
         if (input.agent === "antigravity") return sendJson(res, 200, publicSession(await startAntigravitySignin()));
         if (input.agent === "connect") return sendJson(res, 200, publicSession(startConnectLink()));
+        if (input.agent === "az") return sendJson(res, 200, publicSession(await startAzSignin()));
         return sendJson(res, 200, publicSession(await startSignin(input.agent)));
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
@@ -2278,6 +2389,17 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }
+    }
+
+    if (req.method === "POST" && (route === "/source-control/signin" || route === "/source-control/signout")) {
+      let input;
+      try {
+        input = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        return sendJson(res, 400, { ok: false, code: "bad-request", error: "expected JSON" });
+      }
+      const { http, body } = await sourceControlSignIn(input, route === "/source-control/signout");
+      return sendJson(res, http, body);
     }
 
     if (req.method === "POST" && route === "/auth/cancel") {
