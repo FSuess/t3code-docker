@@ -12,10 +12,13 @@ import test from "node:test";
 
 import {
   CATALOGUE,
+  SOURCE_CONTROL,
   TOOLCHAINS,
   createHarnessManager,
   getHarness,
+  getManagedTool,
   normalizeArch,
+  releaseSpec,
 } from "../docker/harness/index.mjs";
 import { firstError } from "../docker/harness/mise.mjs";
 import * as lock from "../docker/harness/lock.mjs";
@@ -120,7 +123,21 @@ function createWorld(fs, { arch = "x64" } = {}) {
     latest: {
       claude: "2.1.273", codex: "0.154.1", opencode: "1.18.31", grok: "1.0.34", "cursor-agent": "2026.09.15-d2fe57e",
       go: "1.27.1", rust: "1.98.1", bun: "1.4.2", deno: "2.9.7", uv: "0.12.21",
+      glab: "1.120.0", "forgejo:forgejo-contrib/forgejo-cli": "0.6.0", "pipx:azure-cli": "2.90.0",
+      // tea is only found on gitea.com: asked without its api_url, mise finds nothing.
+      "forgejo:gitea/tea[api_url=https://gitea.com/api/v1]": "0.16.0",
     },
+    // What the source control CLIs say when asked about sign-in.
+    scmAuth: {
+      gh: { code: 0, stdout: '{"hosts":{}}', stderr: "You are not logged into any GitHub hosts." },
+      glab: { code: 0, stdout: "", stderr: "gitlab.com\n  ✓ Logged in to gitlab.com as dev-user (keyring)\n" },
+      tea: { code: 0, stdout: "[]", stderr: "" },
+      az: { code: 1, stdout: "", stderr: "ERROR: Please run 'az login' to setup account." },
+    },
+    failExtension: null,
+    // How the CLIs answer a sign-in, its check, and a sign-out.
+    signInFails: {},
+    verifyFails: {},
     tools: {},
     selected: {},
     binVersions: new Map(),
@@ -162,6 +179,22 @@ function createWorld(fs, { arch = "x64" } = {}) {
 
     if (bin !== "mise") {
       if (world.failProbe.some((fragment) => bin.includes(fragment))) return fail("Illegal instruction");
+      // The image's gh, run by name.
+      if (bin === "gh" && argv[1] === "--version") return ok("gh version 2.102.0 (2026-09-30)\nhttps://github.com/cli/cli/releases/tag/v2.102.0\n");
+      const scm = ["gh", "glab", "fj", "tea", "az"].find((name) => path.basename(bin) === name);
+      const signingIn = argv.includes("--with-token") || argv.includes("--stdin") || argv.includes("add-token") || (argv[1] === "login" && argv[2] === "add");
+      if (scm && signingIn) return world.signInFails[scm] ? fail(world.signInFails[scm]) : ok("");
+      if (scm && (argv.includes("whoami") || argv[1] === "api")) return world.verifyFails[scm] ? fail(world.verifyFails[scm]) : ok("{}");
+      if (scm && (argv.includes("logout") || argv.includes("setup-git"))) return ok("");
+      if (scm && ["auth", "login", "account"].includes(argv[1])) {
+        const said = world.scmAuth[scm];
+        return { code: said.code, signal: null, stdout: said.stdout, stderr: said.stderr, error: null };
+      }
+      if (scm === "az" && argv[1] === "extension") {
+        if (world.failExtension) return fail(world.failExtension);
+        fs.seedFile(path.join(HOME, ".azure/cliextensions", argv[argv.indexOf("--name") + 1], "metadata.json"), "{}");
+        return ok("");
+      }
       const version = world.binVersions.get(bin) ?? "0.0.0";
       if (argv[1] === "--version" || argv[1] === "version") return ok(`${version}\n`);
       if (bin.endsWith("claude") && argv[1] === "auth") return ok('{"loggedIn":true}\n');
@@ -195,7 +228,9 @@ function createWorld(fs, { arch = "x64" } = {}) {
         return hit ? ok(`${hit}\n`) : fail(`mise ERROR no version of ${name} matches ${prefix}`);
       }
       const held = anyAge ? (world.waiting[tool] ?? []).at(-1) : null;
-      const latest = held ?? world.latest[tool] ?? published(tool).at(-1);
+      // Tool options that do not change where releases come from (rust's
+      // components) resolve like the bare tool.
+      const latest = held ?? world.latest[tool] ?? world.latest[tool.replace(/\[.*\]$/, "")] ?? published(tool).at(-1);
       return latest ? ok(`${latest}\n`) : fail(`mise ERROR ${tool} not found in mise tool registry`);
     }
     if (command === "registry") return ok(`${JSON.stringify(world.registry)}\n`);
@@ -218,8 +253,10 @@ function createWorld(fs, { arch = "x64" } = {}) {
         installed_versions: world.versionsOf(name), security: [{ type: "checksum", algorithm: "sha256" }] })}\n`);
     }
     if (command === "which") {
-      // Rust's binaries are cargo/rustc, not "rust".
-      const selected = world.selected[tool === "cargo" ? "rust" : tool];
+      // A command is not always named for its tool: Rust's is cargo, and the
+      // source control CLIs install under their backend spec or package.
+      const owner = { cargo: "rust", fj: "forgejo:forgejo-contrib/forgejo-cli", tea: "forgejo:gitea/tea", az: "pipx:azure-cli" }[tool] ?? tool;
+      const selected = world.selected[owner];
       return selected ? ok(`${selected}\n`) : fail("not a mise bin");
     }
     if (command === "use") {
@@ -232,7 +269,8 @@ function createWorld(fs, { arch = "x64" } = {}) {
       world.useSpecs.push(String(tool));
       if (world.failUse) return fail(world.failUse);
       const install = path.join(DATA_DIR, "installs", name, version);
-      const executable = path.join(install, entryForTool(name)?.executable ?? `bin/${name}`);
+      const scm = SOURCE_CONTROL.find((entry) => entry.miseTool === name);
+      const executable = path.join(install, entryForTool(name)?.executable ?? `bin/${scm?.bin ?? name}`);
       fs.seedFile(executable, "", 0o755);
       world.binVersions.set(executable, version);
       world.selected[name] = executable;
@@ -317,6 +355,26 @@ test("catalogue exposes exactly the five audited harnesses", () => {
   assert.equal(getHarness("opencode").minimumVersion, "1.14.19");
   // The native-installer `agent` alias must never become the managed name.
   assert.equal(CATALOGUE.some((entry) => entry.miseTool === "agent"), false);
+});
+
+test("the source control catalogue names one CLI per provider T3 drives through one", () => {
+  assert.deepEqual(SOURCE_CONTROL.map((entry) => [entry.id, entry.provider]), [
+    ["gh", "GitHub"], ["glab", "GitLab"], ["fj", "Forgejo"], ["tea", "Gitea"], ["az", "Azure DevOps"],
+  ]);
+  for (const entry of SOURCE_CONTROL) {
+    assert.ok(entry.bin && entry.probe[0] === entry.bin, `${entry.id} probes the command T3 runs`);
+    assert.ok(entry.auth, `${entry.id} declares how to ask it about sign-in`);
+    assert.equal(Boolean(entry.miseTool), !entry.inImage, `${entry.id} is in the image or installed through mise`);
+  }
+  // gh comes with the image; the rest are managed like a toolchain.
+  assert.equal(getManagedTool("gh"), null);
+  assert.equal(getManagedTool("glab").miseTool, "glab");
+  assert.equal(getManagedTool("go").miseTool, "go");
+  assert.equal(getManagedTool("python"), null);
+  // tea's releases live on gitea.com: every query has to say so.
+  assert.equal(releaseSpec(getManagedTool("tea")), "forgejo:gitea/tea[api_url=https://gitea.com/api/v1]");
+  assert.equal(releaseSpec(getManagedTool("glab")), "glab");
+  assert.deepEqual(getManagedTool("az").extensions, ["azure-devops"]);
 });
 
 test("architecture normalization maps dpkg and node spellings", () => {
@@ -827,6 +885,69 @@ test("a failed toolchain install is reported and leaves nothing selected", async
   assert.equal(unknown.code, "unknown-toolchain");
 });
 
+test("source control CLIs install like toolchains, and say which host they are for and who is signed in", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+
+  const fresh = await manager.sourceControl.status();
+  assert.deepEqual(fresh.sourceControl.map((row) => [row.id, row.provider, row.installed]), [
+    ["gh", "GitHub", true], ["glab", "GitLab", false], ["fj", "Forgejo", false], ["tea", "Gitea", false], ["az", "Azure DevOps", false],
+  ]);
+  const gh = fresh.sourceControl[0];
+  assert.equal(gh.inImage, true);
+  assert.equal(gh.version, "2.102.0");
+  assert.equal(gh.auth.status, "unauthenticated");
+  assert.equal(fresh.sourceControl[1].auth, null, "nothing to ask before it is installed");
+
+  const glab = await manager.sourceControl.install("glab");
+  assert.equal(glab.ok, true, glab.error);
+  assert.equal(glab.toolchain.version, "1.120.0");
+  const signed = await manager.sourceControl.resolve("glab");
+  assert.deepEqual(signed.auth, { status: "authenticated", account: "dev-user", host: "gitlab.com", detail: null });
+  assert.equal((await manager.packages.status()).packages.some((row) => row.id === "glab"), false, "not an added tool");
+
+  // tea's releases are asked for on gitea.com, and installed with that option kept.
+  const tea = await manager.sourceControl.install("tea");
+  assert.equal(tea.ok, true, tea.error);
+  assert.ok(world.useSpecs.includes("forgejo:gitea/tea[api_url=https://gitea.com/api/v1]@0.16.0"));
+  assert.equal((await manager.sourceControl.latest("tea")), "0.16.0");
+
+  // az comes with the extension T3's Azure DevOps support needs.
+  const az = await manager.sourceControl.install("az");
+  assert.equal(az.ok, true, az.error);
+  assert.ok(world.calls.some((call) => / extension add --name azure-devops --yes$/.test(call)));
+  const azFacts = await manager.sourceControl.resolve("az");
+  assert.deepEqual(azFacts.missingExtensions, []);
+  assert.equal(azFacts.auth.status, "unauthenticated");
+  assert.match(azFacts.auth.detail, /az login/);
+
+  const removed = await manager.sourceControl.uninstall("glab");
+  assert.equal(removed.ok, true);
+  assert.ok(world.calls.includes("mise -C /home/t3 uninstall glab@1.120.0"));
+  assert.equal((await manager.sourceControl.install("gh")).code, "unknown-toolchain", "the image's gh is not installed through mise");
+});
+
+test("an az that cannot add its extension is rolled back, and a cheap read asks no CLI", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  world.failExtension = "ERROR: HTTPSConnectionPool: Max retries exceeded";
+  const az = await manager.sourceControl.install("az");
+  assert.equal(az.ok, false);
+  assert.equal(az.code, "extension-failed");
+  assert.match(az.error, /azure-devops extension: ERROR: HTTPSConnectionPool/);
+  assert.equal(az.toolchain.installed, false, "nothing half-usable left selected");
+  assert.ok(world.calls.includes("mise -C /home/t3 uninstall pipx:azure-cli@2.90.0"));
+
+  world.failExtension = null;
+  await manager.sourceControl.install("glab");
+  world.calls.length = 0;
+  const cheap = await manager.sourceControl.status({ authenticate: false });
+  assert.equal(cheap.sourceControl.find((row) => row.id === "glab").auth, null);
+  assert.equal(world.calls.some((call) => / auth status/.test(call)), false);
+});
+
 test("a release that installs but does not run is rolled back, not left selected", async () => {
   const fs = new MemoryFs();
   const world = createWorld(fs);
@@ -1142,6 +1263,7 @@ test("agents and toolchains are refused as packages, in any spelling", async () 
   }
   assert.match((await manager.packages.install("claude-code")).error, /Claude Code is managed on the Agents page/);
   assert.match((await manager.packages.install("core:go")).error, /Go is managed on the Toolchains page/);
+  assert.match((await manager.packages.install("glab")).error, /GitLab CLI is managed on the Source control page/);
   assert.deepEqual(world.useSpecs, [], "nothing reached mise");
 });
 
@@ -1343,4 +1465,45 @@ test("a status read that straddles a package install starting does not call it i
   assert.equal(row.id, "jq");
   assert.equal(row.failed, false, row.failure);
   assert.equal(row.inProgress, true);
+});
+
+test("signing a source control CLI in hands it the token on stdin, and takes back one the host refused", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const runs = [];
+  const run = world.run;
+  world.run = async (argv, options = {}) => {
+    runs.push({ argv, input: options.input ?? null, env: options.env ?? {} });
+    return run(argv, options);
+  };
+  const manager = managerFor(world);
+  await manager.sourceControl.install("glab");
+
+  const ok = await manager.sourceControl.signIn("glab", { host: "https://gitlab.example.com/", token: "glpat-secret" });
+  assert.equal(ok.ok, true, ok.error);
+  assert.equal(ok.host, "gitlab.example.com");
+  const login = runs.find((r) => r.argv.includes("--stdin"));
+  assert.deepEqual(login.argv.slice(1), ["auth", "login", "--hostname", "gitlab.example.com", "--stdin", "--git-protocol", "https", "--insecure-storage"]);
+  assert.equal(login.input, "glpat-secret\n");
+  assert.equal(login.env.GLAB_NO_PROMPT, "1");
+  assert.ok(runs.some((r) => r.argv.slice(1).join(" ") === "api user --hostname gitlab.example.com"), "asked the host");
+  assert.equal(runs.some((r) => r.argv.some((arg) => arg.includes("glpat-secret"))), false, "never an argument");
+
+  world.verifyFails.glab = "glab: 401 Unauthorized (HTTP 401)";
+  const refused = await manager.sourceControl.signIn("glab", { token: "glpat-secret" });
+  assert.equal(refused.code, "not-accepted");
+  assert.equal(refused.error, "gitlab.com did not accept the token: glab: 401 Unauthorized (HTTP 401)");
+  assert.deepEqual(runs.at(-1).argv.slice(1), ["auth", "logout", "--hostname", "gitlab.com"], "the stored token is taken back");
+
+  // gh refuses a bad token itself; the image's gh needs no install.
+  world.signInFails.gh = "error validating token: HTTP 401: Bad credentials";
+  const gh = await manager.sourceControl.signIn("gh", { token: "ghp_x" });
+  assert.equal(gh.error, "error validating token: HTTP 401: Bad credentials");
+  assert.equal((await manager.sourceControl.signIn("az", { token: "x" })).code, "unsupported");
+  assert.equal((await manager.sourceControl.signIn("tea", { token: "x" })).code, "not-installed");
+  assert.equal((await manager.sourceControl.signIn("glab", { host: "http://x", token: "x" })).code, "invalid-host");
+
+  const out = await manager.sourceControl.signOut("glab", { host: "gitlab.example.com" });
+  assert.equal(out.ok, true);
+  assert.ok(runs.some((r) => r.argv.slice(1).join(" ") === "auth logout --hostname gitlab.example.com"));
 });
