@@ -105,6 +105,7 @@ const NAV = [
   ["devices", "Devices", "smartphone", "D"],
   ["agents", "Agents", "bot", "A"],
   ["toolchains", "Toolchains", "wrench", "T"],
+  ["sourcecontrol", "Source control", "git-pull-request", "S"],
   ["ports", "Ports", "ethernet-port", "P"],
   ["environment", "Environment", "settings-2", "E"],
 ];
