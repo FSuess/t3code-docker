@@ -1,6 +1,7 @@
 // The persistent harness manager.
 //
-// One module owns the five supported harnesses: their exact-version install,
+// One module owns the five supported harnesses (and, the same way, the
+// toolchains and source control CLIs): their exact-version install,
 // the global mise selection, the concrete executable path, and the facts
 // (configured, installed, runnable, authenticated, failed) the
 // setup console and T3 integration read. Status and resolve are strictly
@@ -9,7 +10,10 @@
 import os from "node:os";
 import path from "node:path";
 
-import { CATALOGUE, TOOLCHAINS, getHarness, getToolchain, normalizeArch, supportsArch } from "./catalogue.mjs";
+import {
+  CATALOGUE, SOURCE_CONTROL, TOOLCHAINS, getHarness, getManagedTool, getSourceControl, normalizeArch, releaseSpec,
+  supportsArch,
+} from "./catalogue.mjs";
 import { createFs, createRunner, isExecutable, processAlive, processStartTime } from "./io.mjs";
 import * as lock from "./lock.mjs";
 import * as mise from "./mise.mjs";
@@ -18,6 +22,9 @@ import {
   parseDuration, parseRegistry, parseReleases, parseToolInfo, parseToolSpec,
 } from "./packages.mjs";
 import { credentialSurface, detectAuth, probeVersion } from "./probe.mjs";
+import {
+  DEFAULT_HOSTS, detectSourceControlAuth, failureLine, missingExtensions, parseHost, parseToken, signOutArgs, tokenSignIn,
+} from "./source-control.mjs";
 import * as state from "./state.mjs";
 import { compareVersions, meetsMinimum } from "./version.mjs";
 
@@ -469,13 +476,13 @@ export function createHarnessManager(options = {}) {
   }
 
   async function resolveToolchain(id) {
-    const entry = getToolchain(id);
+    const entry = getManagedTool(id);
     if (!entry) throw new Error(`unknown toolchain: ${id}`);
     return toolchainFacts(entry, await snapshot());
   }
 
   function runToolchain(id, kind, work, { onStarted, onProgress, signal } = {}) {
-    const entry = getToolchain(id);
+    const entry = getManagedTool(id);
     if (!entry) return Promise.resolve({ ok: false, code: "unknown-toolchain", error: `unknown toolchain: ${id}` });
     return runLocked({
       section: "toolchains",
@@ -490,10 +497,15 @@ export function createHarnessManager(options = {}) {
     });
   }
 
-  /** Install, or move to, mise's latest release, then prove the shim runs. */
+  /**
+   * Install, or move to, mise's latest release, then prove the shim runs. A
+   * CLI that needs extensions (az) gets the missing ones as part of the proof:
+   * without them T3 cannot use it, so a release that cannot add them is
+   * rolled back like one that does not run.
+   */
   async function selectToolchain(entry, previous, op = NO_OP) {
     op.phase("resolving");
-    const target = await mise.latest(ctx, entry.miseTool, { signal: op.signal });
+    const target = await mise.latest(ctx, releaseSpec(entry), { signal: op.signal });
     assertVersion(target);
     await useVerified(entry, target, async () => {
       const [bin, ...args] = entry.probe;
@@ -506,6 +518,18 @@ export function createHarnessManager(options = {}) {
       });
       if (result.error || result.code !== 0) {
         throw operationError("not-runnable", result.error || `${bin} exited with code ${result.code}`);
+      }
+      for (const name of await missingExtensions(ctx, entry)) {
+        const added = await ctx.run([executable, "extension", "add", "--name", name, "--yes"], {
+          env: ctx.env,
+          cwd: ctx.home,
+          timeoutMs: ctx.timeouts.install,
+          ...(op.signal ? { signal: op.signal } : {}),
+        });
+        if (added.cancelled) throw mise.cancelledError();
+        if (added.error || added.code !== 0) {
+          throw operationError("extension-failed", `could not add the ${name} extension: ${mise.firstError(added) || `exited with code ${added.code}`}`);
+        }
       }
     }, op, previous);
     return { version: target, updatedAt: ctx.now(), managedVersions: union(previous.managedVersions, [target]) };
@@ -582,7 +606,7 @@ export function createHarnessManager(options = {}) {
       return {
         ok: false,
         code: "managed-elsewhere",
-        error: `${owner.name} is managed on the ${owner.kind === "agent" ? "Agents" : "Toolchains"} page, not as an added tool.`,
+        error: `${owner.name} is managed on the ${{ agent: "Agents", "source-control": "Source control" }[owner.kind] ?? "Toolchains"} page, not as an added tool.`,
       };
     }
     return { ok: true, id: canonicalTool(parsed.id, index) };
@@ -856,9 +880,9 @@ export function createHarnessManager(options = {}) {
   }
 
   async function latestToolchain(id) {
-    const entry = getToolchain(id);
+    const entry = getManagedTool(id);
     if (!entry) throw new Error(`unknown toolchain: ${id}`);
-    return mise.latest(ctx, entry.miseTool);
+    return mise.latest(ctx, releaseSpec(entry));
   }
 
   // mise offers a release as the newest only once it has been out for its
@@ -918,9 +942,158 @@ export function createHarnessManager(options = {}) {
   }
 
   async function latestToolchainRelease(id) {
-    const entry = getToolchain(id);
+    const entry = getManagedTool(id);
     if (!entry) throw new Error(`unknown toolchain: ${id}`);
-    return releaseSummary(entry.miseTool);
+    return releaseSummary(releaseSpec(entry));
+  }
+
+  // --- source control CLIs ------------------------------------------------
+  //
+  // The CLIs T3 Code drives for each source control host. The ones mise
+  // installs are run as toolchains (install, update and uninstall above, the
+  // same lock and record); this adds what a toolchain does not have: which
+  // host each is for, whether it is signed in, and the image's own gh.
+
+  /** The image's gh, read once: it only changes with the image. */
+  let imageVersionRead = null;
+  function imageVersion(entry) {
+    imageVersionRead ??= (async () => {
+      const result = await ctx.run(entry.probe, { env: ctx.env, cwd: ctx.home, timeoutMs: ctx.timeouts.probe });
+      const version = result.code === 0 ? new RegExp(entry.versionPattern).exec(result.stdout)?.[1] ?? null : null;
+      if (!version) imageVersionRead = null;
+      return version;
+    })();
+    return imageVersionRead;
+  }
+
+  async function sourceControlAuth(entry, executable, version) {
+    const key = `${executable}:${version ?? ""}`;
+    const cached = authCache.get(entry.id);
+    if (cached && cached.key === key && ctx.now() - cached.at < ctx.authCacheTtlMs) return cached.value;
+    const value = await detectSourceControlAuth(ctx, entry, executable);
+    authCache.set(entry.id, { at: ctx.now(), key, value });
+    return value;
+  }
+
+  async function sourceControlFacts(entry, snap, { authenticate = true } = {}) {
+    const base = entry.inImage
+      ? await (async () => {
+        const version = await imageVersion(entry);
+        return { id: entry.id, name: entry.name, installed: Boolean(version), version, inProgress: false,
+          operation: null, operationState: null, managedVersions: [], failed: false, failure: null };
+      })()
+      : toolchainFacts(entry, snap);
+    let auth = null;
+    if (authenticate && base.installed && !base.inProgress) {
+      // gh is looked up on PATH, as T3 does; a mise CLI by its own shim.
+      const executable = entry.inImage ? entry.bin : await mise.which(ctx, entry.bin);
+      auth = await sourceControlAuth(entry, executable, base.version);
+    }
+    return {
+      ...base,
+      provider: entry.provider,
+      bin: entry.bin,
+      inImage: Boolean(entry.inImage),
+      auth,
+      missingExtensions: base.installed && !entry.inImage ? await missingExtensions(ctx, entry) : [],
+    };
+  }
+
+  /**
+   * Every source control CLI, from one `mise ls`. `authenticate` runs each
+   * installed CLI's sign-in check (cached briefly): too slow for every poll,
+   * so the setup service reads it in the background.
+   */
+  async function sourceControlStatus(options = {}) {
+    const snap = await snapshot();
+    const rows = await Promise.all(SOURCE_CONTROL.map((entry) => sourceControlFacts(entry, snap, options)));
+    return { sourceControl: rows, degraded: snap.degraded };
+  }
+
+  async function resolveSourceControl(id, options = {}) {
+    const entry = getSourceControl(id);
+    if (!entry) throw new Error(`unknown source control CLI: ${id}`);
+    return sourceControlFacts(entry, await snapshot(), options);
+  }
+
+  /** The command to run a source control CLI by: gh by name, as T3 does; a mise one by its shim. */
+  async function sourceControlExecutable(id) {
+    const entry = getSourceControl(id);
+    if (!entry) return null;
+    if (entry.inImage) return (await imageVersion(entry)) ? entry.bin : null;
+    return mise.which(ctx, entry.bin);
+  }
+
+  // Signing in runs the CLI against a server across the network: longer than
+  // a version probe, still bounded.
+  const SIGN_IN_TIMEOUT_MS = 60_000;
+  const NO_PROMPT = { NO_COLOR: "1", GH_PROMPT_DISABLED: "1", GLAB_NO_PROMPT: "1" };
+
+  async function runScm(executable, args, { input = null, env = {} } = {}) {
+    return ctx.run([executable, ...args], {
+      env: { ...ctx.env, ...NO_PROMPT, ...env },
+      cwd: ctx.home,
+      timeoutMs: ctx.timeouts.signIn ?? SIGN_IN_TIMEOUT_MS,
+      input,
+    });
+  }
+
+  /**
+   * Sign a CLI in to one host with a token, and prove the host took it before
+   * saying so: a token glab or fj stored but the server refused is taken back
+   * out, so a failed attempt leaves things as they were. The token never
+   * reaches an argument, a log line or the answer.
+   */
+  async function signInSourceControl(id, { host: rawHost, token: rawToken } = {}) {
+    const entry = getSourceControl(id);
+    if (!entry) return { ok: false, code: "unknown-toolchain", error: `unknown source control CLI: ${id}` };
+    if (!DEFAULT_HOSTS[id]) return { ok: false, code: "unsupported", error: `${entry.name} signs in with a device code, not a token` };
+    const host = parseHost(rawHost || DEFAULT_HOSTS[id]);
+    if (!host.ok) return { ok: false, code: "invalid-host", error: host.error };
+    const token = parseToken(rawToken);
+    if (!token.ok) return { ok: false, code: "invalid-token", error: token.error };
+    const plan = tokenSignIn(entry, host.host, token.token);
+    const executable = await sourceControlExecutable(id);
+    if (!executable) return { ok: false, code: "not-installed", error: `${entry.name} is not installed` };
+
+    const warnings = [];
+    const undo = async () => {
+      try { await runScm(executable, plan.undo); } catch { /* the failure being reported is the one that matters */ }
+    };
+    try {
+      for (const step of plan.steps) {
+        const result = await runScm(executable, step.args, { input: step.input ?? null, env: step.env ?? {} });
+        if (result.code === 0) continue;
+        const said = failureLine(result, token.token);
+        if (step.optional) { warnings.push(said); continue; }
+        return { ok: false, code: "not-accepted", error: said };
+      }
+      if (plan.verify) {
+        const checked = await runScm(executable, plan.verify);
+        if (checked.code !== 0) {
+          await undo();
+          return { ok: false, code: "not-accepted", error: `${host.host} did not accept the token: ${failureLine(checked, token.token)}` };
+        }
+      }
+    } finally {
+      authCache.delete(id);
+    }
+    const facts = await resolveSourceControl(id);
+    return { ok: true, code: "ok", host: host.host, ...(warnings.length ? { warning: warnings[0] } : {}), sourceControl: facts };
+  }
+
+  /** Sign a CLI out of one host (az out of everything). Its other hosts stay signed in. */
+  async function signOutSourceControl(id, { host: rawHost } = {}) {
+    const entry = getSourceControl(id);
+    if (!entry) return { ok: false, code: "unknown-toolchain", error: `unknown source control CLI: ${id}` };
+    const host = entry.auth === "az" ? { ok: true, host: null } : parseHost(rawHost || DEFAULT_HOSTS[id]);
+    if (!host.ok) return { ok: false, code: "invalid-host", error: host.error };
+    const executable = await sourceControlExecutable(id);
+    if (!executable) return { ok: false, code: "not-installed", error: `${entry.name} is not installed` };
+    const result = await runScm(executable, signOutArgs(entry, host.host));
+    authCache.delete(id);
+    if (result.code !== 0) return { ok: false, code: "failed", error: failureLine(result) };
+    return { ok: true, code: "ok", sourceControl: await resolveSourceControl(id) };
   }
 
   /** Drop the cached sign-in verdict after a sign-in changes it. */
@@ -941,6 +1114,19 @@ export function createHarnessManager(options = {}) {
     releaseAge,
     invalidateAuth,
     refreshLinks,
+    sourceControl: {
+      status: sourceControlStatus,
+      resolve: resolveSourceControl,
+      executable: sourceControlExecutable,
+      signIn: signInSourceControl,
+      signOut: signOutSourceControl,
+      // The mise-installed ones run as toolchains: same lock, same record.
+      install: installToolchain,
+      update: updateToolchain,
+      uninstall: uninstallToolchain,
+      latest: latestToolchain,
+      latestRelease: latestToolchainRelease,
+    },
     toolchains: {
       status: toolchainStatus,
       resolve: resolveToolchain,
