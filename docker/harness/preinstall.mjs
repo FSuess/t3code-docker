@@ -20,12 +20,16 @@
 //   T3_PREINSTALL=default        Claude Code, Codex, OpenCode and every toolchain
 //   T3_PREINSTALL=all            every agent and every toolchain
 //   T3_PREINSTALL=agents         just the five agent CLIs
-//   T3_PREINSTALL=claude,go      any mix of ids and the groups above
+//   T3_PREINSTALL=source-control glab, fj, tea and az (also: scm)
+//   T3_PREINSTALL=claude,go,glab any mix of ids and the groups above
 //   T3_PREINSTALL=none           nothing (also: off, 0, false)
+//
+// The source control CLIs are only ever installed when named: which host a
+// server talks to cannot be guessed, so not even `all` includes them.
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { CATALOGUE, TOOLCHAINS } from "./catalogue.mjs";
+import { CATALOGUE, SOURCE_CONTROL, TOOLCHAINS } from "./catalogue.mjs";
 import { createFs, processAlive, processStartTime } from "./io.mjs";
 
 const SCHEMA = 1;
@@ -35,6 +39,9 @@ const ALL = new Set(["all", "1", "true", "yes"]);
 
 const AGENTS = CATALOGUE.map((entry) => ({ kind: "agent", id: entry.id, name: entry.name }));
 const TOOLS = TOOLCHAINS.map((entry) => ({ kind: "toolchain", id: entry.id, name: entry.name }));
+const SCM = SOURCE_CONTROL.filter((entry) => !entry.inImage)
+  .map((entry) => ({ kind: "source-control", id: entry.id, name: entry.name }));
+const KNOWN = [...AGENTS, ...TOOLS, ...SCM];
 const FIRST_START = new Set(CATALOGUE.filter((entry) => entry.firstStart).map((entry) => entry.id));
 const DEFAULT_ITEMS = [...AGENTS.filter((item) => FIRST_START.has(item.id)), ...TOOLS];
 
@@ -42,8 +49,8 @@ export const keyOf = (item) => `${item.kind}:${item.id}`;
 
 /**
  * Turn T3_PREINSTALL into an ordered plan: agents first, because they are what
- * someone opening the app is waiting for, then toolchains. Unknown words are
- * reported rather than failing the container.
+ * someone opening the app is waiting for, then toolchains, then source control
+ * CLIs. Unknown words are reported rather than failing the container.
  */
 export function parsePreinstall(value) {
   const raw = String(value ?? "").trim().toLowerCase();
@@ -58,13 +65,14 @@ export function parsePreinstall(value) {
     else if (token === "default") DEFAULT_ITEMS.forEach((item) => wanted.add(keyOf(item)));
     else if (token === "agents") AGENTS.forEach((item) => wanted.add(keyOf(item)));
     else if (token === "toolchains") TOOLS.forEach((item) => wanted.add(keyOf(item)));
+    else if (token === "source-control" || token === "scm") SCM.forEach((item) => wanted.add(keyOf(item)));
     else {
-      const item = [...AGENTS, ...TOOLS].find((candidate) => candidate.id === token);
+      const item = KNOWN.find((candidate) => candidate.id === token);
       if (item) wanted.add(keyOf(item));
       else unknown.push(token);
     }
   }
-  return { items: [...AGENTS, ...TOOLS].filter((item) => wanted.has(keyOf(item))), unknown };
+  return { items: KNOWN.filter((item) => wanted.has(keyOf(item))), unknown };
 }
 
 export function preinstallPath(stateDir) {
@@ -114,7 +122,7 @@ export async function readPreinstall({
   const items = plan.map((key) => {
     const [kind, id] = key.split(":");
     const entry = record.items[key] ?? {};
-    const known = [...AGENTS, ...TOOLS].find((item) => keyOf(item) === key);
+    const known = KNOWN.find((item) => keyOf(item) === key);
     return {
       kind,
       id,
@@ -178,7 +186,7 @@ export async function runPreinstall({
   }
 
   const summary = { installed: [], adopted: [], failed: [], skipped: [] };
-  const opsFor = (item) => (item.kind === "agent" ? manager : manager.toolchains);
+  const opsFor = (item) => (item.kind === "agent" ? manager : item.kind === "source-control" ? manager.sourceControl : manager.toolchains);
   const unrecorded = items.filter((item) => record.items[keyOf(item)]?.state !== "done");
   summary.skipped = items.filter((item) => !unrecorded.includes(item)).map(keyOf);
 
