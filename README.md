@@ -50,6 +50,9 @@ keeping everything up to date, without a shell in the container.
   Node, Python, clang, ffmpeg, ImageMagick and psql are in the image, and any
   other tool mise can install (kubectl, Java, Terraform and about a thousand
   more) can be added from the setup page.
+- **Pull requests on any host T3 Code supports.** GitHub's `gh` is in the image;
+  the CLIs T3 Code uses for GitLab, Forgejo, Gitea and Azure DevOps install with
+  one click, and the setup page signs each one in with a token or a device code.
 - **A browser for the agents.** Headless Chromium with Playwright and Chrome
   DevTools MCP servers, registered with Claude Code, Codex and OpenCode.
 - **Publish a dev server.** Publish a port from the setup page or with
@@ -68,6 +71,7 @@ keeping everything up to date, without a shell in the container.
 - [Giving agents a browser](#giving-agents-a-browser)
 - [Agents](#agents)
 - [Toolchains](#toolchains)
+- [Source control](#source-control)
 - [How long things last](#how-long-things-last)
 - [Configuration](#configuration)
 - [Building](#building)
@@ -121,6 +125,7 @@ docker compose exec -it t3code t3-login claude   # sign an agent in from a shell
 | Claude Code, Codex, OpenCode | first start | first start |
 | Grok, Cursor, Antigravity | one click | one click |
 | Go, Rust, Bun, Deno, uv | first start | first start |
+| glab, fj, tea, az, for GitLab, Forgejo, Gitea and Azure DevOps | one click | one click |
 | mise, for per-project versions | ✅ | ✅ |
 | Headless Chromium and browser MCP servers | ✅ | — |
 | cloudflared, for publishing a port | ✅ | ✅ |
@@ -130,9 +135,10 @@ docker compose exec -it t3code t3-login claude   # sign an agent in from a shell
 background the first time it runs, and not again. That's about 2 GB that stays
 on the volume you already keep instead of being part of every pull. "One click"
 means the setup page installs it when you ask. `T3_PREINSTALL` changes what the
-first start installs: `all` adds Grok and Cursor, and `agents`, `toolchains`, a
-list like `claude,codex,go`, or `none` also work. Anything left out can be
-installed from the setup page later.
+first start installs: `all` adds Grok and Cursor, `source-control` adds the four
+source control CLIs, and `agents`, `toolchains`, a list like `claude,codex,glab`,
+or `none` also work. Anything left out can be installed from the setup page
+later.
 
 Neither image contains credentials or model access. You bring your own
 subscriptions or API keys and sign the agents in yourself.
@@ -716,6 +722,58 @@ T3_BUILD_TARGET=browser       # or core, for what was slim
 
 The `v0.4.x` tags still have the old images if you need to roll back.
 
+## Source control
+
+T3 Code opens, lists and checks out pull requests through each host's own
+command-line tool, which it looks for on `PATH` and asks whether it is signed in
+(Settings → Source Control in T3 Code). The setup page's **Source control**
+page, under Toolchains, has one row per host:
+
+| Host | CLI | In the image | Signs in with |
+| --- | --- | :---: | --- |
+| GitHub | `gh` | ✅ | a token |
+| GitLab | `glab` | one click | a token |
+| Forgejo (Codeberg) | `fj` | one click | a token |
+| Gitea (and Forgejo) | `tea` | one click | a token |
+| Azure DevOps | `az`, with the `azure-devops` extension | one click | a device code |
+
+Bitbucket needs no CLI: T3 Code talks to its API with a token you add in T3
+Code's own Settings → Source Control.
+
+`glab`, `fj`, `tea` and `az` install like a toolchain: into the volume through
+mise, at an exact version, one press to update or remove. None of them installs
+on its own, because which host a server talks to can't be guessed and the Azure
+CLI alone takes about 330 MB; `T3_PREINSTALL=source-control` (or a list such as
+`glab,az`) installs them on the first start. `az` comes with the `azure-devops`
+extension, which T3 Code needs to reach repositories; a row whose extension has
+gone missing offers **Repair**.
+
+Each row says who the CLI is signed in as, the same way T3 Code asks. One you
+installed and haven't signed in counts as needing you, since T3 Code can't use
+it yet; the image's `gh` never does. **Sign in** opens a sheet:
+
+- **gh, glab, fj, tea**: name the server (github.com, gitlab.com, codeberg.org
+  and gitea.com unless yours runs elsewhere), open its token page, which links
+  to a new token with the scopes T3 Code needs where the host allows that, and
+  paste the token. It goes to the CLI on stdin (to `tea` in its environment),
+  never as an argument, and the server has to accept it before the sheet
+  closes; a token it refused is removed again. `gh` and `tea` also become git's
+  credential helper for that server, so a push over HTTPS uses the same token.
+- **az**: the device-code flow, like the agents': open the page, enter the
+  code, approve.
+
+Once signed in, the row's menu signs in to another server or signs out. From a
+shell:
+
+```bash
+docker compose exec t3code t3-harness source-control     # every CLI, its host and who it is signed in as
+docker compose exec t3code t3-harness install glab
+docker compose exec -u t3 -it t3code bash -lc 'glab auth login'   # or any CLI's own sign-in
+```
+
+Sign-ins are kept on the state volume like the agents' (see
+[Configuration](#configuration)), so they survive a recreate.
+
 ## How long things last
 
 There are three separate expiry times:
@@ -748,7 +806,7 @@ Environment variables (all optional except where noted):
 | `T3_WORKSPACE` | `/workspace` | Scanned for projects |
 | `T3_AUTO_ADD_PROJECTS` | `1` | Register each git checkout under the workspace |
 | `T3_PRINT_PAIRING_ON_START` | `0` | Create a pairing link at startup and print it to the log |
-| `T3_PREINSTALL` | `default` | What the first start installs onto the volume: `default` (Claude Code, Codex, OpenCode and the toolchains), `all`, `agents`, `toolchains`, ids like `claude,go`, or `none` |
+| `T3_PREINSTALL` | `default` | What the first start installs onto the volume: `default` (Claude Code, Codex, OpenCode and the toolchains), `all` (every agent and toolchain), `agents`, `toolchains`, `source-control` (glab, fj, tea, az), ids like `claude,go,glab`, or `none` |
 | `T3_PAIR_TTL` | `30d` | How long links from `t3-pair` can be used |
 | `T3_SETUP_ENABLED` | `1` | Run the setup page |
 | `T3_SETUP_KEY` | *(generated)* | Password for the setup page. Without it, the first start generates one and keeps it on the volume, and the setup page can show and replace it. |
@@ -772,8 +830,10 @@ mounted (`/home/t3/.t3`), credentials and threads persist, and the next start
 reinstalls the tools.
 
 Agent CLIs normally store their sign-ins in `~/.claude`, `~/.codex`,
-`~/.cursor`, `~/.grok` and OpenCode's XDG directories, which only persist when
-the whole home directory is mounted. The container keeps them under
+`~/.cursor`, `~/.grok` and OpenCode's XDG directories, and the source control
+CLIs in `~/.config/gh`, `~/.config/glab-cli`, `~/.config/tea`,
+`~/.local/share/forgejo-cli` and `~/.azure`, which only persist when the whole
+home directory is mounted. The container keeps them under
 `$T3CODE_HOME/agents` instead and links them back, so a sign-in survives even
 when only the state directory is mounted. Set `T3_PERSIST_AGENT_CREDENTIALS=0`
 to leave them where the CLIs put them.
