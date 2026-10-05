@@ -197,7 +197,7 @@ export function renderUnlock({ assets, nonce, mount, host, publicUrl, error, emb
     <div class="tc-standalone-body">
       ${host ? `<span class="tc-eyebrow">${escapeHtml(host)}</span>` : ""}
       <h1 class="tc-standalone-title">Unlock the console</h1>
-      <p class="tc-standalone-desc">Pair devices, sign agents in and publish ports on this server. Enter the setup key you set as <code>T3_SETUP_KEY</code>.</p>
+      <p class="tc-standalone-desc">Pair devices, sign agents in and publish ports on this server. Enter the setup key: the one you set as <code>T3_SETUP_KEY</code>, or the one this server generated on its first start.</p>
       <form class="tc-unlock-form" method="POST" action="${escapeHtml(mount)}/login" id="loginform" novalidate>${embed ? `
         <input type="hidden" name="embed" value="t3">` : ""}
         <div class="tc-field">
@@ -214,7 +214,7 @@ export function renderUnlock({ assets, nonce, mount, host, publicUrl, error, emb
           ${t3Url ? `<a class="tc-btn tc-btn--lg" href="${escapeHtml(t3Url)}" rel="noopener">Open T3 Code</a>` : ""}
         </div>
       </form>
-      <div class="tc-note">Left <code>T3_SETUP_KEY</code> empty? One was generated at boot and printed to the log:<br><code>docker compose logs t3code | grep -A1 T3_SETUP_KEY</code></div>
+      <div class="tc-note">Left <code>T3_SETUP_KEY</code> empty? The first start generated a key and kept it. Every start prints it to the log, under the line that names <code>T3_SETUP_KEY</code>:<br><code>docker compose logs t3code | grep -A1 T3_SETUP_KEY</code></div>
     </div>
   </div>
 </main>

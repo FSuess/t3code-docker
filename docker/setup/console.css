@@ -76,6 +76,10 @@ html.tc-locked { overflow: hidden; }
 @media (max-width: 639.98px) {
   .tc-row:has(> .tc-row-actions--wrap) { grid-template-columns: auto minmax(0, 1fr); }
   .tc-row > .tc-row-actions--wrap { grid-column: 2 / -1; justify-content: flex-start; }
+  /* A plain row has no leading tile to indent under: its actions go under
+     the whole main block. */
+  .tc-row--plain:has(> .tc-row-actions--wrap) { grid-template-columns: minmax(0, 1fr); }
+  .tc-row--plain > .tc-row-actions--wrap { grid-column: 1 / -1; }
 }
 /* A 28px input, for inline values beside small buttons. */
 .tc-input--sm { height: var(--control-sm); font-size: 13px; }
@@ -106,6 +110,8 @@ html.tc-locked { overflow: hidden; }
 .tc-notice:has(> .tc-choice) > .tc-notice-body, .tc-kv > dd:has(> .tc-choice) > .tc-kv-fill { flex: 1 1 14rem; }
 .tc-notice > .tc-choice .tc-btn { margin: 0; }
 .tc-kv-fill { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+/* The setup key, shown on request under its row's description. */
+.tc-key-field { margin-top: var(--space-2); max-width: 28rem; }
 /* Advice under a field that isn't an error: the field still saves. */
 .tc-hint--warn { color: var(--warn-text); }
 

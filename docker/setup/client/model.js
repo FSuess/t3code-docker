@@ -1219,6 +1219,8 @@ const T3Model = (() => {
     add('Actions', 'Lock console', 'lock', { cmd: 'lock' });
     if (s.publicUrl) add('Environment', 'Copy public URL', 'copy', { cmd: 'copy', text: s.publicUrl, toast: 'Public URL copied' }, { meta: { text: hostOf(s.publicUrl), mono: true } });
     if (s.publicUrlSource !== 'env') add('Environment', s.publicUrl ? 'Change public URL' : 'Set public URL', 'globe', { cmd: 'url.edit' }, { meta: s.publicUrl ? { text: publicUrlSource(s) } : { text: 'not set', dot: 'warn' }, attention: !s.publicUrl });
+    add('Environment', 'Show setup key', 'key-round', { cmd: 'key.show' });
+    if (s.setupKeySource && s.setupKeySource !== 'env') add('Environment', 'Replace setup key', 'refresh-cw', { cmd: 'key.replace' });
     add('Environment', 'Copy diagnostics', 'copy', { cmd: 'diagnostics' });
 
     const pages = [['Overview', 'overview', 'layout-dashboard', 'O'], ['Devices', 'devices', 'smartphone', 'D'], ['Agents', 'agents', 'bot', 'A'],

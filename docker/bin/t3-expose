@@ -29,12 +29,15 @@ SETUP_PORT="${T3_SETUP_PORT:-3774}"
 API="http://127.0.0.1:${SETUP_PORT}"
 STATE_DIR="${T3CODE_HOME:-${HOME:-/home/t3}/.t3}"
 
-# The entrypoint exports the key, but `docker exec` and the terminals T3 Code
-# opens do not inherit that, so fall back to the copy on the state volume.
-key="${T3_SETUP_KEY:-}"
-if [ -z "$key" ] && [ -r "${STATE_DIR}/setup-key" ]; then
-  key="$(cat "${STATE_DIR}/setup-key")"
+# The file on the state volume holds the key in effect, whatever set it, and
+# follows a key replaced from the setup page. T3_SETUP_KEY here may be the one
+# the container started with (T3 Code's terminals inherit it), or absent under
+# `docker exec`, so it is only the fallback.
+key=""
+if [ -r "${STATE_DIR}/setup-key" ]; then
+  key="$(head -n 1 "${STATE_DIR}/setup-key")"
 fi
+[ -n "$key" ] || key="${T3_SETUP_KEY:-}"
 if [ -z "$key" ]; then
   echo "t3-expose: no setup key found." >&2
   echo "           Set T3_SETUP_KEY, or check ${STATE_DIR}/setup-key exists." >&2

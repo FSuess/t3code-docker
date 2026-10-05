@@ -374,27 +374,33 @@ start_setup_service() {
   [ "$T3_SETUP_ENABLED" = "1" ] || return 0
   [ -f /opt/t3-setup/server.mjs ] || return 0
 
-  # The console says whether its key survives a recreate, so it needs to know
-  # which kind it has.
-  T3_SETUP_KEY_GENERATED=0
-  if [ -z "${T3_SETUP_KEY:-}" ]; then
-    T3_SETUP_KEY="$("$T3_INFRA_NODE" -e 'console.log(require("crypto").randomBytes(16).toString("hex"))')"
-    T3_SETUP_KEY_GENERATED=1
-    log "T3_SETUP_KEY was not set; generated one for this container:"
-    log "    ${T3_SETUP_KEY}"
-    log "    Set T3_SETUP_KEY yourself to keep it stable across recreates."
+  # The key: T3_SETUP_KEY, else the one kept on the volume since the first
+  # start, else a new one, kept from now on (docker/setup/setup-key.mjs, which
+  # also writes it where t3-expose and friends read it). Printed on every start
+  # unless it was configured: on a hosting platform the log is the one place to
+  # find it without a shell. Each message names T3_SETUP_KEY on the line before
+  # the key, so `grep -A1 T3_SETUP_KEY` finds it whichever was printed.
+  local resolved
+  if ! resolved="$("$T3_INFRA_NODE" /opt/t3-setup/setup-key.mjs --resolve)" || [ -z "$resolved" ]; then
+    log "ERROR: could not settle on a setup key; the setup UI is off for this start"
+    return 0
   fi
-  export T3_SETUP_KEY T3_SETUP_KEY_GENERATED
-  # `docker exec` and the terminals T3 Code opens inherit the image environment,
-  # not this shell's exports, so a generated key would be invisible to t3-expose
-  # and friends. Drop it where they can read it - same directory, same owner,
-  # and the state volume is already where credentials live.
-  key_file="${T3CODE_HOME}/setup-key"
-  if [ -w "$(dirname "$key_file")" ] || [ -w "$key_file" ] 2>/dev/null; then
-    printf '%s\n' "$T3_SETUP_KEY" > "$key_file" 2>/dev/null || true
-    chmod 0600 "$key_file" 2>/dev/null || true
-    chown "${PUID:-1000}:${PGID:-1000}" "$key_file" 2>/dev/null || true
-  fi
+  T3_SETUP_KEY_SOURCE="${resolved%% *}"
+  T3_SETUP_KEY="${resolved#* }"
+  case "$T3_SETUP_KEY_SOURCE" in
+    new)
+      log "T3_SETUP_KEY was not set; generated a setup key and kept it on the volume:"
+      log "    ${T3_SETUP_KEY}"
+      log "    It stays the same from now on. Set T3_SETUP_KEY to choose your own." ;;
+    volume)
+      log "T3_SETUP_KEY is not set; the setup key kept on the volume is:"
+      log "    ${T3_SETUP_KEY}" ;;
+    boot)
+      log "T3_SETUP_KEY was not set, and ${T3CODE_HOME} could not keep a key; generated one for this start:"
+      log "    ${T3_SETUP_KEY}"
+      log "    It changes on every start. Set T3_SETUP_KEY to keep one." ;;
+  esac
+  export T3_SETUP_KEY T3_SETUP_KEY_SOURCE
 
   (
     while :; do

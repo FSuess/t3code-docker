@@ -29,6 +29,7 @@ import { createT3Api } from "./t3-api.mjs";
 import { createAntigravity } from "./antigravity.mjs";
 import { createT3Sessions } from "./t3-session.mjs";
 import { clientAddress } from "./client-address.mjs";
+import { newKey, readKeyFile, writeKeyFile } from "./setup-key.mjs";
 import {
   checkReaches, clearSaved, parsePublicUrl, platformUrl, readSaved, resolvePublicUrl, writeSaved,
 } from "./public-url.mjs";
@@ -43,7 +44,6 @@ const gzip = promisify(gzipCallback);
 const ASSETS = loadAssets();
 
 const PORT = Number(process.env.T3_SETUP_PORT ?? 3774);
-const KEY = process.env.T3_SETUP_KEY ?? "";
 const T3_PORT = process.env.T3CODE_PORT ?? "3773";
 const COOKIE = "t3setup";
 // Lets a single public hostname route a path prefix here instead of needing a
@@ -59,9 +59,14 @@ const SINGLE_PREFIX = BASE_PATH ? (BASE_PATH.startsWith("/") ? BASE_PATH : `/${B
 const STATE_DIR = process.env.T3CODE_HOME || `${process.env.HOME || "/home/t3"}/.t3`;
 const VOLUME = STATE_DIR.replace(/\/\.t3\/?$/, "") || STATE_DIR;
 const WORKSPACE = process.env.T3_WORKSPACE || "/workspace";
-// The entrypoint generates a key when T3_SETUP_KEY is empty and says so; a
-// generated key changes on every recreate, which the Environment page warns of.
-const SETUP_KEY_SOURCE = process.env.T3_SETUP_KEY_GENERATED === "1" ? "generated" : "env";
+// The setup key and where it came from (setup-key.mjs): "env" for
+// T3_SETUP_KEY, "volume" for one kept on the state volume, "boot" for one the
+// volume could not keep. A kept key is read from the volume rather than the
+// environment, so one replaced from this page outlives this process's own
+// restarts, which inherit the key the container started with.
+const keySourceOf = (source) => (source === "env" || source === "boot" ? source : source ? "volume" : "env");
+let KEY_SOURCE = keySourceOf(process.env.T3_SETUP_KEY_SOURCE);
+let KEY = (KEY_SOURCE === "volume" && readKeyFile(STATE_DIR)) || process.env.T3_SETUP_KEY || "";
 
 // Where pairing links point: T3_PUBLIC_URL, else the address saved from this
 // page, else the hosting platform's (public-url.mjs). Read on every use, so a
@@ -720,7 +725,7 @@ const status = async () => {
     // T3_SINGLE_PORT: both services behind one listener, this page under
     // `prefix` there. The page shows it beside the two ports it fronts.
     singlePort: SINGLE_PORT ? { port: SINGLE_PORT, prefix: SINGLE_PREFIX } : null,
-    setupKeySource: SETUP_KEY_SOURCE,
+    setupKeySource: KEY_SOURCE,
     // Settings an older image baked in that this container still carries, which
     // the user environment dropped for everything the entrypoint started
     // (docker/user-env.sh); only the container's configuration can remove them.
@@ -837,6 +842,29 @@ const setPublicUrl = async (value, { check: shouldCheck = true } = {}) => {
   writeSaved(STATE_DIR, parsed.url);
   recordEvent("url.set", "Public URL set", hostOf(parsed.url));
   return { http: 200, body: { ok: true, publicUrl: parsed.url, publicUrlSource: "saved", check } };
+};
+
+/**
+ * Replace the setup key with a new one, kept on the volume. Every browser
+ * signed in with the old key, and anything holding it, is shut out; the CLIs
+ * read the new one from the file. Not while T3_SETUP_KEY sets it: the
+ * container's configuration would put the old one back on the next start.
+ */
+const replaceKey = () => {
+  if (KEY_SOURCE === "env") {
+    return { http: 409, body: { ok: false, code: "pinned", error: "T3_SETUP_KEY sets the key in the container's configuration. Change it there." } };
+  }
+  const key = newKey();
+  try {
+    writeKeyFile(STATE_DIR, key);
+  } catch (error) {
+    return { http: 500, body: { ok: false, error: `The volume could not keep a new key (${error.code ?? error.message}).` } };
+  }
+  KEY = key;
+  KEY_SOURCE = "volume";
+  failures.clear();
+  recordEvent("key.replaced", "Setup key replaced");
+  return { http: 200, body: { ok: true, key, source: KEY_SOURCE } };
 };
 
 const hostOf = (url) => {
@@ -1698,7 +1726,7 @@ const cancelLifecycle = (target, rawId) => {
 };
 
 const ROUTES = ["/login", "/logout", "/hello", "/status", "/pair", "/revoke", "/ports",
-  "/public-url/clear", "/public-url",
+  "/public-url/clear", "/public-url", "/setup-key/reveal", "/setup-key/replace",
   "/ports/expose", "/ports/unexpose",
   "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses/enable", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
@@ -2110,6 +2138,23 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }
+    }
+
+    // The key itself, for a signed-in browser to copy. Nothing new to it: one
+    // signed in with T3 Code has a terminal that can read the same file.
+    if (req.method === "POST" && route === "/setup-key/reveal") {
+      return sendJson(res, 200, { ok: true, key: KEY, source: KEY_SOURCE });
+    }
+
+    if (req.method === "POST" && route === "/setup-key/replace") {
+      const answer = replaceKey();
+      // A browser that came in with the old key keeps its place with the new
+      // one. One that came in on its T3 Code session gets no key cookie: it
+      // stays as revocable as that session.
+      const headers = answer.body.ok && viewer?.via === "key"
+        ? { "set-cookie": cookie(req, mount, encodeURIComponent(KEY), 86400) }
+        : {};
+      return sendJson(res, answer.http, answer.body, headers);
     }
 
     if (req.method === "POST" && (route === "/public-url" || route === "/public-url/clear")) {

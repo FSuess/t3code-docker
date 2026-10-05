@@ -400,7 +400,7 @@ import json, sys
 s = json.load(sys.stdin)
 assert isinstance(s.get('events'), list), 'events'
 assert s.get('platform', '').startswith('linux/'), 'platform'
-assert s.get('setupKeySource') in ('env', 'generated'), 'setupKeySource'
+assert s.get('setupKeySource') in ('env', 'volume', 'boot'), 'setupKeySource'
 assert 'uptimeSeconds' in s['server'], 'uptimeSeconds'
 assert all('latestVersion' in h for h in s['harnesses']), 'harness latestVersion'
 assert all('latestVersion' in t for t in s['toolchains']), 'toolchain latestVersion'
@@ -1152,6 +1152,8 @@ url_is_pinned() {
   [ "$(status_json | jq -r '"\(.publicUrl) \(.publicUrlSource)"')" = "${PUBLIC_URL} env" ]
 }
 check "a T3_PUBLIC_URL in the container's settings can't be changed from the page" url_is_pinned
+check "nor can a T3_SETUP_KEY be replaced from it" \
+  "docker exec $NAME sh -c \"curl -sS --max-time 10 -b /tmp/jar -H 'content-type: application/json' -d '{}' http://127.0.0.1:3774/setup-key/replace\" | jq -e '.code == \"pinned\"'"
 rm -f "$SETUP_JAR"
 
 # T3_SINGLE_PORT: one listener in front of both services, the way a hosting
@@ -1167,8 +1169,9 @@ docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
 # Without T3_PUBLIC_URL, and with the variable Railway sets: the public URL
 # checks below run against this container too.
 ONE_PLATFORM_URL="https://t3-smoke.up.railway.app"
+# No T3_SETUP_KEY either: the key checks below need the generated one.
 docker run -d --name "${NAME}-one" -e T3_PREINSTALL=none \
-  -e T3_SINGLE_PORT=8080 -e "T3_SETUP_KEY=${SETUP_KEY}" -e "RAILWAY_PUBLIC_DOMAIN=${ONE_PLATFORM_URL#https://}" \
+  -e T3_SINGLE_PORT=8080 -e "RAILWAY_PUBLIC_DOMAIN=${ONE_PLATFORM_URL#https://}" \
   -p "127.0.0.1:${ONE_PORT}:8080" "$IMAGE" >/dev/null
 one_up=0
 for _ in $(seq 1 40); do
@@ -1186,6 +1189,15 @@ else
   docker logs "${NAME}-one" 2>&1 | tail -15
 fi
 
+# Without T3_SETUP_KEY, the first start generates a key and keeps it on the
+# volume, where t3-expose and the page's later starts find it.
+ONE_KEY_FILE=/home/t3/.t3/setup-key
+ONE_KEY="$(docker exec "${NAME}-one" cat "$ONE_KEY_FILE" 2>/dev/null || true)"
+check "without T3_SETUP_KEY, the first start generates a setup key and keeps it" \
+  "[ -n \"\$ONE_KEY\" ] && output_has 'docker logs ${NAME}-one' 'generated a setup key and kept it on the volume'"
+check "and only the t3 user can read it" \
+  "[ \"\$(docker exec ${NAME}-one stat -c '%a %U' $ONE_KEY_FILE)\" = '600 t3' ]"
+
 # Captured rather than piped into `grep -q`, for the reason given at
 # page_says_mount below: grep exiting early kills curl under pipefail.
 one_serves_t3_shell() {
@@ -1197,7 +1209,7 @@ check "T3 Code's pages come through it, setup bridge included" one_serves_t3_she
 check "the setup page answers under /__setup on it" \
   "retry 10 \"curl -fsS --noproxy '*' --max-time 5 ${ONE_URL}/__setup/hello | grep -q '\\\"service\\\":\\\"t3-setup\\\"'\""
 one_signs_in() {
-  curl -sS --noproxy '*' --max-time 10 -c "$ONE_JAR" -d "key=${SETUP_KEY}" -o /dev/null "${ONE_URL}/__setup/login" || return 1
+  curl -sS --noproxy '*' --max-time 10 -c "$ONE_JAR" -d "key=${ONE_KEY}" -o /dev/null "${ONE_URL}/__setup/login" || return 1
   # Netscape cookie jar: the path is the third field.
   awk '$6 == "t3setup" && $3 == "/__setup" { found = 1 } END { exit !found }' "$ONE_JAR" || return 1
   [ "$(curl -fsS --noproxy '*' --max-time 20 -b "$ONE_JAR" -H 'accept: application/json' \
@@ -1279,8 +1291,32 @@ one_url_survives_restart() {
   retry 15 "[ \"\$(one_public_url)\" = 'http://127.0.0.1:8080 saved' ]"
 }
 check "and it survives a restart" one_url_survives_restart
+# The status read above already used the cookie from before the restart; the
+# file and the log say why.
+check "the setup key is the same after a restart" \
+  "[ \"\$(docker exec ${NAME}-one cat $ONE_KEY_FILE)\" = \"\$ONE_KEY\" ] && output_has 'docker logs ${NAME}-one' 'the setup key kept on the volume is'"
 check "clearing it goes back to the platform's" \
   "one_set_url '{}' /clear >/dev/null && [ \"\$(one_public_url)\" = '${ONE_PLATFORM_URL} platform' ]"
+
+# Replacing the key: the old one stops working at once, the browser that asked
+# stays signed in on a cookie for the new one, the volume holds it, and
+# t3-expose (which reads the file) follows it.
+one_status_code() { curl -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' -H 'accept: application/json' "$@" "${ONE_URL}/__setup/status"; }
+one_replaces_key() {
+  local answer new
+  answer="$(curl -sS --noproxy '*' --max-time 10 -b "$ONE_JAR" -c "$ONE_JAR" -H 'content-type: application/json' \
+    -d '{}' "${ONE_URL}/__setup/setup-key/replace")" || return 1
+  new="$(jq -r '.key // empty' <<<"$answer")"
+  [ -n "$new" ] && [ "$new" != "$ONE_KEY" ] || return 1
+  [ "$(docker exec "${NAME}-one" cat "$ONE_KEY_FILE")" = "$new" ] || return 1
+  [ "$(one_status_code -b "$ONE_JAR")" = 200 ] || return 1
+  [ "$(one_status_code -H "x-t3-setup-key: ${ONE_KEY}")" = 401 ] || return 1
+  [ "$(one_status_code -H "x-t3-setup-key: ${new}")" = 200 ] || return 1
+  ONE_KEY="$new"
+}
+check "the setup page replaces the key: the old one stops working, the browser stays in" one_replaces_key
+check "and t3-expose follows the new key" \
+  "output_has 'docker exec ${NAME}-one t3-expose' 'PORT\\|Nothing is listening'"
 docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
 
 # A port the router cannot serve must stop the container with the reason, not

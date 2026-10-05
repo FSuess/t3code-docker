@@ -449,8 +449,9 @@
       ? html`<button class="${cx('tc-btn tc-btn--icon', opts.ghost !== false && 'tc-btn--ghost', size)}" type="button" data-cmd="copy" data-text="${text}" aria-label="${label}">${icon('copy')}</button>`
       : html`<button class="${cx('tc-btn', opts.ghost !== false && 'tc-btn--ghost', size)}" type="button" data-cmd="copy" data-text="${text}">${icon('copy')}<span data-label>${label || 'Copy'}</span></button>`;
   };
-  const copyField = (value, { code, actions, label } = {}) => html`
-    <div class="${cx('tc-copyfield', code && 'tc-copyfield--code')}"><span class="tc-copyfield-value">${value}</span><span class="tc-copyfield-actions">${actions || copyButton(value, label)}</span></div>`;
+  // `wrap` shows a long value whole, over several lines, rather than cut short.
+  const copyField = (value, { code, actions, label, wrap } = {}) => html`
+    <div class="${cx('tc-copyfield', code && 'tc-copyfield--code')}"${wrap ? raw(' data-wrap') : ''}><span class="tc-copyfield-value">${value}</span><span class="tc-copyfield-actions">${actions || copyButton(value, label)}</span></div>`;
   /**
    * qrencode's SVG, minus its XML prolog and the root's size in centimetres,
    * so the stylesheet sizes it. Only the root tag is touched: every module is
@@ -607,7 +608,7 @@
       'harness.installed': 'download', 'harness.uninstalled': 'trash-2', 'harness.failed': 'circle-alert', 'harness.enabled': 'circle-check', 'signin.ok': 'log-in', 'setup.finished': 'download',
       'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
       'package.installed': 'download', 'package.updated': 'circle-arrow-up', 'package.uninstalled': 'trash-2', 'package.failed': 'circle-alert',
-      'url.set': 'globe', 'url.cleared': 'globe',
+      'url.set': 'globe', 'url.cleared': 'globe', 'key.replaced': 'key-round',
     };
     return section('recent-title', 'Recent', html`<div class="tc-group"><ol class="tc-log">${events.slice(0, 8).map((e) => html`
       <li data-key="ev-${e.at}-${e.kind}">${icon(ICONS[e.kind] || 'activity')}<span class="tc-truncate">${e.text}${e.detail ? html` <span class="tc-mono">${e.detail}</span>` : ''}</span><time datetime="${new Date(e.at).toISOString()}" title="${M.absTime(e.at)}">${M.relTime(e.at, n)}</time></li>`)}</ol></div>`,
@@ -982,6 +983,31 @@
   const kindText = (kind) => kind === 'durable' ? 'Durable volume' : kind === 'anonymous' ? 'Anonymous volume, lost when the container is removed'
     : kind === 'none' ? 'Inside the container, lost when it is removed' : null;
 
+  // ------------------------------------------------------------- setup key --
+  // The key itself is fetched only when someone asks to see it, never with
+  // /status: status is polled, and copied whole into diagnostics.
+  const keyView = { value: null };
+  const KEY_STATES = {
+    env: { text: html`Set with <code>T3_SETUP_KEY</code> in the container’s settings.`, badge: 'Pinned', tone: 'ok' },
+    volume: { text: 'Generated on the first start and kept on the volume, so it stays the same across restarts and recreates.', badge: 'Kept', tone: 'ok' },
+    boot: { text: html`Generated at boot, and the volume could not keep it, so it changes on every start. Set <code>T3_SETUP_KEY</code> to keep one.`, badge: 'Changes on restart', tone: 'warn' },
+  };
+  const keyRow = (source) => {
+    const view = KEY_STATES[source] || KEY_STATES.env;
+    return html`<div class="tc-row tc-row--compact tc-row--plain" data-key="setup-key">
+      <div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">Setup key</span><span class="tc-badge tc-badge--${view.tone}">${view.badge}</span></div>
+        <span class="tc-status tc-status--prose">${view.text}</span>
+        ${keyView.value ? html`<div class="tc-key-field">${copyField(keyView.value, { label: 'Copy', wrap: true })}</div>` : ''}
+      </div>
+      <div class="tc-row-actions tc-row-actions--wrap">
+        ${keyView.value
+          ? html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="key.hide">${icon('eye-off')}Hide</button>`
+          : html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="key.show">${icon('eye')}Show</button>`}
+        ${source === 'env' ? '' : html`<button class="tc-btn tc-btn--sm" type="button" data-cmd="key.replace">${icon('refresh-cw')}New key</button>`}
+      </div>
+    </div>`;
+  };
+
   const environmentPage = (s, n) => {
     const server = s.server || {};
     const image = s.image || {};
@@ -1020,9 +1046,7 @@
         ${s.browser.devtoolsMcp ? html`<dt>Chrome DevTools MCP</dt><dd><span class="tc-mono tc-mono--body">${s.browser.devtoolsMcp}</span></dd>` : ''}
       </dl></div>`, { actions: muted('Wired into Claude Code, Codex and OpenCode') }) : ''}
       ${section('ev-console', 'This console', html`<div class="tc-group"><div class="tc-list">
-        ${keySource ? html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Setup key</span><span class="tc-status tc-status--prose">${keySource === 'generated'
-          ? html`Generated at boot, so it changes when the container is recreated. Set <code>T3_SETUP_KEY</code> to keep it.`
-          : html`Pinned with <code>T3_SETUP_KEY</code>, so it survives a recreate.`}</span></div>${keySource === 'generated' ? html`<span class="tc-badge tc-badge--warn">Not pinned</span>` : html`<span class="tc-badge tc-badge--ok">Pinned</span>`}</div>` : ''}
+        ${keySource ? keyRow(keySource) : ''}
         ${viaT3(s)
           ? html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Signed in through T3 Code</span><span class="tc-status tc-status--prose">This browser is paired with T3 Code, which already gives it a terminal here, so the console did not ask for the key. Revoking the device under Devices ends both.</span></div></div>`
           : html`<div class="tc-row tc-row--compact tc-row--plain"><div class="tc-row-main"><span class="tc-row-name">Lock console</span><span class="tc-status">Ends this browser’s session. You will need the setup key to come back.</span></div><button class="tc-btn tc-btn--sm" type="button" data-cmd="lock">${icon('lock')}Lock</button></div>`}
@@ -2327,6 +2351,37 @@
       if (!res.ok && res.error) Kit.toast('Could not set the public URL', { tone: 'danger', detail: res.error });
     },
     'url.edit': (a, el) => openUrlSheet(el),
+
+    'key.show': async () => {
+      if (state.route !== 'environment') go('environment');
+      const res = await api('/setup-key/reveal', { body: {} });
+      if (!res.ok) { Kit.toast('Could not read the setup key', { tone: 'danger', detail: res.error }); return; }
+      keyView.value = res.data.key;
+      render();
+    },
+    'key.hide': () => { keyView.value = null; render(); },
+    'key.replace': async () => {
+      if (state.route !== 'environment') go('environment');
+      const t3Session = viaT3(state.status);
+      const ok = await Kit.confirm({
+        title: 'Replace the setup key?',
+        body: 'A new key is generated and kept on the volume, and the current one stops working at once.',
+        consequences: [
+          { icon: 'log-out', text: 'Browsers signed in with the current key are signed out, and need the new one.' },
+          { icon: 'check', text: t3Session ? 'This browser stays in, through its T3 Code session.' : 'This browser stays signed in.' },
+          { icon: 'terminal', text: 't3-expose in the container picks the new key up by itself.' },
+        ],
+        confirm: 'Replace key',
+      });
+      if (!ok) return;
+      const res = await api('/setup-key/replace', { body: {} });
+      if (!res.ok) { Kit.toast('Could not replace the setup key', { tone: 'danger', detail: res.error }); return; }
+      // Shown at once: the old key must not stay on screen while status reloads.
+      keyView.value = res.data.key;
+      render();
+      Kit.toast('Setup key replaced', { detail: 'Copy the new one now: it is the key the setup page asks for from here on.' });
+      await loadStatus();
+    },
 
     'pair.start': () => {
       if (state.route !== 'devices') go('devices');

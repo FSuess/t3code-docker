@@ -98,7 +98,7 @@ instead of building, set `T3_IMAGE` in `.env` and drop `--build`.
 On first start, the container installs the default agents and toolchains onto
 the `/home/t3` volume in the background. This takes a few minutes, and the
 setup page shows the progress. In the meantime, open the setup page on port
-**3774**, enter your `T3_SETUP_KEY`, and press **Create pairing link**. Scan the
+**3774**, enter the setup key, and press **Create pairing link**. Scan the
 QR code with the T3 Code app, or open the link in a browser.
 
 Then sign each agent in on the setup page's **Agents** page, and turn its
@@ -144,15 +144,25 @@ does what T3 Code can't do before you're connected to it, pairing your first
 device, and it also signs agents in, installs and updates agents and tools, and
 publishes ports. None of this needs a shell in the container or a restart.
 
-Set a key for it when you create the container:
+It's guarded by a setup key. Leave `T3_SETUP_KEY` empty and the first start
+generates one and keeps it on the volume (`/home/t3/.t3/setup-key`), so it stays
+the same across restarts, redeploys and recreates. Every start prints it to the
+log, on the line after the one that names `T3_SETUP_KEY`:
+
+```bash
+docker compose logs t3code | grep -A1 T3_SETUP_KEY
+```
+
+Or choose your own when you create the container:
 
 ```
 T3_SETUP_KEY=<something long>
 ```
 
-If `T3_SETUP_KEY` is empty, a key is generated at startup and printed to the
-log. Setting it yourself keeps it the same when the container is recreated.
-Open port 3774 and enter the key.
+Open port 3774 and enter the key. **Environment → This console** shows the key
+to a signed-in browser, and **New key** replaces a generated one. That signs
+out every browser that used the old key, and keeps the one you're using
+signed in. A key set with `T3_SETUP_KEY` can only be changed there.
 
 **Overview** lists what's left before a phone can use the server: the server
 running, a [public URL](#the-public-url) set, a device paired, and the agents signed in, with a
@@ -405,7 +415,8 @@ option.
 
 **Treat the setup key like a password.** It can do everything a pairing link
 can, and it can create new links. `compose.yaml` binds the port to loopback;
-only publish it as far as you need to. A browser already paired with T3 Code
+only publish it as far as you need to. If it leaks, replace it under
+**Environment**, or change `T3_SETUP_KEY` if you set one. A browser already paired with T3 Code
 doesn't need the key (see [Opening it from T3 Code](#opening-it-from-t3-code)).
 
 ## Connecting a phone
@@ -727,7 +738,7 @@ Environment variables (all optional except where noted):
 | `T3_PREINSTALL` | `default` | What the first start installs onto the volume: `default` (Claude Code, Codex, OpenCode and the toolchains), `all`, `agents`, `toolchains`, ids like `claude,go`, or `none` |
 | `T3_PAIR_TTL` | `30d` | How long links from `t3-pair` can be used |
 | `T3_SETUP_ENABLED` | `1` | Run the setup page |
-| `T3_SETUP_KEY` | *(generated)* | Password for the setup page. Set it to keep it the same across recreates. |
+| `T3_SETUP_KEY` | *(generated)* | Password for the setup page. Without it, the first start generates one and keeps it on the volume, and the setup page can show and replace it. |
 | `T3_SETUP_PORT` | `3774` | Setup page port inside the container |
 | `T3_SETUP_BASE_PATH` | — | Serve the setup page under a path, such as `/__setup` |
 | `T3_SINGLE_PORT` | — | Also serve T3 Code and the setup page together on this port, the setup page under `/__setup`, for a tunnel, proxy or hosting platform that routes one port. See [Exposing it through one hostname](#exposing-it-through-one-hostname). |

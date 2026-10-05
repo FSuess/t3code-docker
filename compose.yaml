@@ -32,7 +32,8 @@ services:
       # be marked sensitive - not in a variable every process here inherits.
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       # Password for the setup UI on port 3774, which mints pairing links on
-      # demand. Leave empty and one is generated at boot and printed to the log.
+      # demand. Leave empty and the first start generates one, keeps it on the
+      # volume, and prints it to the log on every start.
       T3_SETUP_KEY: ${T3_SETUP_KEY:-}
       T3_SETUP_ENABLED: ${T3_SETUP_ENABLED:-1}
       # Serve the setup UI under a path prefix, so one public hostname can

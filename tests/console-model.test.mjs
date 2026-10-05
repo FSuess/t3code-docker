@@ -330,6 +330,12 @@ test("the palette sets or changes the public URL, unless T3_PUBLIC_URL pins it",
   assert.equal(find(statusWith({ publicUrlSource: "env" }), "Change public URL"), undefined);
 });
 
+test("the palette shows the setup key, and replaces it unless T3_SETUP_KEY sets it", () => {
+  const labels = (s) => plain(M.paletteItems(s, null, ui(), NOW)).filter((item) => /setup key/.test(item.label)).map((item) => `${item.label} -> ${item.cmd.cmd}`);
+  assert.deepEqual(labels(statusWith({ setupKeySource: "volume" })), ["Show setup key -> key.show", "Replace setup key -> key.replace"]);
+  assert.deepEqual(labels(statusWith({ setupKeySource: "env" })), ["Show setup key -> key.show"]);
+});
+
 test("a later step that needs the user is a warning, not a second todo", () => {
   const s = statusWith({ sessions: [], harnesses: [harness("grok", { signedIn: false }), harness("cursor", { signedIn: false })] });
   const r = M.readiness(s, ui());
