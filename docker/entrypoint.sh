@@ -30,6 +30,9 @@ T3_HOME=/home/t3
 : "${T3_SETUP_ENABLED:=1}"
 : "${T3_SETUP_PORT:=3774}"
 : "${T3_SINGLE_PORT:=}"
+# Where docker/run-t3.sh keeps T3 Code's pid and takes restart requests from
+# the setup page. Runtime only: nothing here outlives the container.
+: "${T3_RUN_DIR:=/tmp/t3code}"
 : "${T3_PERSIST_AGENT_CREDENTIALS:=1}"
 : "${T3_PREINSTALL:=default}"
 # The image's own runtimes. T3 runs as the root-owned platform binary; setup
@@ -41,7 +44,7 @@ T3_HOME=/home/t3
 # Provider integration: maps the harness manager's selection onto T3's
 # per-provider `binaryPath`.
 : "${T3_PROVIDER_CLI:=/opt/t3-provider/cli.mjs}"
-export T3CODE_HOME T3CODE_HOST T3CODE_PORT T3_WORKSPACE T3_SETUP_PORT T3_SINGLE_PORT
+export T3CODE_HOME T3CODE_HOST T3CODE_PORT T3_WORKSPACE T3_SETUP_PORT T3_SINGLE_PORT T3_RUN_DIR
 export T3_INFRA_NODE T3_INFRA_BINARY T3_INFRA_LAUNCHER T3_PROVIDER_CLI T3_PREINSTALL
 
 # Ownership migration is recorded here before anything else changes. The state
@@ -479,7 +482,10 @@ fi
 log "note: the token in the server banner below expires in 5 minutes and is"
 log "      addressed to this container - use t3-pair for a link that lasts"
 
-exec "$T3_INFRA_LAUNCHER" serve \
+# Under docker/run-t3.sh rather than in this shell's place, so the setup page
+# can restart it: T3 Connect's link, for one, takes effect on a start. T3 Code
+# exiting on its own still ends the container, with its status, as before.
+exec /usr/local/lib/t3code/run-t3.sh "$T3_INFRA_LAUNCHER" serve \
   --host "$T3CODE_HOST" \
   --port "$T3CODE_PORT" \
   "$@" \

@@ -23,7 +23,7 @@ jobs:
       - name: Shell scripts parse and pass shellcheck
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          for f in docker/entrypoint.sh docker/bin/* scripts/*.sh scripts/lib/*.sh tests/*.test.sh; do
+          for f in docker/entrypoint.sh docker/run-t3.sh docker/bin/* scripts/*.sh scripts/lib/*.sh tests/*.test.sh; do
             bash -n "$f"
             shellcheck -S warning "$f"
           done
@@ -32,6 +32,7 @@ jobs:
           shellcheck -s sh -S warning docker/user-env.sh
           bash tests/image-profile.test.sh
           bash tests/user-env.test.sh
+          bash tests/run-t3.test.sh
           for f in docker/setup/app.js docker/setup/client/*.js docker/setup/design/ui.js docker/router/*.mjs; do
             node --check "$f"
           done

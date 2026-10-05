@@ -260,6 +260,9 @@ RUN set -eux; \
 # installs mise-managed executables into the persistent home at runtime.
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+# T3 Code's supervisor: restarts it when the setup page asks, and otherwise
+# ends the container when it exits, as `exec` did.
+COPY docker/run-t3.sh /usr/local/lib/t3code/run-t3.sh
 COPY docker/bin/ /usr/local/bin/
 # Plain ESM modules shared by the setup service, the entrypoint and the shell
 # helpers: the harness manager owns install/resolve, and the provider
@@ -281,7 +284,7 @@ RUN "$T3_INFRA_NODE" /usr/local/share/t3-client/patch.mjs
 # `t3` is the same immutable launcher under its user-facing name, for root's
 # shell and anyone typing it. Nothing in the image resolves it by name: the
 # entrypoint, the setup service and the helpers all use T3_INFRA_LAUNCHER.
-RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/t3-* \
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/lib/t3code/run-t3.sh /usr/local/bin/t3-* \
     && ln -sfn t3-admin /usr/local/bin/t3
 
 # The agent names, for `docker exec <container> claude` and friends: links to
