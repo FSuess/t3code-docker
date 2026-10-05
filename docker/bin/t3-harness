@@ -10,13 +10,15 @@
 #
 #   t3-harness list [--json]
 #   t3-harness toolchains [--json]
+#   t3-harness source-control [--json]
 #   t3-harness status [--json] [id]
 #   t3-harness install <id> [--version <v>] [--json]
 #   t3-harness update <id> [--version <v>] [--json]
 #   t3-harness uninstall <id> [--json]
 #
 # Agent ids: claude, codex, opencode, grok, cursor. Toolchain ids: go, rust,
-# bun, deno, uv. Install defaults to mise's latest and records that exact
+# bun, deno, uv. Source control CLIs: glab, fj, tea, az (and gh, which is
+# part of the image and only listed). Install defaults to mise's latest and records that exact
 # version; update is always explicit. Uninstalling an agent removes the managed
 # selection and executables but preserves credentials.
 #
@@ -52,6 +54,7 @@ Usage: t3-harness <command> [options]
 
   list [--json]                 the five agents
   toolchains [--json]           Go, Rust, Bun, Deno, uv
+  source-control [--json]       gh, glab, fj, tea, az, and who each is signed in as
   packages [--json]             every other tool in the global mise config
   status [--json] [id]
   install <id> [--version <version>] [--json]
@@ -59,7 +62,8 @@ Usage: t3-harness <command> [options]
   uninstall <id> [--json]
 
   id is an agent (claude, codex, opencode, grok, cursor), a toolchain
-  (go, rust, bun, deno, uv), or any other mise tool, which is managed as an
+  (go, rust, bun, deno, uv), a source control CLI (glab, fj, tea, az; gh comes
+  with the image), or any other mise tool, which is managed as an
   added tool: a registry name (ripgrep, kubectl) or a backend spec
   (npm:prettier, github:owner/repo). --version applies to agents, and to
   installing an added tool, where a prefix (3.12) takes the newest under it.
@@ -100,11 +104,11 @@ done
 if [ ${#pos[@]} -gt 0 ]; then set -- "${pos[@]}"; else set --; fi
 
 case "$command" in
-  list|toolchains|packages|status|install|update|uninstall) ;;
+  list|toolchains|source-control|packages|status|install|update|uninstall) ;;
   *) printf 't3-harness: unknown command %s\n\n' "$command" >&2; usage >&2; exit 2 ;;
 esac
 
-if { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "packages" ]; } && [ $# -gt 0 ]; then
+if { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "source-control" ] || [ "$command" = "packages" ]; } && [ $# -gt 0 ]; then
   printf 't3-harness: %s takes no id\n\n' "$command" >&2; usage >&2; exit 2
 fi
 if { [ "$command" = "install" ] || [ "$command" = "update" ] || [ "$command" = "uninstall" ]; } \
@@ -120,7 +124,7 @@ fi
 if [ $# -eq 1 ] && [ "${1#-}" != "$1" ]; then
   printf 't3-harness: %s is not a tool name\n\n' "$1" >&2; usage >&2; exit 2
 fi
-if [ -n "$version" ] && { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "packages" ] || [ "$command" = "status" ] || [ "$command" = "uninstall" ]; }; then
+if [ -n "$version" ] && { [ "$command" = "list" ] || [ "$command" = "toolchains" ] || [ "$command" = "source-control" ] || [ "$command" = "packages" ] || [ "$command" = "status" ] || [ "$command" = "uninstall" ]; }; then
   printf 't3-harness: --version only applies to install and update\n\n' >&2; usage >&2; exit 2
 fi
 
@@ -165,17 +169,53 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
 
   const TOOLCHAIN_IDS = ["go", "rust", "bun", "deno", "uv"];
   const AGENT_IDS = ["claude", "codex", "opencode", "grok", "cursor"];
-  const isPackage = (id) => Boolean(id) && !TOOLCHAIN_IDS.includes(id) && !AGENT_IDS.includes(id);
+  const SCM_IDS = ["gh", "glab", "fj", "tea", "az"];
+  const isPackage = (id) => Boolean(id) && !TOOLCHAIN_IDS.includes(id) && !AGENT_IDS.includes(id) && !SCM_IDS.includes(id);
   const packageRow = (p) => `${p.id}\t${p.version ?? "-"}\t${p.inProgress ? `${p.operation ?? "working"}…`
     : p.failed ? `failed: ${p.failure ?? "unknown error"}` : p.installed ? (p.adopted ? "installed (added with mise use)" : "installed") : "not installed"}`;
   const toolRow = (t) => `${t.id}\t${t.version ?? "-"}\t${t.inProgress ? `${t.operation ?? "working"}…`
     : t.installed ? "installed" : t.failed ? `failed: ${t.failure ?? "unknown error"}` : "not installed"}`;
+  const signIn = (a) => !a ? "" : a.status === "authenticated"
+    ? `signed in${a.account ? ` as ${a.account}` : ""}${a.host ? ` on ${a.host}` : ""}`
+    : a.status === "unauthenticated" ? `not signed in${a.detail ? ` (${a.detail})` : ""}` : "sign-in unknown";
+  const scmRow = (c) => `${c.id}\t${c.version ?? "-"}\t${c.provider}\t${c.inProgress ? `${c.operation ?? "working"}…`
+    : c.installed ? [c.inImage ? "in the image" : "installed", signIn(c.auth),
+      c.missingExtensions?.length ? `missing extension ${c.missingExtensions.join(", ")}` : ""].filter(Boolean).join("; ")
+    : c.failed ? `failed: ${c.failure ?? "unknown error"}` : "not installed"}`;
 
   try {
     if (command === "toolchains") {
       const { toolchains, degraded } = await manager.toolchains.status();
       if (wantJson) process.stdout.write(JSON.stringify({ toolchains, degraded }, null, 2) + "\n");
       else for (const t of toolchains) process.stdout.write(toolRow(t) + "\n");
+      return;
+    }
+    if (command === "source-control") {
+      const { sourceControl, degraded } = await manager.sourceControl.status();
+      if (wantJson) process.stdout.write(JSON.stringify({ sourceControl, degraded }, null, 2) + "\n");
+      else for (const c of sourceControl) process.stdout.write(scmRow(c) + "\n");
+      return;
+    }
+    if (SCM_IDS.includes(arg)) {
+      if (command === "status") {
+        const cli = await manager.sourceControl.resolve(arg);
+        if (wantJson) process.stdout.write(JSON.stringify({ sourceControl: cli }, null, 2) + "\n");
+        else process.stdout.write(scmRow(cli) + "\n");
+        return;
+      }
+      if (arg === "gh") {
+        process.stderr.write("t3-harness: gh is part of the image; pulling a newer image updates it\n");
+        process.exit(2);
+      }
+      if (version) {
+        process.stderr.write("t3-harness: source control CLIs always install the latest release; --version applies to agents\n");
+        process.exit(2);
+      }
+      const result = await manager.sourceControl[command](arg);
+      if (wantJson) process.stdout.write(JSON.stringify(result, null, 2) + "\n");
+      else if (result?.ok) process.stdout.write(`${command} ${arg}: ok${result.toolchain?.version ? ` (${result.toolchain.version})` : ""}\n`);
+      else process.stderr.write(`t3-harness: ${command} ${arg} failed [${result?.code ?? "failed"}]: ${result?.error ?? "unknown error"}\n`);
+      if (!result?.ok) process.exit(1);
       return;
     }
     if (command === "packages") {
