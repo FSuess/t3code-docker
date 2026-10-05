@@ -320,20 +320,54 @@ affect your threads, projects or provider sign-ins.
 
 ### Exposing it through one hostname
 
-Two ports normally mean two public hostnames. To use one, route by path. The
-setup page works under any path prefix without configuration, because each
-request carries the prefix. With Cloudflare Tunnel, add two public hostname
-entries for the same domain:
+Two ports normally mean two public hostnames. The simplest way to need only
+one is `T3_SINGLE_PORT`. The container then also listens on that port and
+serves both there: T3 Code at the root, and the setup page at `/__setup`.
+Point your tunnel, reverse proxy or hosting platform at that port alone:
+
+```yaml
+    environment:
+      T3_SINGLE_PORT: 8080
+    ports:
+      - "127.0.0.1:8080:8080"   # instead of the 3773 and 3774 lines
+```
+
+With Cloudflare Tunnel that is one public hostname entry, `t3.example.com` to
+`http://127.0.0.1:8080`. The setup page is then at
+`https://t3.example.com/__setup`, and T3 Code's Settings find it there without
+any configuration.
+
+What to expect from it:
+
+- WebSockets, streamed responses and large uploads pass straight through.
+  Nothing is buffered or rewritten.
+- While T3 Code starts or restarts, a browser gets a short page that says so
+  and opens T3 Code once it answers. Anything else gets a `503` with
+  `Retry-After`.
+- It adds the visitor's address to `X-Forwarded-For`, and keeps the
+  `X-Forwarded-Proto` and `X-Forwarded-Host` that a proxy in front of it set.
+  The setup page counts wrong keys per visitor from that address.
+- Ports 3773 and 3774 still answer inside the container, so `t3-pair`,
+  `t3-expose` and anything else that talks to them keep working.
+- The Docker healthcheck asks through the one port, so the container reports
+  unhealthy if that port stops answering.
+- A port it can't serve, such as T3 Code's own 3773, stops the container at
+  start with a message saying what to change.
+
+If you'd rather route by path in your own proxy, that works too. The setup page
+works under any path prefix without configuration, because each request
+carries the prefix. With Cloudflare Tunnel, add two public hostname entries for
+the same domain:
 
 | Hostname | Path | Service |
 | --- | --- | --- |
 | `t3.example.com` | `__setup*` | `http://127.0.0.1:3774` |
 | `t3.example.com` | *(none)* | `http://127.0.0.1:3773` |
 
-The more specific path rule must come first. The setup page is then at
-`https://t3.example.com/__setup`, and T3 Code stays at the root.
-`T3_SETUP_BASE_PATH` is only needed to pin the prefix and reject every other
-path.
+The more specific path rule must come first. `T3_SETUP_BASE_PATH` is only
+needed to pin the prefix and reject every other path. With `T3_SINGLE_PORT`, it
+also moves the setup page to that prefix on the one port. T3 Code's Settings
+only look for it at `/__setup` and `/setup`.
 
 A separate hostname works just as well. Keeping the setup page off the public
 internet entirely, reachable only over your LAN or tailnet, is the safest
@@ -666,6 +700,7 @@ Environment variables (all optional except where noted):
 | `T3_SETUP_KEY` | *(generated)* | Password for the setup page. Set it to keep it the same across recreates. |
 | `T3_SETUP_PORT` | `3774` | Setup page port inside the container |
 | `T3_SETUP_BASE_PATH` | — | Serve the setup page under a path, such as `/__setup` |
+| `T3_SINGLE_PORT` | — | Also serve T3 Code and the setup page together on this port, the setup page under `/__setup`, for a tunnel, proxy or hosting platform that routes one port. See [Exposing it through one hostname](#exposing-it-through-one-hostname). |
 | `T3_SETUP_ACCEPT_T3_SESSIONS` | `1` | Let a browser signed in to T3 Code with terminal access open the setup page without the key. `0` always asks for the key. |
 | `T3_ALLOW_SUDO` | `0` | Give agents passwordless sudo in the container |
 | `DEEPSEEK_API_KEY` | — | Used by the DeepSeek-through-OpenCode example |
@@ -734,8 +769,9 @@ the only boundary. Keep in mind:
 - **Pairing links are credentials.** They carry a bearer token in the URL
   fragment. Serve over HTTPS, keep `--ttl` short, and revoke links or sessions
   with `t3 auth pairing revoke <id>` and `t3 auth session revoke <id>`.
-- **Don't publish port 3773 to the internet.** `compose.yaml` binds it to
-  loopback for that reason. Put TLS in front of it, or use a tunnel.
+- **Don't publish port 3773, or `T3_SINGLE_PORT`, to the internet unencrypted.**
+  `compose.yaml` binds its ports to loopback for that reason. Put TLS in front,
+  or use a tunnel.
 - **A paired browser can open the setup page without the key**, when both are
   on one hostname. T3 Code already gives that browser a terminal, which can
   read the key. `T3_SETUP_ACCEPT_T3_SESSIONS=0` turns this off.
@@ -794,11 +830,12 @@ Issues and pull requests are welcome. Before opening one:
   lifecycle test runs on amd64 for every build.
 - **To work on the setup page or what it adds to T3 Code's pages**, run
   `node scripts/dev-console.mjs` inside a container from this image. It starts
-  a scratch T3 Code and the setup page from your working tree behind one
-  origin, as a tunnel would. It restarts the setup page as you edit, serves
-  T3 Code's pages with your copy of `docker/t3-client/setup-bridge.js`, and
-  prints a pairing link. `scripts/setup-bridge-audit.js` checks those pages
-  in a browser.
+  a scratch T3 Code and the setup page from your working tree behind the
+  image's one-port router, as `T3_SINGLE_PORT` would. It restarts the setup
+  page as you edit, serves T3 Code's pages with your copy of
+  `docker/t3-client/setup-bridge.js`, and prints a pairing link.
+  `scripts/setup-bridge-audit.js` checks those pages in a browser, through the
+  same router.
 
 Releases are made from tags. Pushing `vX.Y.Z` builds each image for each
 architecture, tests each one against the exact digest that was pushed, runs the

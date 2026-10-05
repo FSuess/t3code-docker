@@ -71,7 +71,9 @@ if [ -z "$UI_AUDIT_LOG" ]; then
   UI_AUDIT_LOG_CREATED=1
 fi
 cleanup() {
-  docker rm -f "$NAME" "${NAME}-mount" "${NAME}-boot" "${NAME}-anon" "${NAME}-env" >/dev/null 2>&1 || true
+  docker rm -f "$NAME" "${NAME}-mount" "${NAME}-boot" "${NAME}-anon" "${NAME}-env" \
+    "${NAME}-one" "${NAME}-badport" >/dev/null 2>&1 || true
+  rm -f "${ONE_JAR:-}" 2>/dev/null || true
   rm -f "$PAGE_HTML" 2>/dev/null || true
   [ -n "$SETUP_COPY" ] && rm -rf "$SETUP_COPY" 2>/dev/null || true
   [ "${UI_AUDIT_LOG_CREATED:-0}" = 1 ] && rm -f "$UI_AUDIT_LOG" 2>/dev/null || true
@@ -1141,6 +1143,105 @@ setup_stayed_up() {
 }
 check "the setup service did not crash-loop" setup_stayed_up
 rm -f "$SETUP_JAR"
+
+# T3_SINGLE_PORT: one listener in front of both services, the way a hosting
+# platform or a single-upstream tunnel reaches them. Every check below goes
+# through it from the host, as a visitor would: T3's health and its pages, the
+# setup page under its prefix with a session cookie scoped there, and T3's
+# WebSocket opened with a session.
+printf '\nOne port\n'
+ONE_PORT="${SMOKE_ONE_PORT:-13780}"
+ONE_URL="http://127.0.0.1:${ONE_PORT}"
+ONE_JAR="$(mktemp)"
+docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
+docker run -d --name "${NAME}-one" -e T3_PREINSTALL=none \
+  -e T3_SINGLE_PORT=8080 -e "T3_SETUP_KEY=${SETUP_KEY}" -e "T3_PUBLIC_URL=${PUBLIC_URL}" \
+  -p "127.0.0.1:${ONE_PORT}:8080" "$IMAGE" >/dev/null
+one_up=0
+for _ in $(seq 1 40); do
+  if curl -fsS --noproxy '*' --max-time 3 "${ONE_URL}/.well-known/t3/environment" >/dev/null 2>&1; then
+    one_up=1
+    break
+  fi
+  [ "$(docker inspect -f '{{.State.Running}}' "${NAME}-one" 2>/dev/null)" = true ] || break
+  sleep 3
+done
+if [ "$one_up" = 1 ]; then
+  ok "T3 Code answers through the one port"
+else
+  no "T3 Code answers through the one port"
+  docker logs "${NAME}-one" 2>&1 | tail -15
+fi
+
+# Captured rather than piped into `grep -q`, for the reason given at
+# page_says_mount below: grep exiting early kills curl under pipefail.
+one_serves_t3_shell() {
+  local page
+  page="$(curl -fsS --noproxy '*' --max-time 10 -H 'accept: text/html' "${ONE_URL}/")" || return 1
+  case "$page" in *'data-t3-setup-bridge'*) return 0 ;; *) return 1 ;; esac
+}
+check "T3 Code's pages come through it, setup bridge included" one_serves_t3_shell
+check "the setup page answers under /__setup on it" \
+  "retry 10 \"curl -fsS --noproxy '*' --max-time 5 ${ONE_URL}/__setup/hello | grep -q '\\\"service\\\":\\\"t3-setup\\\"'\""
+one_signs_in() {
+  curl -sS --noproxy '*' --max-time 10 -c "$ONE_JAR" -d "key=${SETUP_KEY}" -o /dev/null "${ONE_URL}/__setup/login" || return 1
+  # Netscape cookie jar: the path is the third field.
+  awk '$6 == "t3setup" && $3 == "/__setup" { found = 1 } END { exit !found }' "$ONE_JAR" || return 1
+  [ "$(curl -fsS --noproxy '*' --max-time 20 -b "$ONE_JAR" -H 'accept: application/json' \
+       "${ONE_URL}/__setup/status" | jq -r '.singlePort.port')" = 8080 ]
+}
+check "and signs in there, its cookie scoped to /__setup, and says it is on one port" \
+  "retry 5 one_signs_in"
+one_opens_websocket() {
+  docker exec "${NAME}-one" node -e '
+    const { execFileSync } = require("node:child_process");
+    const out = execFileSync("t3", ["auth", "session", "issue", "--ttl", "5m", "--label", "smoke", "--subject", "smoke-one-port", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const { token } = JSON.parse(out.slice(out.indexOf("{")));
+    const ws = new WebSocket("ws://127.0.0.1:8080/ws", { headers: { authorization: `Bearer ${token}` } });
+    const timer = setTimeout(() => process.exit(2), 10000);
+    ws.addEventListener("open", () => ws.send(JSON.stringify({ _tag: "Ping" })));
+    ws.addEventListener("message", (event) => {
+      if (String(event.data).includes("Pong")) { clearTimeout(timer); ws.close(); process.exit(0); }
+    });
+    ws.addEventListener("error", () => process.exit(1));
+  '
+}
+check "T3's WebSocket opens through it with a session, and answers" one_opens_websocket
+check "ports 3773 and 3774 still answer inside the container" \
+  "docker exec ${NAME}-one sh -c 'curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:3773/.well-known/t3/environment && curl -fsS --max-time 5 -o /dev/null http://127.0.0.1:3774/hello'"
+check "t3-expose will not publish the one port, and says why" \
+  "output_has 'docker exec ${NAME}-one t3-expose 8080' 'belongs to T3 Code'"
+check "t3-doctor checks the one port" \
+  "output_has 'docker exec ${NAME}-one t3-doctor' 'reaches T3 Code'"
+check "the log says where everything is" \
+  "output_has 'docker logs ${NAME}-one' 'listening on .*:8080: T3 Code (port 3773) at /, the setup page (port 3774) at /__setup'"
+# Asked through the one port, so this also proves the router stayed up long
+# enough for Docker to see it.
+one_healthy() {
+  local status=""
+  for _ in $(seq 1 30); do
+    status="$(docker inspect --format '{{.State.Health.Status}}' "${NAME}-one" 2>/dev/null || true)"
+    [ "$status" = healthy ] && return 0
+    [ "$status" = unhealthy ] && return 1
+    sleep 5
+  done
+  return 1
+}
+check "the docker healthcheck asks through it and reports healthy" one_healthy
+check "the router did not crash-loop" "! output_has 'docker logs ${NAME}-one' 'router exited'"
+docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
+
+# A port the router cannot serve must stop the container with the reason, not
+# leave one that starts and answers nothing where it was told to.
+bad_port_is_refused() {
+  local out rc=0
+  docker rm -f "${NAME}-badport" >/dev/null 2>&1 || true
+  out="$(timeout 90 docker run --name "${NAME}-badport" -e T3_PREINSTALL=none -e T3_SINGLE_PORT=3773 "$IMAGE" 2>&1)" || rc=$?
+  docker rm -f "${NAME}-badport" >/dev/null 2>&1 || true
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] || return 1
+  grep -q 'T3_SINGLE_PORT=3773 is the port T3 Code itself listens on' <<<"$out"
+}
+check "an impossible T3_SINGLE_PORT stops the container at start, saying why" bad_port_is_refused
 
 printf '\nStartup pairing link\n'
 docker rm -f "${NAME}-boot" >/dev/null 2>&1 || true

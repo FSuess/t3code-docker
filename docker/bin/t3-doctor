@@ -129,6 +129,9 @@ fi
 printf '  %-22s %s\n' "state dir" "${T3CODE_HOME:-unset}"
 printf '  %-22s %s\n' "bind" "${T3CODE_HOST:-unset}:${T3CODE_PORT:-unset}"
 printf '  %-22s %s\n' "public URL" "${T3_PUBLIC_URL:-<unset - t3-pair will warn>}"
+if [ -n "${T3_SINGLE_PORT:-}" ]; then
+  printf '  %-22s %s\n' "one port" "${T3_SINGLE_PORT} (T3 Code at /, setup page at ${T3_SETUP_BASE_PATH:-/__setup})"
+fi
 printf '  %-22s %s\n' "workspace" "${T3_WORKSPACE:-unset}"
 
 head_ "Server"
@@ -140,6 +143,16 @@ if curl -fsS --max-time 5 \
   rm -f /tmp/.t3-doctor-env
 else
   bad "health" "no response on 127.0.0.1:${T3CODE_PORT:-3773}"
+fi
+# The one port is how everyone else gets in, so ask through it as well: T3 Code
+# answering on its own port says nothing about the router in front of it.
+if [ -n "${T3_SINGLE_PORT:-}" ]; then
+  if curl -fsS --max-time 5 -o /dev/null \
+       "http://127.0.0.1:${T3_SINGLE_PORT}/.well-known/t3/environment" 2>/dev/null; then
+    ok "one port" "127.0.0.1:${T3_SINGLE_PORT} reaches T3 Code"
+  else
+    bad "one port" "no answer from T3 Code through 127.0.0.1:${T3_SINGLE_PORT}"
+  fi
 fi
 
 head_ "Harnesses"

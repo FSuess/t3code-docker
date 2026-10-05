@@ -38,6 +38,10 @@ services:
       # Serve the setup UI under a path prefix, so one public hostname can
       # route e.g. /__setup* here instead of needing a second subdomain.
       T3_SETUP_BASE_PATH: ${T3_SETUP_BASE_PATH:-}
+      # Also serve T3 Code and the setup page together on this one port (the
+      # setup page under /__setup), for a tunnel, proxy or hosting platform
+      # that routes a single port. Publish it in place of the two below.
+      T3_SINGLE_PORT: ${T3_SINGLE_PORT:-}
       T3_PAIR_TTL: ${T3_PAIR_TTL:-30d}
     volumes:
       # State, provider credentials, shell history - everything under ~.

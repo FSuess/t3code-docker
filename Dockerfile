@@ -267,6 +267,9 @@ COPY docker/bin/ /usr/local/bin/
 COPY docker/harness/ /opt/t3-harness/
 COPY docker/provider-integration/ /opt/t3-provider/
 COPY docker/setup/ /opt/t3-setup/
+# The one-port router (T3_SINGLE_PORT): T3 Code and the setup page behind a
+# single listener, for platforms and tunnels that route one port.
+COPY docker/router/ /opt/t3-router/
 COPY examples/ /opt/examples/
 # T3 Code's client has no link to the setup console. The setup bridge is
 # injected into its static shell: a Setup pill on the pairing screen, and a
@@ -302,6 +305,7 @@ ENV T3CODE_HOME=/home/t3/.t3 \
     T3_SETUP_ENABLED=1 \
     T3_SETUP_PORT=3774 \
     T3_SETUP_BASE_PATH= \
+    T3_SINGLE_PORT= \
     PUID=1000 \
     PGID=1000
 
@@ -311,8 +315,10 @@ VOLUME ["/home/t3", "/workspace"]
 WORKDIR /workspace
 EXPOSE 3773 3774
 
+# With one port, asked through it: that is the way in, so a router that is not
+# answering is an unhealthy container even while T3 Code itself is fine.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
-    CMD curl -fsS --max-time 4 "http://127.0.0.1:${T3CODE_PORT}/.well-known/t3/environment" >/dev/null || exit 1
+    CMD curl -fsS --max-time 4 "http://127.0.0.1:${T3_SINGLE_PORT:-${T3CODE_PORT}}/.well-known/t3/environment" >/dev/null || exit 1
 
 # Stamped last so a version change reuses every layer above it. IMAGE_VERSION is
 # the release tag in CI and "dev" for a local build; the setup page shows both so

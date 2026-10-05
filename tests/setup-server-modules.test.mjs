@@ -15,6 +15,7 @@ import test from "node:test";
 import { looksLikeDatabase, parseListeners, processLabel, splitLocal } from "../docker/setup/ports.mjs";
 import { countProjects, coveringMount, mountKind } from "../docker/setup/storage.mjs";
 import { createLatestCache } from "../docker/setup/latest.mjs";
+import { clientAddress, isLoopback, plainAddress } from "../docker/setup/client-address.mjs";
 
 // --------------------------------------------------------------------- ports --
 
@@ -185,4 +186,36 @@ test("one key can be looked up now, outside the schedule, and a failure changes 
   assert.deepEqual(JSON.parse(world.written).versions["package:jq"], { version: "1.8.2", at: 1_000_000 });
   await world.cache.refreshOne("package:bad");
   assert.equal(world.cache.get("package:bad").latestVersion, null);
+});
+
+// ----------------------------------------------------------- client address --
+
+const fromPeer = (remoteAddress, forwardedFor) => ({
+  socket: { remoteAddress },
+  headers: forwardedFor === undefined ? {} : { "x-forwarded-for": forwardedFor },
+});
+
+test("a visitor connecting directly is its own address, whatever it claims", () => {
+  assert.equal(clientAddress(fromPeer("192.168.1.20")), "192.168.1.20");
+  assert.equal(clientAddress(fromPeer("::ffff:192.168.1.20")), "192.168.1.20");
+  assert.equal(clientAddress(fromPeer("172.17.0.1", "127.0.0.1")), "172.17.0.1", "a header from outside the container is not believed");
+  assert.equal(clientAddress(fromPeer(undefined)), "?");
+});
+
+test("through the router on loopback, the visitor is the address the router saw", () => {
+  assert.equal(clientAddress(fromPeer("127.0.0.1", "203.0.113.9")), "203.0.113.9");
+  assert.equal(clientAddress(fromPeer("::ffff:127.0.0.1", "203.0.113.9")), "203.0.113.9");
+  assert.equal(clientAddress(fromPeer("::1", "2001:db8::7")), "2001:db8::7");
+  assert.equal(clientAddress(fromPeer("127.0.0.1", "6.6.6.6, 10.0.0.4")), "10.0.0.4", "only the router's own entry, not what the visitor wrote before it");
+  assert.equal(clientAddress(fromPeer("127.0.0.1", ["6.6.6.6", "10.0.0.4"])), "10.0.0.4", "repeated headers read as one list");
+  assert.equal(clientAddress(fromPeer("127.0.0.1", "::ffff:10.0.0.4")), "10.0.0.4");
+});
+
+test("a loopback request without a usable forwarded address stays loopback", () => {
+  assert.equal(clientAddress(fromPeer("127.0.0.1")), "127.0.0.1", "t3-expose and the other CLIs");
+  assert.equal(clientAddress(fromPeer("127.0.0.1", "")), "127.0.0.1");
+  assert.equal(clientAddress(fromPeer("127.0.0.1", "not-an-address")), "127.0.0.1");
+  assert.ok(isLoopback("127.0.0.53") && isLoopback("::1") && isLoopback("::ffff:127.0.0.1"));
+  assert.ok(!isLoopback("10.0.0.1") && !isLoopback("::2"));
+  assert.equal(plainAddress("::ffff:1.2.3.4"), "1.2.3.4");
 });

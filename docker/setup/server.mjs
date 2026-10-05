@@ -28,6 +28,7 @@ import { createLatestCache } from "./latest.mjs";
 import { createT3Api } from "./t3-api.mjs";
 import { createAntigravity } from "./antigravity.mjs";
 import { createT3Sessions } from "./t3-session.mjs";
+import { clientAddress } from "./client-address.mjs";
 
 const run = promisify(execFile);
 const gzip = promisify(gzipCallback);
@@ -46,6 +47,10 @@ const COOKIE = "t3setup";
 // Lets a single public hostname route a path prefix here instead of needing a
 // second subdomain: e.g. Cloudflare Tunnel sending /__setup* to this port.
 const BASE_PATH = (process.env.T3_SETUP_BASE_PATH ?? "").replace(/\/+$/, "");
+// The one-port router in front of T3 Code and this page (docker/router), when
+// T3_SINGLE_PORT asks for it. The entrypoint has already refused a value it
+// could not serve, so anything here is a port.
+const SINGLE_PORT = Number(process.env.T3_SINGLE_PORT) || null;
 // Where T3 Code keeps its state; the volume a user mounts is the home around it.
 const STATE_DIR = process.env.T3CODE_HOME || `${process.env.HOME || "/home/t3"}/.t3`;
 const VOLUME = STATE_DIR.replace(/\/\.t3\/?$/, "") || STATE_DIR;
@@ -73,10 +78,15 @@ const keyMatches = (candidate) => {
 
 // A trivial throttle: the key is the only thing between a stranger and a
 // pairing token, so make guessing expensive.
+// Bounded: behind a proxy that names each visitor, a guesser rotating
+// addresses would otherwise grow this forever. The oldest go first.
+const FAILURES_KEPT = 1000;
 const failures = new Map();
 const throttle = (ip) => {
   const n = failures.get(ip) ?? 0;
+  failures.delete(ip);
   failures.set(ip, n + 1);
+  if (failures.size > FAILURES_KEPT) failures.delete(failures.keys().next().value);
   return new Promise((r) => setTimeout(r, Math.min(n * 250, 3000)));
 };
 
@@ -692,6 +702,9 @@ const status = async () => {
     publicUrl: PUBLIC_URL || null,
     t3: { port: Number(T3_PORT), bind: `${process.env.T3CODE_HOST || "0.0.0.0"}:${T3_PORT}` },
     setupPort: PORT,
+    // T3_SINGLE_PORT: both services behind one listener, this page under
+    // `prefix` there. The page shows it beside the two ports it fronts.
+    singlePort: SINGLE_PORT ? { port: SINGLE_PORT, prefix: BASE_PATH || "/__setup" } : null,
     setupKeySource: SETUP_KEY_SOURCE,
     // Settings an older image baked in that this container still carries, which
     // the user environment dropped for everything the entrypoint started
@@ -1151,7 +1164,7 @@ const EXPOSED_FILE = `${STATE_DIR}/exposed-ports.json`;
 
 // Ports that belong to the container's own plumbing rather than to anything a
 // user started. Exposing the setup page itself would be a foot-gun.
-const RESERVED = new Set([PORT, Number(process.env.T3CODE_PORT ?? 3773)]);
+const RESERVED = new Set([PORT, Number(process.env.T3CODE_PORT ?? 3773), SINGLE_PORT].filter(Boolean));
 
 // Ports the kernel hands out at random, which is where T3 Code's own agent
 // probes and other short-lived internals land. They appear and vanish every
@@ -1742,7 +1755,8 @@ const resolve = (pathname) => {
 };
 
 const server = createServer(async (req, res) => {
-  const ip = req.socket.remoteAddress ?? "?";
+  // The visitor, not the router in front of them: see client-address.mjs.
+  const ip = clientAddress(req);
   const raw = new URL(req.url ?? "/", "http://localhost");
   const resolved = resolve(raw.pathname);
   const route = resolved.route;

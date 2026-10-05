@@ -977,6 +977,7 @@
       ${section('ev-access', 'Access', html`<div class="tc-group"><dl class="tc-kv">
         <dt>Public URL</dt><dd>${s.publicUrl ? html`<span class="tc-mono tc-mono--body tc-truncate">${s.publicUrl}</span><span class="tc-spacer"></span>${copyButton(s.publicUrl, 'Copy public URL', { iconOnly: true })}`
           : html`${dot('warn')}<span>Not set. Pairing links need <code>T3_PUBLIC_URL</code>.</span>`}</dd>
+        ${s.singlePort ? html`<dt>One port</dt><dd><span class="tc-mono tc-mono--body">${s.singlePort.port}</span><span class="tc-kv-aside">T3_SINGLE_PORT · T3 Code at /, this console at ${s.singlePort.prefix}</span></dd>` : ''}
         ${t3.bind ? html`<dt>T3 Code</dt><dd><span class="tc-mono tc-mono--body">${t3.bind}</span><span class="tc-kv-aside">${/^(127\.|localhost|\[?::1)/.test(t3.bind) ? 'loopback, behind your proxy' : 'every interface in the container'}</span></dd>` : ''}
         <dt>Setup console</dt><dd><span class="tc-mono tc-mono--body">${consolePath}</span><span class="tc-kv-aside">${BASE ? 'on the same hostname · ' : ''}port ${s.setupPort || 3774}</span></dd>
         <dt>Pairing links last</dt><dd><span class="tc-mono tc-mono--body">${paths.pairTtl || '30d'}</span><span class="tc-kv-aside">T3_PAIR_TTL · a paired session lasts 30 days</span></dd>

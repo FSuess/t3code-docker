@@ -29,6 +29,7 @@ T3_HOME=/home/t3
 : "${T3_ALLOW_SUDO:=0}"
 : "${T3_SETUP_ENABLED:=1}"
 : "${T3_SETUP_PORT:=3774}"
+: "${T3_SINGLE_PORT:=}"
 : "${T3_PERSIST_AGENT_CREDENTIALS:=1}"
 : "${T3_PREINSTALL:=default}"
 # The image's own runtimes. T3 runs as the root-owned platform binary; setup
@@ -40,7 +41,7 @@ T3_HOME=/home/t3
 # Provider integration: maps the harness manager's selection onto T3's
 # per-provider `binaryPath`.
 : "${T3_PROVIDER_CLI:=/opt/t3-provider/cli.mjs}"
-export T3CODE_HOME T3CODE_HOST T3CODE_PORT T3_WORKSPACE T3_SETUP_PORT
+export T3CODE_HOME T3CODE_HOST T3CODE_PORT T3_WORKSPACE T3_SETUP_PORT T3_SINGLE_PORT
 export T3_INFRA_NODE T3_INFRA_BINARY T3_INFRA_LAUNCHER T3_PROVIDER_CLI T3_PREINSTALL
 
 # Ownership migration is recorded here before anything else changes. The state
@@ -185,6 +186,14 @@ if ! mkdir -p "$T3CODE_HOME" 2>/dev/null || [ ! -w "$T3CODE_HOME" ]; then
   log "           itself, and select the user with PUID/PGID; or"
   log "         - chown the host directory to uid ${PUID} before mounting it."
   exit 1
+fi
+
+# One port asked for and impossible to serve (T3 Code's own port, say) would
+# leave a deployment that comes up and answers nothing where it was told to.
+# Refuse to start instead, with the reason, before anything else runs.
+ROUTER=/opt/t3-router/server.mjs
+if [ -n "$T3_SINGLE_PORT" ] && [ -f "$ROUTER" ]; then
+  "$T3_INFRA_NODE" "$ROUTER" --check || exit 1
 fi
 
 # Establish the user-only tool environment before anything is launched, so the
@@ -395,10 +404,42 @@ start_setup_service() {
     done
   ) &
 
-  log "setup UI on port ${T3_SETUP_PORT} - publish it to pair a device from a browser"
+  if [ -n "$T3_SINGLE_PORT" ]; then
+    log "setup UI on port ${T3_SETUP_PORT}, and on the one port below"
+  else
+    log "setup UI on port ${T3_SETUP_PORT} - publish it to pair a device from a browser"
+  fi
 }
 
 start_setup_service
+
+# T3_SINGLE_PORT: one listener in front of both services, for hosting platforms
+# and tunnels that route a single port. The setup page answers under its prefix
+# there, T3 Code everywhere else (docker/router/router.mjs). Started before the
+# server so a visitor who arrives first gets a page that waits for it.
+start_router() {
+  [ -n "$T3_SINGLE_PORT" ] || return 0
+  [ -f "$ROUTER" ] || return 0
+  (
+    # A router that ran a while and then died comes straight back; one that
+    # cannot start at all (its port taken) backs off instead of filling the log.
+    delay=1
+    while :; do
+      started=$SECONDS
+      "$T3_INFRA_NODE" "$ROUTER" || true
+      if [ $((SECONDS - started)) -ge 30 ]; then delay=1; else delay=$((delay * 2 > 60 ? 60 : delay * 2)); fi
+      log "router exited; restarting in ${delay}s"
+      sleep "$delay"
+    done
+  ) &
+  if [ "$T3_SETUP_ENABLED" = "1" ]; then
+    log "one port: ${T3_SINGLE_PORT} serves T3 Code, and the setup page under ${T3_SETUP_BASE_PATH:-/__setup}"
+  else
+    log "one port: ${T3_SINGLE_PORT} serves T3 Code"
+  fi
+}
+
+start_router
 
 if [ "$T3_PRINT_PAIRING_ON_START" = "1" ]; then
   # The server has to be up before a token is worth anything; mint it just
