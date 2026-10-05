@@ -251,6 +251,8 @@ test("toolchains follow the same rules without sign-in", () => {
     ],
     setup: { state: "finished", items: [{ kind: "toolchain", id: "go", state: "done" }] },
   });
+  // Each wears its own project's mark.
+  assert.deepEqual(plain(M.toolchainRows(s, ui(), NOW).map((r) => r.mark)), ["go", "rust", "bun", "deno", "uv"]);
   assert.equal(tool(s, "go").status.text, "Installed · up to date");
   const rust = tool(s, "rust");
   assert.equal(rust.state, "running");
@@ -641,6 +643,7 @@ test("an added tool reads like a toolchain row, under its own commands", () => {
   const rg = pkgRow(s, "ripgrep");
   assert.equal(rg.target, "package");
   assert.equal(rg.mono, "Ri");
+  assert.equal(rg.mark, null, "an added tool has no mark of its own, only its monogram");
   assert.equal(rg.status.text, "Provides rg · up to date");
   assert.equal(rg.description, "searches directories");
   assert.deepEqual(plain(rg.menu.map((m) => m.cmd || "sep")), ["package.version", "sep", "package.uninstall"]);

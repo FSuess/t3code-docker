@@ -61,3 +61,9 @@ Not in the handoff. Keep them when syncing.
   Code's Source Control settings draw them. T3 has none for Gitea, which it
   files under Forgejo; Gitea's is its repository's `assets/logo.svg`. A mark's
   gradient ids start `ID-`, which `agentMark` makes unique per drawing.
+- **Toolchain marks.** And the toolchains' (Go, Rust, Bun, Deno, uv) from
+  `TOOLCHAIN_MARKS`, each from its own project, since T3 Code draws none: Go's
+  wordmark, Rust's logo from rust-artwork, Bun's and Deno's from their sites,
+  uv's letter mark from its docs. Rust follows the theme in `currentColor`, and
+  Deno's black and white are `--agentmark-ink` and `--agentmark-hole`, as
+  OpenCode's are. Added tools keep their monogram.

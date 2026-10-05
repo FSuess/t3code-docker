@@ -25,11 +25,11 @@ const T3Model = (() => {
   const AGENT_ORDER = ['claude', 'codex', 'opencode', 'grok', 'cursor', 'antigravity'];
 
   const TOOLCHAINS = {
-    go: { name: 'Go', mono: 'Go' },
-    rust: { name: 'Rust', mono: 'Ru', detail: 'With clippy and rustfmt' },
-    bun: { name: 'Bun', mono: 'Bu' },
-    deno: { name: 'Deno', mono: 'De' },
-    uv: { name: 'uv', mono: 'uv' },
+    go: { name: 'Go', mark: 'go', mono: 'Go' },
+    rust: { name: 'Rust', mark: 'rust', mono: 'Ru', detail: 'With clippy and rustfmt' },
+    bun: { name: 'Bun', mark: 'bun', mono: 'Bu' },
+    deno: { name: 'Deno', mark: 'deno', mono: 'De' },
+    uv: { name: 'uv', mark: 'uv', mono: 'uv' },
   };
 
   // The CLI T3 Code drives for each source control host (its Settings >
