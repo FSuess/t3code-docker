@@ -18,10 +18,14 @@ export {
   CATALOGUE,
   CURSOR_EXECUTABLE,
   MINIMUM_OPENCODE_VERSION,
+  SOURCE_CONTROL,
   TOOLCHAINS,
   getHarness,
+  getManagedTool,
+  getSourceControl,
   getToolchain,
   normalizeArch,
+  releaseSpec,
   supportsArch,
 } from "./catalogue.mjs";
 export { parsePreinstall, readPreinstall, runPreinstall } from "./preinstall.mjs";

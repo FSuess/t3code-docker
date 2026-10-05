@@ -10,7 +10,7 @@
 // and hand its output here, so the rules - what a tool name may be, which names
 // belong to an agent or a toolchain, how the registry reads - are unit-tested
 // without mise.
-import { CATALOGUE, TOOLCHAINS } from "./catalogue.mjs";
+import { CATALOGUE, SOURCE_CONTROL, TOOLCHAINS } from "./catalogue.mjs";
 
 // `[backend:]name`. The backend is any lowercase word (mise owns that list and
 // grows it: aqua, asdf, github, cargo, npm, pypi, ...). The name may carry an
@@ -100,30 +100,42 @@ export function indexRegistry(entries) {
   return { byName, byBackend, entries: entries ?? [] };
 }
 
-// The mise tool names the agents and toolchains are configured under. They are
-// installed, updated and removed on their own pages, with their own rules
-// (exact verification, T3's provider wiring), never as a package.
+// The mise tool names the agents, toolchains and source control CLIs are
+// configured under. They are installed, updated and removed in their own
+// places, with their own rules (exact verification, T3's provider wiring, an
+// az extension), never as a package. `gh` is not one of them: the image has
+// it, and adding a newer one through mise is still an added tool.
 const RESERVED = new Map([
   ...CATALOGUE.map((entry) => [entry.miseTool, { kind: "agent", id: entry.id, name: entry.name }]),
   ...CATALOGUE.map((entry) => [entry.id, { kind: "agent", id: entry.id, name: entry.name }]),
   ...TOOLCHAINS.map((entry) => [entry.miseTool, { kind: "toolchain", id: entry.id, name: entry.name }]),
+  ...SOURCE_CONTROL.filter((entry) => !entry.inImage)
+    .map((entry) => [entry.miseTool, { kind: "source-control", id: entry.id, name: entry.name }]),
 ]);
 
-/** Whether a mise tool name is one an agent or toolchain is configured under. */
+/** Whether a mise tool name is one an agent, toolchain or source control CLI is configured under. */
 export const isReservedTool = (id) => RESERVED.has(String(id ?? ""));
 
+// Registry names for a package a source control CLI installs under another
+// backend (azure-cli, which az installs as pipx:azure-cli). Adding one is
+// refused like a reserved name, but one already added stays an added tool.
+const REDIRECTS = new Map(SOURCE_CONTROL.flatMap((entry) =>
+  (entry.registryNames ?? []).map((name) => [name, { kind: "source-control", id: entry.id, name: entry.name }])));
+const ownerOf = (name) => RESERVED.get(name) ?? REDIRECTS.get(name) ?? null;
+
 /**
- * Which agent or toolchain owns a tool name, through any of its spellings: the
- * name itself, a registry alias (claude-code), or a backend spec that resolves
- * to it (core:go, aqua:anthropics/claude-code). Null when it is free to add.
+ * Which agent, toolchain or source control CLI owns a tool name, through any
+ * of its spellings: the name itself, a registry alias (claude-code, azure), or
+ * a backend spec that resolves to it (core:go, aqua:anthropics/claude-code).
+ * Null when it is free to add.
  */
 export function managedElsewhere(id, registry) {
   const spec = String(id ?? "");
-  if (RESERVED.has(spec)) return RESERVED.get(spec);
+  if (ownerOf(spec)) return ownerOf(spec);
   const viaName = registry?.byName?.get(spec);
-  if (viaName && RESERVED.has(viaName.name)) return RESERVED.get(viaName.name);
+  if (viaName && ownerOf(viaName.name)) return ownerOf(viaName.name);
   const viaBackend = registry?.byBackend?.get(spec);
-  if (viaBackend && RESERVED.has(viaBackend.name)) return RESERVED.get(viaBackend.name);
+  if (viaBackend && ownerOf(viaBackend.name)) return ownerOf(viaBackend.name);
   // `core:go` is go whether or not the registry lists that exact spelling.
   if (spec.startsWith("core:") && RESERVED.has(spec.slice(5))) return RESERVED.get(spec.slice(5));
   return null;
