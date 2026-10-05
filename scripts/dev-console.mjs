@@ -11,10 +11,10 @@
 //     --fresh), so nothing touches the real one;
 //   - the setup console from this working tree, with the key "dev", restarted
 //     whenever a file under docker/setup changes;
-//   - a router on --port that sends /__setup* to the console and everything
-//     else to T3, as the README's Cloudflare Tunnel setup does, and serves T3's
-//     HTML shell with this working tree's setup bridge in place of the built
-//     one, read fresh on every load.
+//   - the image's one-port router (docker/router, T3_SINGLE_PORT) on --port,
+//     sending /__setup* to the console and everything else to T3, with one
+//     change: T3's HTML shell is served with this working tree's setup bridge
+//     in place of the built one, read fresh on every load.
 //
 // It prints a pairing link for a browser, and stops everything on Ctrl-C.
 // scripts/setup-bridge-audit.js can be pointed at the router's T3 and console
@@ -22,10 +22,11 @@
 import { spawn, execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import http from "node:http";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { createRouter } from "../docker/router/router.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const arg = (name, fallback) => {
@@ -80,6 +81,7 @@ const startConsole = () => {
     ...T3_ENV,
     T3_SETUP_PORT: String(SETUP_PORT),
     T3_SETUP_KEY: KEY,
+    T3_SINGLE_PORT: String(PORT),
     T3_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
     T3_IMAGE_VERSION: "dev",
     T3_IMAGE_VARIANT: process.env.T3_IMAGE_VARIANT || "browser",
@@ -105,18 +107,21 @@ setInterval(() => {
 }, 1000).unref();
 
 // ------------------------------------------------------------------ router --
-const upstream = (path) => (path.startsWith("/__setup") ? SETUP_PORT : T3_PORT);
+const routes = createRouter({
+  t3: { host: "127.0.0.1", port: T3_PORT },
+  setup: { host: "127.0.0.1", port: SETUP_PORT },
+  log: (line) => console.log(`[router] ${line}`),
+});
 // T3 answers every app route with its shell; swap the built bridge for this one.
 const isShell = (req) => req.method === "GET" && !/^\/(__setup|api|assets|ws|oauth|\.well-known)/.test(req.url)
   && !/\.\w+(\?|$)/.test(req.url) && /text\/html/.test(String(req.headers.accept || ""));
 
-const router = http.createServer((req, res) => {
-  const shell = isShell(req);
+const serveShell = (req, res) => {
   const headers = { ...req.headers };
-  if (shell) delete headers["accept-encoding"];
-  const forward = http.request({ host: "127.0.0.1", port: upstream(req.url), path: req.url, method: req.method, headers }, (answer) => {
+  delete headers["accept-encoding"];
+  const forward = http.request({ host: "127.0.0.1", port: T3_PORT, path: req.url, method: req.method, headers }, (answer) => {
     const type = String(answer.headers["content-type"] || "");
-    if (!shell || !type.includes("text/html")) {
+    if (!type.includes("text/html")) {
       res.writeHead(answer.statusCode, answer.headers);
       answer.pipe(res);
       return;
@@ -134,19 +139,13 @@ const router = http.createServer((req, res) => {
       res.end(body);
     });
   });
-  forward.on("error", () => { res.writeHead(502); res.end("not up yet"); });
-  req.pipe(forward);
-});
-router.on("upgrade", (req, socket, head) => {
-  const forward = net.connect(upstream(req.url), "127.0.0.1", () => {
-    forward.write(`${req.method} ${req.url} HTTP/1.1\r\n`
-      + Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join("\r\n") + "\r\n\r\n");
-    forward.write(head);
-    socket.pipe(forward).pipe(socket);
-  });
-  forward.on("error", () => socket.destroy());
-  socket.on("error", () => forward.destroy());
-});
+  // T3 not up yet: the router's own waiting page.
+  forward.on("error", () => routes.handleRequest(req, res));
+  forward.end();
+};
+
+const router = http.createServer((req, res) => (isShell(req) ? serveShell(req, res) : routes.handleRequest(req, res)));
+router.on("upgrade", routes.handleUpgrade);
 
 // ------------------------------------------------------------------- ready --
 // T3 opens its port before it answers, so each try gives up after a moment.
@@ -189,6 +188,7 @@ let stopping = false;
 const stop = (code = 0) => {
   stopping = true;
   router.close();
+  routes.close();
   for (const child of children) child.kill();
   setTimeout(() => process.exit(code), 300);
 };

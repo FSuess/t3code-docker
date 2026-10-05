@@ -10,9 +10,9 @@
  *                        built into it, to try a working copy against an image
  *
  * The console is only reachable from T3 Code when one origin serves both, so
- * this starts that origin itself: a small router sending /__setup* to the
- * console and everything else to T3, as the README's Cloudflare Tunnel setup
- * does. Through it, a fresh browser:
+ * this starts that origin itself, with the image's own one-port router
+ * (docker/router, what T3_SINGLE_PORT runs): /__setup* to the console and
+ * everything else to T3. Through it, a fresh browser:
  *
  *   - sees the Setup pill on the pairing screen, and no entry;
  *   - pairs through T3's own /pair page, after which the pill is gone;
@@ -26,9 +26,9 @@
  *
  * Exits non-zero on the first finding, after saying what it was.
  */
-const http = require("node:http");
-const net = require("node:net");
 const fs = require("node:fs");
+const path = require("node:path");
+const { pathToFileURL } = require("node:url");
 
 let chromium;
 try {
@@ -54,29 +54,17 @@ if (!CREDENTIAL) {
 }
 
 // ------------------------------------------------------------------ router --
-const upstream = (path) => (path.startsWith("/__setup") ? SETUP : T3);
-const router = http.createServer((req, res) => {
-  const to = upstream(req.url);
-  const forward = http.request({
-    host: to.hostname, port: to.port, path: req.url, method: req.method, headers: req.headers,
-  }, (answer) => {
-    res.writeHead(answer.statusCode, answer.headers);
-    answer.pipe(res);
-  });
-  forward.on("error", () => { res.writeHead(502); res.end(); });
-  req.pipe(forward);
-});
-router.on("upgrade", (req, socket, head) => {
-  const to = upstream(req.url);
-  const forward = net.connect(Number(to.port), to.hostname, () => {
-    forward.write(`${req.method} ${req.url} HTTP/1.1\r\n`
-      + Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join("\r\n") + "\r\n\r\n");
-    forward.write(head);
-    socket.pipe(forward).pipe(socket);
-  });
-  forward.on("error", () => socket.destroy());
-  socket.on("error", () => forward.destroy());
-});
+// The image's router, wherever this runs: installed in a container (the smoke
+// test copies this script to /tmp there), or beside it in a checkout.
+const ROUTER_MODULE = [
+  process.env.T3_ROUTER_MODULE,
+  "/opt/t3-router/router.mjs",
+  path.join(__dirname, "../docker/router/router.mjs"),
+].find((candidate) => candidate && fs.existsSync(candidate));
+if (!ROUTER_MODULE) {
+  console.error("setup-bridge-audit: cannot find docker/router/router.mjs; set T3_ROUTER_MODULE");
+  process.exit(2);
+}
 
 // ------------------------------------------------------------------ checks --
 let passed = 0;
@@ -393,7 +381,16 @@ const run = async (base) => {
   }
 };
 
-router.listen(0, "127.0.0.1", async () => {
+import(pathToFileURL(ROUTER_MODULE).href).then(({ createRouterServer }) => {
+  const router = createRouterServer({
+    t3: { host: T3.hostname, port: Number(T3.port) || 80 },
+    setup: { host: SETUP.hostname, port: Number(SETUP.port) || 80 },
+    log: (line) => console.log(`  [router] ${line}`),
+  });
+  router.listen(0, "127.0.0.1", () => audit(router));
+});
+
+const audit = async (router) => {
   const base = `http://127.0.0.1:${router.address().port}`;
   console.log(`setup-bridge-audit: T3 ${T3.origin}, console ${SETUP.origin}, routed together at ${base}`);
   let code = 0;
@@ -406,4 +403,4 @@ router.listen(0, "127.0.0.1", async () => {
   }
   router.close();
   process.exit(code);
-});
+};
