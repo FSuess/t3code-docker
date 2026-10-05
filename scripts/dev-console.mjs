@@ -82,7 +82,10 @@ const startConsole = () => {
     T3_SETUP_PORT: String(SETUP_PORT),
     T3_SETUP_KEY: KEY,
     T3_SINGLE_PORT: String(PORT),
-    T3_PUBLIC_URL: `http://127.0.0.1:${PORT}`,
+    // Not this container's own: links from the scratch T3 must not point at
+    // the server you are running it in. Set it from the page, as a new
+    // deployment would.
+    T3_PUBLIC_URL: "",
     T3_IMAGE_VERSION: "dev",
     T3_IMAGE_VARIANT: process.env.T3_IMAGE_VARIANT || "browser",
     T3_INFRA_LAUNCHER: T3_BINARY,
