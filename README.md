@@ -193,6 +193,10 @@ at build time: the release tag in CI, or `dev` for a local build.
 whether those mounts survive a recreate, the agent browser, **Copy
 diagnostics** (the status with identifying details removed, for bug reports)
 and **Lock**, which signs this browser out if it came in with the key.
+**Restart T3 Code** there restarts the server inside the container, which keeps
+running. Open apps reconnect by themselves, and any agent turn in progress
+stops. T3 Code exiting on its own still ends the container, so a crash is left
+to the container's restart policy rather than hidden.
 
 The page is a single self-contained document. It loads no fonts, scripts or
 styles from anywhere else, which helps over a slow tunnel.
@@ -485,19 +489,28 @@ docker compose --profile tls up -d
 The hosted web app at [app.t3.codes](https://app.t3.codes) needs this too: it
 connects directly to your server, and only over HTTPS.
 
-**T3 Connect.** Sign the machine in and T3's relay handles reachability.
-Devices then connect through your account instead of a pairing token, and
-Connect renews their credentials, so you don't re-pair every 30 days:
+**T3 Connect.** T3's relay makes the server reachable, with no domain or
+tunnel of your own. Devices then connect through your T3 account instead of a
+pairing link, and Connect renews their credentials, so you don't re-pair every
+30 days.
+
+On the setup page, **Devices → From anywhere → Set up** shows a link and a code
+to approve in any browser. T3 Code makes the link when it starts, so the page
+then offers to restart it, and shows when the link is made. The container keeps
+running throughout. **Turn off** undoes it and keeps your sign-in, so turning
+it on again asks for no new code.
+
+From a shell, the same sign-in is:
 
 ```bash
 docker compose exec -it t3code t3-login connect
 ```
 
-This authorizes the environment without disturbing the running server. The
-link takes effect **on the next start**, so restart the container afterwards.
-Use `t3-login connect` rather than `t3 connect` directly: `docker exec` runs as
-root, and Connect writes into the state directory, where root-owned files
-would stop the server from writing.
+The link then takes effect **on T3 Code's next start**: use **Restart T3 Code**
+under **Environment**, or restart the container. Use `t3-login connect` rather
+than `t3 connect` directly: `docker exec` runs as root, and Connect writes into
+the state directory, where root-owned files would stop the server from
+writing.
 
 **Tailscale.** Run Tailscale on the host and set the public URL to the
 machine's tailnet name. (`t3 serve --tailscale-serve` needs `tailscaled` inside

@@ -609,6 +609,7 @@
       'toolchain.installed': 'download', 'toolchain.updated': 'circle-arrow-up', 'toolchain.uninstalled': 'trash-2', 'toolchain.failed': 'circle-alert',
       'package.installed': 'download', 'package.updated': 'circle-arrow-up', 'package.uninstalled': 'trash-2', 'package.failed': 'circle-alert',
       'url.set': 'globe', 'url.cleared': 'globe', 'key.replaced': 'key-round',
+      'connect.linked': 'globe', 'connect.unlinked': 'globe', 't3.restarted': 'refresh-cw',
     };
     return section('recent-title', 'Recent', html`<div class="tc-group"><ol class="tc-log">${events.slice(0, 8).map((e) => html`
       <li data-key="ev-${e.at}-${e.kind}">${icon(ICONS[e.kind] || 'activity')}<span class="tc-truncate">${e.text}${e.detail ? html` <span class="tc-mono">${e.detail}</span>` : ''}</span><time datetime="${new Date(e.at).toISOString()}" title="${M.absTime(e.at)}">${M.relTime(e.at, n)}</time></li>`)}</ol></div>`,
@@ -805,7 +806,18 @@
           <div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">${l.name}</span>${l.waiting ? html`<span class="tc-badge tc-badge--info">Waiting</span>` : ''}</div><span class="tc-status" title="${l.expiresTitle}">${l.status}</span></div>
           <div class="tc-row-actions"><button class="tc-btn tc-btn--danger tc-btn--sm" type="button" data-cmd="link.revoke" data-id="${l.id}" aria-label="Revoke link ${l.name}">Revoke</button></div>
         </div>`)}</div></div>`) : ''}
+      ${section('anywhere-title', 'From anywhere', connectCard(s))}
       ${devices.length ? '' : notice(null, 'history', 'Sessions last 30 days', 'After that the device asks to pair again, which takes a few seconds here. Threads, projects and agent sign-ins are kept on the volume.')}`;
+  };
+
+  /** T3 Connect on Devices: where it stands, and the one thing to do next. */
+  const connectCard = (s) => {
+    const view = M.connectView(s);
+    return html`<div class="tc-group"><div class="tc-list"><div class="tc-row tc-row--compact" data-key="connect">
+      <span class="tc-tile tc-tile--icon" aria-hidden="true">${icon('globe')}</span>
+      <div class="tc-row-main"><div class="tc-row-title"><span class="tc-row-name">T3 Connect</span>${badge(view.badge)}</div><span class="tc-status tc-status--prose">${view.text}</span></div>
+      ${view.action ? html`<div class="tc-row-actions tc-row-actions--wrap"><button class="${cx('tc-btn tc-btn--sm', view.action.cmd === 'connect.off' && 'tc-btn--danger')}" type="button" data-cmd="${view.action.cmd}">${view.action.icon ? icon(view.action.icon) : ''}${view.action.label}</button></div>` : ''}
+    </div></div></div>`;
   };
 
   // --------------------------------------------------------------- agents --
@@ -1027,10 +1039,14 @@
         ${readout('Image', html`<span class="tc-truncate" title="${M.imageLabel(image).full || ''}">${M.imageLabel(image).text || 'unversioned'}</span>`, true)}
         ${s.platform ? readout('Platform', s.platform, true) : ''}
         ${Number.isFinite(server.uptimeSeconds) ? readout('Uptime', M.duration(server.uptimeSeconds)) : ''}
-      </div></div>`)}
+      </div></div>`, { actions: s.t3 && s.t3.pid ? html`<button class="tc-btn tc-btn--xs" type="button" data-cmd="t3.restart">${icon('refresh-cw')}Restart T3 Code</button>` : null })}
       ${section('ev-access', 'Access', html`<div class="tc-group"><dl class="tc-kv">
         <dt>Public URL</dt><dd>${s.publicUrl ? html`<span class="tc-mono tc-mono--body tc-truncate">${s.publicUrl}</span><span class="tc-kv-aside">${M.publicUrlSource(s)}</span><span class="tc-spacer"></span>${s.publicUrlSource === 'env' ? '' : html`<button class="tc-btn tc-btn--ghost tc-btn--xs" type="button" data-cmd="url.edit">Change</button>`}${copyButton(s.publicUrl, 'Copy public URL', { iconOnly: true })}`
           : html`<span class="tc-kv-fill">${dot('warn')}<span>Not set. Pairing links need it.</span></span>${urlButtons(s, 'tc-btn--xs', 'tc-choice')}`}</dd>
+        ${(() => {
+          const view = M.connectView(s);
+          return html`<dt>T3 Connect</dt><dd><span class="tc-kv-fill">${view.badge ? badge(view.badge) : html`<span class="tc-muted">${view.state === 'unknown' ? 'Not readable' : 'Off'}</span>`}</span>${view.action ? html`<span class="tc-row-actions tc-row-actions--wrap tc-choice"><button class="tc-btn tc-btn--ghost tc-btn--xs" type="button" data-cmd="${view.action.cmd}">${view.action.label}</button></span>` : ''}</dd>`;
+        })()}
         ${s.singlePort ? html`<dt>One port</dt><dd><span class="tc-mono tc-mono--body">${s.singlePort.port}</span><span class="tc-kv-aside">T3_SINGLE_PORT · T3 Code at /, this console at ${s.singlePort.prefix}</span></dd>` : ''}
         ${t3.bind ? html`<dt>T3 Code</dt><dd><span class="tc-mono tc-mono--body">${t3.bind}</span><span class="tc-kv-aside">${/^(127\.|localhost|\[?::1)/.test(t3.bind) ? 'loopback, behind your proxy' : 'every interface in the container'}</span></dd>` : ''}
         <dt>Setup console</dt><dd><span class="tc-mono tc-mono--body">${consolePath}</span><span class="tc-kv-aside">${BASE ? 'on the same hostname · ' : ''}port ${s.setupPort || 3774}</span></dd>
@@ -1239,13 +1255,28 @@
   // manager's probe says the agent is signed in.
   const signin = { layer: null, agent: null, session: null, phase: 'idle', error: null, cancelled: false, startedAt: 0, poll: null, tick: null };
 
+  // Pieces of a sheet that walks through numbered steps: the agent sign-ins
+  // and T3 Connect's both.
+  const sheetQr = (st) => st.qr ? html`<div class="tc-qr tc-qr--sm tc-desk-only" role="img" aria-label="QR code for the sign-in page" data-keep>${qrSvg(st.qr)}</div>` : '';
+  const sheetWaiting = (text, extra) => html`<div class="tc-op tc-op--quiet"><span class="tc-op-line">${raw('<span class="tc-spinner tc-info" aria-hidden="true"></span>')}<span>${text}</span></span><span class="tc-op-pct">${extra || ''}</span></div>`;
+  const sheetStep = (n, title, stateName, body) => html`<div class="tc-sheet-step"${stateName ? raw(' data-state="' + stateName + '"') : ''}><span class="tc-step-mark">${stateName === 'done' ? icon('check') : String(n)}</span><div class="tc-sheet-step-body"><span class="${cx('tc-sheet-step-title', !stateName && 'tc-muted')}">${title}</span>${body || ''}</div></div>`;
+  /** A device-code sign-in's first two steps: the page to open, and the code to enter there. */
+  const deviceSteps = (st) => {
+    const left = st.expiresAt ? M.countdown(st.expiresAt - now()) : null;
+    return html`
+      ${sheetStep(1, 'Open the device page', 'done', html`<div class="tc-signin-split"><div class="tc-stack tc-signin-fields">${copyField(st.url, { actions: copyButton(st.url, 'Copy device page link', { iconOnly: true }) })}<a class="tc-btn tc-btn--sm tc-self-start" href="${st.url}" target="_blank" rel="noopener">${icon('external-link')}Open device page</a>${st.qr ? html`<span class="tc-hint tc-desk-only">Or scan to approve on your phone.</span>` : ''}</div>${sheetQr(st)}</div>`)}
+      ${sheetStep(2, 'Enter this code there', 'active', st.code
+        ? html`${copyField(st.code, { code: true })}${sheetWaiting('Waiting for you to approve…', left ? 'expires in ' + left : '')}`
+        : sheetWaiting('Waiting for the code…'))}`;
+  };
+
   const signinSheet = () => {
     const meta = M.AGENTS[signin.agent] || {};
     const st = signin.session || {};
     const host = M.hostOf(st.url);
-    const qr = st.qr ? html`<div class="tc-qr tc-qr--sm tc-desk-only" role="img" aria-label="QR code for the sign-in page" data-keep>${qrSvg(st.qr)}</div>` : '';
-    const waiting = (text, extra) => html`<div class="tc-op tc-op--quiet"><span class="tc-op-line">${raw('<span class="tc-spinner tc-info" aria-hidden="true"></span>')}<span>${text}</span></span><span class="tc-op-pct">${extra || ''}</span></div>`;
-    const step = (n, title, stateName, body) => html`<div class="tc-sheet-step"${stateName ? raw(' data-state="' + stateName + '"') : ''}><span class="tc-step-mark">${stateName === 'done' ? icon('check') : String(n)}</span><div class="tc-sheet-step-body"><span class="${cx('tc-sheet-step-title', !stateName && 'tc-muted')}">${title}</span>${body || ''}</div></div>`;
+    const qr = sheetQr(st);
+    const waiting = sheetWaiting;
+    const step = sheetStep;
     const openPage = (label) => html`<div class="tc-signin-open"><a class="tc-btn" href="${st.url}" target="_blank" rel="noopener">${icon('external-link')}${label}</a>${copyButton(st.url, 'Copy the sign-in link', { iconOnly: true, size: '' })}</div>`;
     let body;
     if (signin.phase === 'failed') {
@@ -1254,12 +1285,8 @@
     } else if (!st.url) {
       body = step(1, 'Starting ' + (meta.name || 'the CLI'), 'active', waiting('Waiting for ' + (meta.name || 'it') + ' to print a sign-in link…'));
     } else if (meta.flow === 'device') {
-      const left = st.expiresAt ? M.countdown(st.expiresAt - now()) : null;
       body = html`
-        ${step(1, 'Open the device page', 'done', html`<div class="tc-signin-split"><div class="tc-stack tc-signin-fields">${copyField(st.url, { actions: copyButton(st.url, 'Copy device page link', { iconOnly: true }) })}<a class="tc-btn tc-btn--sm tc-self-start" href="${st.url}" target="_blank" rel="noopener">${icon('external-link')}Open device page</a>${st.qr ? html`<span class="tc-hint tc-desk-only">Or scan to approve on your phone.</span>` : ''}</div>${qr}</div>`)}
-        ${step(2, 'Enter this code there', 'active', st.code
-          ? html`${copyField(st.code, { code: true })}${waiting('Waiting for you to approve…', left ? 'expires in ' + left : '')}`
-          : waiting('Waiting for the code…'))}
+        ${deviceSteps(st)}
         ${step(3, 'Signed in', '', html`<span class="tc-hint">This sheet closes on its own when ${meta.name} reports a session.</span>`)}`;
     } else if (meta.flow === 'code') {
       const submitted = st.state === 'submitted' || signin.phase === 'submitting';
@@ -1800,6 +1827,179 @@
       }
       urlSheet.layer.close('saved');
     });
+  };
+
+  // ------------------------------------------------------------ T3 Connect --
+  // One sheet for the whole way: sign in to T3 with a device code (T3 Code's
+  // own `t3 connect link --headless`, which the setup service runs), restart
+  // T3 Code so it makes the link, and wait for it to come on. Opened again
+  // later, it starts wherever the server says things are.
+  const conn = { layer: null, phase: 'idle', session: null, error: null, identity: null, attempt: 0, poll: null, oldPid: null, since: 0 };
+
+  const connectSheetBody = () => {
+    const st = conn.session || {};
+    const s = state.status || {};
+    const restartable = Boolean(s.t3 && s.t3.pid);
+    const signedIn = sheetStep(1, 'Sign in to T3' + (conn.identity ? ' as ' + conn.identity : ''), 'done', '');
+    let body;
+    if (conn.phase === 'failed') {
+      body = html`${notice('danger', 'circle-alert', 'T3 Connect did not finish', conn.error || 'The sign-in stopped before it finished.')}${st.tail ? html`<pre class="tc-log-tail">${st.tail}</pre>` : ''}`;
+    } else if (conn.phase === 'signin') {
+      body = st.url
+        ? html`${deviceSteps(st)}${sheetStep(3, 'Turn it on', '', '')}`
+        : sheetStep(1, 'Starting the sign-in', 'active', sheetWaiting('Waiting for T3 Code to print a sign-in link…'));
+    } else if (conn.phase === 'authorized') {
+      body = html`${signedIn}${sheetStep(2, 'Turn it on', 'active', restartable
+        ? html`<span class="tc-hint">T3 Code makes the link when it starts. A restart takes a few seconds: open apps reconnect by themselves, and any agent turn in progress stops.</span>`
+        : notice('warn', 'triangle-alert', 'Restart the container', 'T3 Code makes the link when it starts, and here this page cannot restart it on its own.'))}`;
+    } else if (conn.phase === 'restarting') {
+      body = html`${signedIn}${sheetStep(2, 'Turn it on', 'active', sheetWaiting('Restarting T3 Code…'))}`;
+    } else if (conn.phase === 'linking') {
+      body = html`${signedIn}${sheetStep(2, 'Turn it on', 'active', html`${sheetWaiting('T3 Code is making the link…')}${now() - conn.since > 120_000 ? html`<span class="tc-hint">This is taking longer than usual. You can close this: Devices shows when it is on.</span>` : ''}`)}`;
+    } else if (conn.phase === 'on') {
+      body = notice('ok', 'circle-check', 'T3 Connect is on', 'Devices signed in to your T3 account reach this server through ' + ((s.connect && s.connect.relayHost) || 'T3’s relay') + '.');
+    }
+    const close = (label, variant) => html`<button class="${cx('tc-btn', variant || 'tc-btn--ghost')}" type="button" data-sheet="close">${label}</button>`;
+    const foot = conn.phase === 'failed'
+      ? html`${close('Close')}<button class="tc-btn tc-btn--primary" type="button" data-sheet="retry">${icon('refresh-cw')}Try again</button>`
+      : conn.phase === 'authorized'
+        ? html`${close('Later')}${restartable ? html`<button class="tc-btn tc-btn--primary" type="button" data-sheet="restart">${icon('refresh-cw')}Restart T3 Code</button>` : ''}`
+        : conn.phase === 'on' ? close('Done', 'tc-btn--primary')
+          : conn.phase === 'signin' ? html`<span class="tc-sheet-foot-note tc-desk-only"><span class="tc-kbd">Esc</span> cancels</span>${close('Cancel')}`
+            : close('Close');
+    return html`
+      <div class="tc-sheet-head"><span class="tc-tile tc-tile--icon tc-tile--lg" aria-hidden="true">${icon('globe')}</span><div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="connect-title">T3 Connect</h2><span class="tc-small tc-muted">Runs <code>t3 connect link</code> for you</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
+      <div class="tc-sheet-body" aria-live="polite">${body}</div>
+      <div class="tc-sheet-foot">${foot}</div>`;
+  };
+
+  const connRender = () => { if (conn.layer) conn.layer.render(); };
+  // Each phase change is an attempt; an answer for an older one is dropped.
+  const connNext = () => { clearTimeout(conn.poll); conn.poll = null; return ++conn.attempt; };
+  const connFail = (error) => { conn.phase = 'failed'; conn.error = error; connRender(); };
+
+  const connPollSignin = async (attempt) => {
+    if (!conn.layer || conn.attempt !== attempt || !conn.session) return;
+    const res = await api('/auth/session?id=' + encodeURIComponent(conn.session.id));
+    if (!conn.layer || conn.attempt !== attempt) return;
+    if (!res.ok) return connFail(res.status === 404 ? 'The setup service no longer knows this sign-in (it may have restarted).' : res.error);
+    conn.session = Object.assign({}, conn.session, res.data);
+    if (res.data.state === 'done') {
+      conn.identity = res.data.identity || null;
+      conn.phase = 'authorized';
+      connRender();
+      loadStatus();
+      return;
+    }
+    if (res.data.state === 'failed' || res.data.state === 'cancelled') return connFail(res.data.error);
+    connRender();
+    conn.poll = setTimeout(() => connPollSignin(attempt), 1500);
+  };
+
+  const connBeginSignin = async () => {
+    const attempt = connNext();
+    Object.assign(conn, { phase: 'signin', session: null, error: null });
+    connRender();
+    const res = await api('/auth/signin', { body: { agent: 'connect' } });
+    if (!conn.layer || conn.attempt !== attempt) {
+      if (res.ok && res.data.id) api('/auth/cancel', { body: { id: res.data.id } });
+      return;
+    }
+    if (!res.ok) return connFail(res.error);
+    conn.session = res.data;
+    connRender();
+    conn.poll = setTimeout(() => connPollSignin(attempt), 1200);
+  };
+
+  // After a restart: T3 Code back (answering, under a new pid), then the link.
+  const connWatch = async (attempt) => {
+    if (!conn.layer || conn.attempt !== attempt) return;
+    await loadStatus();
+    if (!conn.layer || conn.attempt !== attempt) return;
+    const s = state.status || {};
+    if (conn.phase === 'restarting' && s.server && s.server.ok && s.t3 && s.t3.pid && s.t3.pid !== conn.oldPid) {
+      conn.phase = 'linking';
+      conn.since = now();
+    }
+    if (conn.phase === 'linking' && s.connect && s.connect.state === 'on') {
+      conn.phase = 'on';
+      connRender();
+      Kit.announce('T3 Connect is on.');
+      return;
+    }
+    connRender();
+    conn.poll = setTimeout(() => connWatch(attempt), conn.phase === 'restarting' ? 1500 : 3000);
+  };
+
+  const connRestart = async () => {
+    const attempt = connNext();
+    conn.oldPid = state.status && state.status.t3 && state.status.t3.pid;
+    conn.phase = 'restarting';
+    connRender();
+    const res = await api('/t3/restart', { body: { why: 'connect' } });
+    if (!conn.layer || conn.attempt !== attempt) return;
+    if (!res.ok) return connFail(res.error);
+    conn.poll = setTimeout(() => connWatch(attempt), 1500);
+  };
+
+  const openConnect = (trigger, { restart } = {}) => {
+    if (conn.layer) return;
+    const view = M.connectView(state.status);
+    const phase = { on: 'on', linking: 'linking', restart: 'authorized' }[view.state] || 'signin';
+    Object.assign(conn, { phase, session: null, error: null, identity: null, since: now() });
+    conn.layer = Kit.open({
+      kind: 'sheet',
+      panel: { tag: 'aside', class: 'tc-sheet ' + (Kit.isPhone() ? 'tc-sheet--bottom' : 'tc-sheet--inset'), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'connect-title' },
+      returnTo: trigger,
+      backdrop: 'ignore',
+      render: connectSheetBody,
+      onClose: () => {
+        // A sign-in still waiting for approval has nobody left to finish it.
+        if (conn.phase === 'signin' && conn.session && conn.session.id) api('/auth/cancel', { body: { id: conn.session.id } });
+        connNext();
+        conn.layer = null;
+        render();
+      },
+    });
+    conn.layer.panel.addEventListener('click', (e) => {
+      const action = e.target.closest('[data-sheet]');
+      if (!action) return;
+      const what = action.getAttribute('data-sheet');
+      if (what === 'close') conn.layer.close('close');
+      else if (what === 'retry') connBeginSignin();
+      else if (what === 'restart') connRestart();
+    });
+    if (phase === 'signin') connBeginSignin();
+    else if (phase === 'linking') { const attempt = connNext(); conn.poll = setTimeout(() => connWatch(attempt), 1500); }
+    else if (phase === 'authorized' && restart) connRestart();
+  };
+
+  /** Restart T3 Code from Environment or the palette, and say when it is back. */
+  const restartT3 = async () => {
+    const ok = await Kit.confirm({
+      title: 'Restart T3 Code?',
+      body: 'It stops and starts again inside this container, which keeps running. It takes a few seconds.',
+      consequences: [
+        { icon: 'refresh-cw', text: 'Open apps and browsers reconnect by themselves.' },
+        { icon: 'circle-stop', text: 'Any agent turn in progress stops.' },
+      ],
+      confirm: 'Restart',
+      tone: 'primary',
+    });
+    if (!ok) return;
+    const before = state.status && state.status.t3 && state.status.t3.pid;
+    const res = await api('/t3/restart', { body: {} });
+    if (!res.ok) { Kit.toast('Could not restart T3 Code', { tone: 'danger', detail: res.error }); return; }
+    Kit.toast('Restarting T3 Code', { tone: 'info' });
+    const deadline = now() + 90_000;
+    const watch = async () => {
+      await loadStatus();
+      const s = state.status || {};
+      if (s.server && s.server.ok && s.t3 && s.t3.pid && s.t3.pid !== before) { Kit.toast('T3 Code is back'); return; }
+      if (now() < deadline) setTimeout(watch, 1500);
+      else Kit.toast('T3 Code has not come back yet', { tone: 'danger', detail: 'Its log, in the container’s, says why.' });
+    };
+    setTimeout(watch, 1500);
   };
 
   const toolSheet = { layer: null };
@@ -2351,6 +2551,23 @@
       if (!res.ok && res.error) Kit.toast('Could not set the public URL', { tone: 'danger', detail: res.error });
     },
     'url.edit': (a, el) => openUrlSheet(el),
+
+    'connect.setup': (a, el) => openConnect(el),
+    'connect.restart': (a, el) => openConnect(el, { restart: true }),
+    'connect.off': async () => {
+      const ok = await Kit.confirm({
+        title: 'Turn T3 Connect off?',
+        body: 'This server leaves T3’s relay. Devices that reach it through T3 Connect lose it until it is on again.',
+        consequences: [{ icon: 'check', text: 'Your T3 sign-in is kept: turning it on again asks for no new code.' }],
+        confirm: 'Turn off',
+      });
+      if (!ok) return;
+      const res = await api('/connect/unlink', { body: {} });
+      if (!res.ok) { Kit.toast('Could not turn T3 Connect off', { tone: 'danger', detail: res.error }); return; }
+      Kit.toast('T3 Connect is off');
+      loadStatus();
+    },
+    't3.restart': () => restartT3(),
 
     'key.show': async () => {
       if (state.route !== 'environment') go('environment');

@@ -1317,6 +1317,40 @@ one_replaces_key() {
 check "the setup page replaces the key: the old one stops working, the browser stays in" one_replaces_key
 check "and t3-expose follows the new key" \
   "output_has 'docker exec ${NAME}-one t3-expose' 'PORT\\|Nothing is listening'"
+
+# T3 Code runs under docker/run-t3.sh, so the setup page can restart it (T3
+# Connect's link takes effect on a start) while the container keeps running.
+printf '\nRestarting T3 Code, T3 Connect\n'
+ONE_PID_FILE=/tmp/t3code/t3.pid
+one_t3_pid() { docker exec "${NAME}-one" cat "$ONE_PID_FILE" 2>/dev/null; }
+one_restarts_t3() {
+  local before started code
+  before="$(one_t3_pid)"
+  [ -n "$before" ] || return 1
+  started="$(docker inspect -f '{{.State.StartedAt}}' "${NAME}-one")"
+  code="$(curl -sS --noproxy '*' --max-time 10 -o /dev/null -w '%{http_code}' -b "$ONE_JAR" \
+    -H 'content-type: application/json' -d '{}' "${ONE_URL}/__setup/t3/restart")"
+  [ "$code" = 202 ] || return 1
+  retry 30 "[ -n \"\$(one_t3_pid)\" ] && [ \"\$(one_t3_pid)\" != '$before' ] && curl -fsS --noproxy '*' --max-time 3 -o /dev/null ${ONE_URL}/.well-known/t3/environment" || return 1
+  # The same container, not one the runtime restarted.
+  [ "$(docker inspect -f '{{.State.StartedAt}}' "${NAME}-one")" = "$started" ]
+}
+check "the setup page restarts T3 Code, and the container keeps running" one_restarts_t3
+check "the log says it was asked for" \
+  "output_has 'docker logs ${NAME}-one' 'restarting T3 Code, as asked on the setup page'"
+check "status reports T3 Connect off, with its relay client ready" \
+  "one_status | jq -e '.connect.state == \"off\" and .connect.relayClient.status == \"available\"'"
+# docker stop reaches T3 Code through the supervisor, which then exits with
+# it, well inside the timeout: a SIGKILL at the deadline would read as 137.
+one_stops_cleanly() {
+  local started took code
+  started=$SECONDS
+  docker stop -t 30 "${NAME}-one" >/dev/null || return 1
+  took=$((SECONDS - started))
+  code="$(docker inspect -f '{{.State.ExitCode}}' "${NAME}-one")"
+  [ "$took" -lt 25 ] && [ "$code" != 137 ]
+}
+check "docker stop shuts it down through the supervisor, not at the deadline" one_stops_cleanly
 docker rm -f "${NAME}-one" >/dev/null 2>&1 || true
 
 # A port the router cannot serve must stop the container with the reason, not

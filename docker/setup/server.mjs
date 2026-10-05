@@ -14,7 +14,7 @@ import { execFile } from "node:child_process";
 import { timingSafeEqual, randomBytes } from "node:crypto";
 import { promisify } from "node:util";
 import { gzip as gzipCallback } from "node:zlib";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, rmSync, statSync } from "node:fs";
 import vm from "node:vm";
 import {
   withTimeout,
@@ -30,6 +30,7 @@ import { createAntigravity } from "./antigravity.mjs";
 import { createT3Sessions } from "./t3-session.mjs";
 import { clientAddress } from "./client-address.mjs";
 import { newKey, readKeyFile, writeKeyFile } from "./setup-key.mjs";
+import { connectState, jsonFrom, parseLinkOutput } from "./connect.mjs";
 import {
   checkReaches, clearSaved, parsePublicUrl, platformUrl, readSaved, resolvePublicUrl, writeSaved,
 } from "./public-url.mjs";
@@ -720,7 +721,14 @@ const status = async () => {
     // The platform's own address, also when something else overrides it, so
     // the page can offer to go back to it.
     publicUrlPlatform: platformUrl(process.env),
-    t3: { port: Number(T3_PORT), bind: `${process.env.T3CODE_HOST || "0.0.0.0"}:${T3_PORT}` },
+    t3: {
+      port: Number(T3_PORT),
+      bind: `${process.env.T3CODE_HOST || "0.0.0.0"}:${T3_PORT}`,
+      // Under the image's supervisor (docker/run-t3.sh), this page can
+      // restart it; the pid changing is how it sees the restart land.
+      pid: t3Pid(),
+    },
+    connect: await connectFacts(),
     setupPort: PORT,
     // T3_SINGLE_PORT: both services behind one listener, this page under
     // `prefix` there. The page shows it beside the two ports it fronts.
@@ -842,6 +850,162 @@ const setPublicUrl = async (value, { check: shouldCheck = true } = {}) => {
   writeSaved(STATE_DIR, parsed.url);
   recordEvent("url.set", "Public URL set", hostOf(parsed.url));
   return { http: 200, body: { ok: true, publicUrl: parsed.url, publicUrlSource: "saved", check } };
+};
+
+// --- restarting T3 Code ---------------------------------------------------
+//
+// T3 Code runs under docker/run-t3.sh, which starts it again when asked: a
+// request file, then SIGTERM, so it shuts down exactly as for `docker stop`.
+// Anything T3 Code only reads on a start (T3 Connect's link) then applies
+// without anyone restarting the container.
+const RUN_DIR = process.env.T3_RUN_DIR || "/tmp/t3code";
+
+const t3Pid = () => {
+  try {
+    const pid = Number(readFileSync(`${RUN_DIR}/t3.pid`, "utf8").trim());
+    return Number.isInteger(pid) && pid > 1 ? pid : null;
+  } catch {
+    return null;
+  }
+};
+
+// When T3 Code last started: the supervisor writes its pid file on each start.
+const t3StartedAt = () => {
+  try {
+    return statSync(`${RUN_DIR}/t3.pid`).mtimeMs;
+  } catch {
+    return 0;
+  }
+};
+
+const restartT3 = (why = null) => {
+  const pid = t3Pid();
+  if (!pid) {
+    return { http: 409, body: { ok: false, code: "unsupervised", error: "T3 Code is not running under the image's supervisor, so this page cannot restart it. Restart the container instead." } };
+  }
+  const request = `${RUN_DIR}/restart`;
+  try {
+    writeFileSync(request, `${new Date().toISOString()}\n`);
+    process.kill(pid, "SIGTERM");
+  } catch (error) {
+    rmSync(request, { force: true });
+    return { http: 500, body: { ok: false, error: `Could not restart T3 Code (${error.code ?? error.message}).` } };
+  }
+  forgetConnect();
+  recordEvent("t3.restarted", "Restarted T3 Code", why);
+  return { http: 202, body: { ok: true, pid } };
+};
+
+// --- T3 Connect -------------------------------------------------------------
+//
+// Through T3 Code's own CLI (connect.mjs says why). `status` starts a t3
+// process, about a second of CPU, so the answer is kept: five minutes while
+// nothing is happening, ten seconds while a link waits on T3 Code's start (so
+// the page sees it come on). Anything this page does to Connect drops it.
+const CONNECT_FRESH_MS = { idle: 5 * 60_000, pending: 10_000 };
+let connectCache = { at: 0, value: null, refreshing: null };
+// When this service saw a sign-in finish. A link saved after T3 Code's last
+// start still needs one; one saved before it is being made, and another
+// restart would only interrupt that. Unknown (0) after this service restarts.
+let connectLinkedAt = 0;
+
+const refreshConnect = () => {
+  connectCache.refreshing ??= t3(["connect", "status", "--json"])
+    .then(({ stdout }) => {
+      connectCache = { at: Date.now(), value: connectState(jsonFrom(stdout)), refreshing: null };
+    })
+    .catch(() => {
+      connectCache = { ...connectCache, at: Date.now(), refreshing: null };
+    });
+  return connectCache.refreshing;
+};
+
+const forgetConnect = () => {
+  connectCache = { ...connectCache, at: 0 };
+};
+
+/**
+ * The last answer, after a short wait for a fresh one when it is stale, with
+ * `startedSinceLink`: whether T3 Code has started since the sign-in this
+ * service saw finish (null when it saw none).
+ */
+const connectFacts = async () => {
+  const fresh = connectCache.value?.state === "pending" ? CONNECT_FRESH_MS.pending : CONNECT_FRESH_MS.idle;
+  if (Date.now() - connectCache.at > fresh) {
+    await withTimeout(refreshConnect(), connectCache.value ? 300 : 3000);
+  }
+  if (!connectCache.value) return null;
+  return { ...connectCache.value, startedSinceLink: connectLinkedAt ? t3StartedAt() > connectLinkedAt : null };
+};
+
+/**
+ * `t3 connect link --headless`, as a sign-in session the page's sheet shows
+ * like an agent's device sign-in: a link, a code, and a wait for approval.
+ * The link it saves is made on T3 Code's next start; the page offers that
+ * restart once this is done.
+ */
+const startConnectLink = () => {
+  const child = spawn(T3_LAUNCHER, ["connect", "link", "--headless"], {
+    env: { ...process.env, NO_COLOR: "1" },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const id = randomBytes(9).toString("hex");
+  const session = {
+    id, agentId: "connect", state: "starting", url: null, code: null, needsCode: false,
+    output: "", error: null, child, startedAt: Date.now(), identity: null,
+  };
+  const absorb = (chunk) => {
+    session.output = (session.output + stripAnsi(String(chunk))).slice(-8000);
+    const seen = parseLinkOutput(session.output);
+    if (!session.url && seen.url) {
+      session.url = seen.url;
+      run("qrencode", ["-t", "SVG", "-m", "1", "-o", "-", session.url])
+        .then(({ stdout }) => { session.qr = stdout; })
+        .catch(() => {});
+    }
+    session.code ??= seen.code;
+    if (seen.expiresInMs && !session.expiresAt) session.expiresAt = Date.now() + seen.expiresInMs;
+    session.identity ??= seen.identity;
+    if (session.url && session.state === "starting") session.state = "awaiting-browser";
+  };
+  child.stdout.on("data", absorb);
+  child.stderr.on("data", absorb);
+  child.on("error", (error) => { session.state = "failed"; session.error = String(error.message); });
+  child.on("close", (code) => {
+    forgetConnect();
+    if (TERMINAL_STATES.has(session.state)) return;
+    if (code === 0 && parseLinkOutput(session.output).authorized) {
+      session.state = "done";
+      connectLinkedAt = Date.now();
+      recordEvent("connect.linked", "Signed in to T3 Connect", session.identity);
+      return;
+    }
+    session.state = "failed";
+    session.error = session.output.trim().split("\n").slice(-3).join(" ").slice(0, 300) || `exited with code ${code}`;
+  });
+  sessions.set(id, session);
+  setTimeout(() => {
+    if (!TERMINAL_STATES.has(session.state)) {
+      try { child.kill(); } catch {}
+      session.state = "failed";
+      session.error = "Timed out waiting for the approval.";
+    }
+  }, SESSION_TTL_MS).unref?.();
+  return session;
+};
+
+/** Off again: the environment leaves the relay, and the sign-in is kept. */
+const unlinkConnect = async () => {
+  try {
+    await t3(["connect", "unlink"]);
+  } catch (error) {
+    const said = String(error?.stdout ?? "").trim() || String(error?.stderr ?? "").trim() || String(error?.message ?? error);
+    return { http: 500, body: { ok: false, error: said.split("\n").slice(-2).join(" ").slice(0, 300) } };
+  } finally {
+    forgetConnect();
+  }
+  recordEvent("connect.unlinked", "Turned T3 Connect off");
+  return { http: 200, body: { ok: true, connect: await connectFacts() } };
 };
 
 /**
@@ -1124,7 +1288,7 @@ const startAntigravitySignin = async () => {
 
 const publicSession = (s) => ({
   id: s.id, agent: s.agentId, state: s.state, url: s.url, code: s.code, qr: s.qr ?? null,
-  needsCode: s.needsCode, error: s.error,
+  needsCode: s.needsCode, error: s.error, identity: s.identity ?? null,
   // When the wait for the browser step gives up, for the device code's countdown.
   startedAt: s.startedAt, expiresAt: s.expiresAt ?? s.startedAt + SESSION_TTL_MS,
   tail: s.output.trim().split("\n").slice(-4).join("\n"),
@@ -1726,7 +1890,7 @@ const cancelLifecycle = (target, rawId) => {
 };
 
 const ROUTES = ["/login", "/logout", "/hello", "/status", "/pair", "/revoke", "/ports",
-  "/public-url/clear", "/public-url", "/setup-key/reveal", "/setup-key/replace",
+  "/public-url/clear", "/public-url", "/setup-key/reveal", "/setup-key/replace", "/connect/unlink", "/t3/restart",
   "/ports/expose", "/ports/unexpose",
   "/harnesses/install", "/harnesses/update", "/harnesses/uninstall", "/harnesses/cancel", "/harnesses/versions", "/harnesses/enable", "/harnesses",
   "/toolchains/install", "/toolchains/update", "/toolchains/uninstall", "/toolchains/cancel",
@@ -2069,6 +2233,7 @@ const server = createServer(async (req, res) => {
       try {
         const input = JSON.parse((await readBody(req)) || "{}");
         if (input.agent === "antigravity") return sendJson(res, 200, publicSession(await startAntigravitySignin()));
+        if (input.agent === "connect") return sendJson(res, 200, publicSession(startConnectLink()));
         return sendJson(res, 200, publicSession(await startSignin(input.agent)));
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
@@ -2138,6 +2303,17 @@ const server = createServer(async (req, res) => {
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });
       }
+    }
+
+    if (req.method === "POST" && route === "/t3/restart") {
+      const input = JSON.parse((await readBody(req)) || "{}");
+      const answer = restartT3(input.why === "connect" ? "to turn T3 Connect on" : null);
+      return sendJson(res, answer.http, answer.body);
+    }
+
+    if (req.method === "POST" && route === "/connect/unlink") {
+      const answer = await unlinkConnect();
+      return sendJson(res, answer.http, answer.body);
     }
 
     // The key itself, for a signed-in browser to copy. Nothing new to it: one

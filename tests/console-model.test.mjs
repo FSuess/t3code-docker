@@ -336,6 +336,48 @@ test("the palette shows the setup key, and replaces it unless T3_SETUP_KEY sets 
   assert.deepEqual(labels(statusWith({ setupKeySource: "env" })), ["Show setup key -> key.show"]);
 });
 
+test("T3 Connect reads as one state with at most one next step", () => {
+  const view = (connect, t3 = { port: 3773, pid: 42 }) => plain(M.connectView(statusWith({ connect, t3 })));
+  const saved = (over) => ({ state: "off", desired: false, authenticated: false, linked: false, relayHost: null, startedSinceLink: null, ...over });
+
+  const off = view(saved());
+  assert.equal(off.state, "off");
+  assert.deepEqual(off.action, { cmd: "connect.setup", label: "Set up", icon: "globe" });
+  assert.match(off.text, /no domain or tunnel of your own/);
+
+  const restart = view(saved({ state: "pending", desired: true, authenticated: true }));
+  assert.equal(restart.state, "restart");
+  assert.equal(restart.action.cmd, "connect.restart");
+  assert.equal(view(saved({ state: "pending", desired: true, authenticated: true, startedSinceLink: false })).state, "restart",
+    "signed in after T3 Code last started: it still needs one");
+
+  const unsupervised = view(saved({ state: "pending", desired: true, authenticated: true }), { port: 3773, pid: null });
+  assert.equal(unsupervised.action, null, "no button this page cannot carry out");
+  assert.match(unsupervised.text, /restart the container/);
+
+  const linking = view(saved({ state: "pending", desired: true, authenticated: true, startedSinceLink: true }));
+  assert.equal(linking.state, "linking", "T3 Code has started since: another restart would only interrupt it");
+  assert.equal(linking.action, null);
+  assert.equal(linking.badge.spinner, true);
+
+  const on = view(saved({ state: "on", desired: true, authenticated: true, linked: true, relayHost: "relay.t3.codes" }));
+  assert.equal(on.state, "on");
+  assert.match(on.text, /through relay\.t3\.codes\./);
+  assert.equal(on.action.cmd, "connect.off");
+
+  assert.equal(view(saved({ state: "signin", desired: true })).action.cmd, "connect.setup");
+  assert.deepEqual(view(null), { state: "unknown", badge: null, text: "Its state could not be read just now.", action: null });
+});
+
+test("the palette offers what T3 Connect needs next, and a restart when T3 Code can take one", () => {
+  const labels = (s) => plain(M.paletteItems(s, null, ui(), NOW)).filter((i) => /T3 Connect|Restart T3 Code/.test(i.label)).map((i) => i.label);
+  const t3 = { port: 3773, pid: 42 };
+  assert.deepEqual(labels(statusWith({ t3, connect: { state: "off" } })), ["Set up T3 Connect", "Restart T3 Code"]);
+  assert.deepEqual(labels(statusWith({ t3, connect: { state: "pending" } })), ["Restart T3 Code to turn T3 Connect on", "Restart T3 Code"]);
+  assert.deepEqual(labels(statusWith({ t3, connect: { state: "on" } })), ["Turn T3 Connect off", "Restart T3 Code"]);
+  assert.deepEqual(labels(statusWith({ t3: { port: 3773 }, connect: { state: "on" } })), ["Turn T3 Connect off"], "no restart without the supervisor");
+});
+
 test("a later step that needs the user is a warning, not a second todo", () => {
   const s = statusWith({ sessions: [], harnesses: [harness("grok", { signedIn: false }), harness("cursor", { signedIn: false })] });
   const r = M.readiness(s, ui());

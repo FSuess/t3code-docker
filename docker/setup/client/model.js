@@ -839,6 +839,65 @@ const T3Model = (() => {
     expiresTitle: 'Expires ' + absTime(l.expiresAt),
   }));
 
+  // -------------------------------------------------------------- connect --
+  /**
+   * T3 Connect as the page shows it, from status.connect (what T3 Code's CLI
+   * has saved) and status.t3.pid (whether this page can restart T3 Code): a
+   * badge, a line of text, and at most one action.
+   *
+   *   off        not set up
+   *   restart    signed in; T3 Code makes the link when it next starts
+   *   linking    T3 Code has started since, and is making it
+   *   on         linked
+   *   signin     set up, but its sign-in is gone
+   *   unknown    the CLI's answer could not be read
+   */
+  const connectView = (s) => {
+    const c = s && s.connect;
+    const restartable = Boolean(s && s.t3 && s.t3.pid);
+    if (!c) return { state: 'unknown', badge: null, text: 'Its state could not be read just now.', action: null };
+    if (c.state === 'on') {
+      return {
+        state: 'on',
+        badge: { tone: 'ok', text: 'On' },
+        text: 'Devices signed in to your T3 account reach this server through ' + (c.relayHost || 'T3’s relay') + '.',
+        action: { cmd: 'connect.off', label: 'Turn off' },
+      };
+    }
+    if (c.state === 'pending' && c.startedSinceLink === true) {
+      return {
+        state: 'linking',
+        badge: { tone: 'info', text: 'Linking', spinner: true },
+        text: 'T3 Code is making the link. It can take a minute.',
+        action: null,
+      };
+    }
+    if (c.state === 'pending') {
+      return {
+        state: 'restart',
+        badge: { tone: 'info', text: 'Needs a restart' },
+        text: restartable
+          ? 'Signed in. T3 Code makes the link when it next starts.'
+          : 'Signed in. T3 Code makes the link when it next starts, so restart the container.',
+        action: restartable ? { cmd: 'connect.restart', label: 'Restart T3 Code', icon: 'refresh-cw' } : null,
+      };
+    }
+    if (c.state === 'signin') {
+      return {
+        state: 'signin',
+        badge: { tone: 'warn', text: 'Signed out' },
+        text: 'Its sign-in is gone, so the link cannot be made until you sign in again.',
+        action: { cmd: 'connect.setup', label: 'Sign in', icon: 'log-in' },
+      };
+    }
+    return {
+      state: 'off',
+      badge: null,
+      text: 'Reach this server from anywhere through T3’s relay, with no domain or tunnel of your own. Devices then sign in with your T3 account instead of a pairing link.',
+      action: { cmd: 'connect.setup', label: 'Set up', icon: 'globe' },
+    };
+  };
+
   // ----------------------------------------------------------- public url --
   /** Where the public URL came from, as the page says it: "set here", "from Railway". */
   const publicUrlSource = (s) => {
@@ -1219,6 +1278,11 @@ const T3Model = (() => {
     add('Actions', 'Lock console', 'lock', { cmd: 'lock' });
     if (s.publicUrl) add('Environment', 'Copy public URL', 'copy', { cmd: 'copy', text: s.publicUrl, toast: 'Public URL copied' }, { meta: { text: hostOf(s.publicUrl), mono: true } });
     if (s.publicUrlSource !== 'env') add('Environment', s.publicUrl ? 'Change public URL' : 'Set public URL', 'globe', { cmd: 'url.edit' }, { meta: s.publicUrl ? { text: publicUrlSource(s) } : { text: 'not set', dot: 'warn' }, attention: !s.publicUrl });
+    const connect = connectView(s);
+    if (connect.state === 'off' || connect.state === 'signin') add('Environment', 'Set up T3 Connect', 'globe', { cmd: 'connect.setup' });
+    if (connect.state === 'restart') add('Environment', 'Restart T3 Code to turn T3 Connect on', 'refresh-cw', { cmd: 'connect.restart' }, { attention: true });
+    if (connect.state === 'on') add('Environment', 'Turn T3 Connect off', 'globe', { cmd: 'connect.off' });
+    if (s.t3 && s.t3.pid) add('Actions', 'Restart T3 Code', 'refresh-cw', { cmd: 't3.restart' });
     add('Environment', 'Show setup key', 'key-round', { cmd: 'key.show' });
     if (s.setupKeySource && s.setupKeySource !== 'env') add('Environment', 'Replace setup key', 'refresh-cw', { cmd: 'key.replace' });
     add('Environment', 'Copy diagnostics', 'copy', { cmd: 'diagnostics' });
@@ -1300,7 +1364,7 @@ const T3Model = (() => {
     monogram, managedOn, isVersionSpec, isToolSpec, specPrefix, SPEC_SAMPLES, searchRegistry, resolveRelease, matchReleases, releaseIndex, heldRelease, versionOf, toolName, SUGGESTED_TOOLS,
     deviceRows, linkRows, deviceKind, deviceName,
     readiness, readySummary, needsYou, activity, setupBanner,
-    publicUrlSource, hereOffer,
+    publicUrlSource, hereOffer, connectView,
     navBadges, attentionCount, summaries,
     paletteItems, searchPalette,
     redactedDiagnostics,

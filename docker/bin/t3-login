@@ -53,8 +53,10 @@ them in the background; if one is not there yet, wait for it (the setup page
 shows progress) or run `t3-harness install <id>`.
 
 `connect` authorizes this environment for T3 Connect. It does not start or
-disturb the running server - the link takes effect on the next start, so
-restart the container afterwards.
+disturb the running server - the link takes effect on T3 Code's next start, so
+restart it afterwards: Restart T3 Code under Environment on the setup page, or
+restart the container. The setup page can also do the whole sign-in itself
+(Devices -> From anywhere).
 USAGE
 }
 
