@@ -80,6 +80,28 @@ test("agents and toolchains own their names in every spelling", () => {
   assert.equal(managedElsewhere("npm:prettier", index), null);
 });
 
+test("the source control CLIs own their names; the image's gh stays free to add", () => {
+  const index = indexRegistry(parseRegistry(JSON.stringify([
+    { short: "glab", backends: ["gitlab:gitlab-org/cli", "asdf:mise-plugins/mise-glab"], bins: ["glab"], description: "A GitLab CLI tool" },
+    { short: "azure-cli", backends: ["pypi:azure-cli"], bins: ["az"], description: "Azure CLI", aliases: ["azure"] },
+    { short: "gh", backends: ["aqua:cli/cli"], bins: ["gh"], description: "GitHub's official command line tool" },
+  ])));
+  const scm = (id, name) => ({ kind: "source-control", id, name });
+  assert.deepEqual(managedElsewhere("glab", index), scm("glab", "GitLab CLI"));
+  assert.deepEqual(managedElsewhere("gitlab:gitlab-org/cli", index), scm("glab", "GitLab CLI"));
+  assert.deepEqual(managedElsewhere("azure", index), scm("az", "Azure CLI"));
+  assert.deepEqual(managedElsewhere("pypi:azure-cli", index), scm("az", "Azure CLI"));
+  assert.deepEqual(managedElsewhere("azure-cli", null), scm("az", "Azure CLI"), "the registry name, without the registry");
+  assert.deepEqual(managedElsewhere("pipx:azure-cli", null), scm("az", "Azure CLI"));
+  assert.deepEqual(managedElsewhere("forgejo:forgejo-contrib/forgejo-cli", null), scm("fj", "Forgejo CLI"));
+  assert.deepEqual(managedElsewhere("forgejo:gitea/tea", null), scm("tea", "Gitea CLI"));
+  // az installs as pipx:azure-cli. An azure-cli someone added before stays theirs to see.
+  assert.equal(isReservedTool("pipx:azure-cli"), true);
+  assert.equal(isReservedTool("azure-cli"), false);
+  assert.equal(isReservedTool("gh"), false);
+  assert.equal(managedElsewhere("gh", index), null);
+});
+
 test("an alias becomes its registry name; specs and unknown names stay as typed", () => {
   const index = indexRegistry(parseRegistry(REGISTRY));
   assert.equal(canonicalTool("rg", index), "ripgrep");

@@ -1,7 +1,8 @@
-// The five supported agent harnesses. This file is data only: every executable
-// name, architecture, credential surface, and minimum version the manager
-// enforces comes from here, so the module, the setup console, and the CLI all
-// describe the same harnesses.
+// The five supported agent harnesses, the toolchains, and the source control
+// CLIs. This file is data only: every executable name, architecture,
+// credential surface, and minimum version the manager enforces comes from
+// here, so the module, the setup console, and the CLI all describe the same
+// tools.
 
 /**
  * T3 refuses to serve OpenCode below this version, so a managed install must
@@ -173,4 +174,100 @@ export const TOOLCHAINS = Object.freeze([
 /** Look up one toolchain by its stable id. */
 export function getToolchain(id) {
   return TOOLCHAINS.find((entry) => entry.id === id) ?? null;
+}
+
+/**
+ * The command-line tools T3 Code drives for each source control provider
+ * (its Settings > Source Control): it looks each up by name on PATH and asks
+ * it whether it is signed in. Bitbucket needs none; T3 talks to its API with
+ * a token saved in that same settings page.
+ *
+ * GitHub's `gh` is part of the image (`inImage`), at the minimum version T3
+ * requires, which the image build checks. The rest install like a toolchain -
+ * through mise, into the persistent home - but only when asked: a server
+ * rarely talks to more than one host, and Azure's CLI alone is a 330 MB
+ * Python install. `bin` is the command T3 runs, `probe` proves an install
+ * runs, and `extensions` are az extensions installed with it, because T3's
+ * Azure DevOps support runs `az repos`. tea is published on gitea.com, which
+ * mise's forgejo backend reaches through `api_url`; the option has to be part
+ * of every spec mise resolves releases for, not only the one it installs.
+ */
+export const SOURCE_CONTROL = Object.freeze([
+  {
+    id: "gh",
+    name: "GitHub CLI",
+    provider: "GitHub",
+    inImage: true,
+    bin: "gh",
+    probe: ["gh", "--version"],
+    versionPattern: "gh version (\\d+\\.\\d+\\.\\d+)",
+    auth: "gh",
+  },
+  {
+    id: "glab",
+    name: "GitLab CLI",
+    provider: "GitLab",
+    miseTool: "glab",
+    bin: "glab",
+    probe: ["glab", "--version"],
+    auth: "glab",
+  },
+  {
+    id: "fj",
+    name: "Forgejo CLI",
+    provider: "Forgejo",
+    miseTool: "forgejo:forgejo-contrib/forgejo-cli",
+    bin: "fj",
+    probe: ["fj", "version"],
+    auth: "fj",
+  },
+  {
+    id: "tea",
+    name: "Gitea CLI",
+    provider: "Gitea",
+    miseTool: "forgejo:gitea/tea",
+    miseOptions: "api_url=https://gitea.com/api/v1",
+    bin: "tea",
+    probe: ["tea", "--version"],
+    auth: "tea",
+  },
+  {
+    id: "az",
+    name: "Azure CLI",
+    provider: "Azure DevOps",
+    // Through pipx, which the image has. mise's registry installs azure-cli
+    // from PyPI with options only uv understands, and uv is a toolchain that
+    // may not be installed. pipx uses uv when it is there anyway.
+    miseTool: "pipx:azure-cli",
+    // The registry's own name for the same package: refused as an added tool,
+    // so az is never installed twice.
+    registryNames: ["azure-cli"],
+    bin: "az",
+    probe: ["az", "version", "--output", "json"],
+    extensions: ["azure-devops"],
+    auth: "az",
+  },
+]);
+
+/** Look up one source control CLI by its stable id. */
+export function getSourceControl(id) {
+  return SOURCE_CONTROL.find((entry) => entry.id === id) ?? null;
+}
+
+/**
+ * Everything installed and updated the way a toolchain is: the toolchains, and
+ * the source control CLIs that are not part of the image. One lookup, so the
+ * lock, the state record and the routes treat them alike.
+ */
+export function getManagedTool(id) {
+  const scm = getSourceControl(id);
+  return getToolchain(id) ?? (scm && !scm.inImage ? scm : null);
+}
+
+/**
+ * The spec mise resolves an entry's releases under: its tool, with the tool
+ * options that change where releases come from (tea's api_url).
+ */
+export function releaseSpec(entry) {
+  return entry.miseOptions ? `${entry.miseTool}[${entry.miseOptions}]` : entry.miseTool;
 }
