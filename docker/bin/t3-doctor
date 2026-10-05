@@ -130,7 +130,11 @@ printf '  %-22s %s\n' "state dir" "${T3CODE_HOME:-unset}"
 printf '  %-22s %s\n' "bind" "${T3CODE_HOST:-unset}:${T3CODE_PORT:-unset}"
 printf '  %-22s %s\n' "public URL" "${T3_PUBLIC_URL:-<unset - t3-pair will warn>}"
 if [ -n "${T3_SINGLE_PORT:-}" ]; then
-  printf '  %-22s %s\n' "one port" "${T3_SINGLE_PORT} (T3 Code at /, setup page at ${T3_SETUP_BASE_PATH:-/__setup})"
+  if [ "${T3_SETUP_ENABLED:-1}" = 1 ]; then
+    printf '  %-22s %s\n' "one port" "${T3_SINGLE_PORT} (T3 Code at /, the setup page under its prefix)"
+  else
+    printf '  %-22s %s\n' "one port" "${T3_SINGLE_PORT} (T3 Code)"
+  fi
 fi
 printf '  %-22s %s\n' "workspace" "${T3_WORKSPACE:-unset}"
 

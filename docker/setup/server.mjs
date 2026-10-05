@@ -51,6 +51,8 @@ const BASE_PATH = (process.env.T3_SETUP_BASE_PATH ?? "").replace(/\/+$/, "");
 // T3_SINGLE_PORT asks for it. The entrypoint has already refused a value it
 // could not serve, so anything here is a port.
 const SINGLE_PORT = Number(process.env.T3_SINGLE_PORT) || null;
+// Where the router puts this page, as it normalises T3_SETUP_BASE_PATH.
+const SINGLE_PREFIX = BASE_PATH ? (BASE_PATH.startsWith("/") ? BASE_PATH : `/${BASE_PATH}`) : "/__setup";
 // Where T3 Code keeps its state; the volume a user mounts is the home around it.
 const STATE_DIR = process.env.T3CODE_HOME || `${process.env.HOME || "/home/t3"}/.t3`;
 const VOLUME = STATE_DIR.replace(/\/\.t3\/?$/, "") || STATE_DIR;
@@ -704,7 +706,7 @@ const status = async () => {
     setupPort: PORT,
     // T3_SINGLE_PORT: both services behind one listener, this page under
     // `prefix` there. The page shows it beside the two ports it fronts.
-    singlePort: SINGLE_PORT ? { port: SINGLE_PORT, prefix: BASE_PATH || "/__setup" } : null,
+    singlePort: SINGLE_PORT ? { port: SINGLE_PORT, prefix: SINGLE_PREFIX } : null,
     setupKeySource: SETUP_KEY_SOURCE,
     // Settings an older image baked in that this container still carries, which
     // the user environment dropped for everything the entrypoint started

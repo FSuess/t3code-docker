@@ -432,11 +432,8 @@ start_router() {
       sleep "$delay"
     done
   ) &
-  if [ "$T3_SETUP_ENABLED" = "1" ]; then
-    log "one port: ${T3_SINGLE_PORT} serves T3 Code, and the setup page under ${T3_SETUP_BASE_PATH:-/__setup}"
-  else
-    log "one port: ${T3_SINGLE_PORT} serves T3 Code"
-  fi
+  # The router's own first line says exactly what it serves where.
+  log "one port: ${T3_SINGLE_PORT}, in front of T3 Code and the setup page"
 }
 
 start_router

@@ -149,6 +149,9 @@ test("configuration: off when unset, and every mistake says what to change", () 
     setupPrefix: "/__setup",
   });
   assert.deepEqual(readConfig({ T3_SINGLE_PORT: "8080", T3_SETUP_ENABLED: "0" }).setup, null);
+  assert.deepEqual(readConfig({ T3_SINGLE_PORT: "8080", T3_SETUP_ENABLED: "true" }).setup, null,
+    "on only when the entrypoint starts it, which is for 1 alone");
+  assert.equal(readConfig({ T3_SINGLE_PORT: "8080", T3_SETUP_ENABLED: " 1 " }).setup.port, 3774);
   assert.equal(readConfig({ T3_SINGLE_PORT: "8080", T3_SETUP_BASE_PATH: "/setup/" }).setupPrefix, "/setup");
   assert.equal(readConfig({ T3_SINGLE_PORT: "3774", T3_SETUP_ENABLED: "0" }).port, 3774, "the setup page's port is free when it is off");
 

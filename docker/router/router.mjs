@@ -496,7 +496,10 @@ export function createRouterServer(options) {
 const PORT_RE = /^\d{1,5}$/;
 const portOf = (value) => (PORT_RE.test(String(value ?? "").trim()) ? Number(String(value).trim()) : NaN);
 const validPort = (port) => Number.isInteger(port) && port >= 1 && port <= 65535;
-const enabled = (value) => !/^(0|false|no|off)$/i.test(String(value ?? "").trim());
+// Exactly as the entrypoint decides whether to start the setup page at all:
+// "1" or nothing. Anything else routing /__setup to a page that never started
+// would show "restarting" forever.
+const setupStarts = (value) => String(value ?? "1").trim() === "1";
 
 /**
  * The router's configuration from the environment, or an Error whose message
@@ -511,7 +514,7 @@ export function readConfig(env = process.env) {
   }
   const t3Port = portOf(env.T3CODE_PORT ?? 3773);
   if (!validPort(t3Port)) throw new Error(`T3CODE_PORT=${env.T3CODE_PORT} is not a port.`);
-  const setupOn = enabled(env.T3_SETUP_ENABLED ?? "1");
+  const setupOn = setupStarts(env.T3_SETUP_ENABLED);
   const setupPort = portOf(env.T3_SETUP_PORT ?? 3774);
   if (setupOn && !validPort(setupPort)) throw new Error(`T3_SETUP_PORT=${env.T3_SETUP_PORT} is not a port.`);
   if (port === t3Port) {
