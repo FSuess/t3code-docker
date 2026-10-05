@@ -23,7 +23,8 @@ services:
       T3_PRINT_PAIRING_ON_START: ${T3_PRINT_PAIRING_ON_START:-0}
       # What to install onto the volume on first start, in the background:
       # all (the five agents plus Go, Rust, Bun, Deno, uv), agents,
-      # toolchains, a list such as claude,codex,go, or none.
+      # toolchains, source-control (glab, fj, tea, az; never part of all),
+      # a list such as claude,codex,go,glab, or none.
       T3_PREINSTALL: ${T3_PREINSTALL:-all}
       T3_PERSIST_AGENT_CREDENTIALS: ${T3_PERSIST_AGENT_CREDENTIALS:-1}
       # Used by the DeepSeek-through-OpenCode example. Keys for the harnesses
