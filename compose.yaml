@@ -24,7 +24,8 @@ services:
       # What to install onto the volume on first start, in the background:
       # all (the five agents plus Go, Rust, Bun, Deno, uv), agents,
       # toolchains, source-control (glab, fj, tea, az; never part of all),
-      # a list such as claude,codex,go,glab, or none.
+      # a list such as claude,codex,go,glab, or none. They combine:
+      # all,source-control adds the source control CLIs to all.
       T3_PREINSTALL: ${T3_PREINSTALL:-all}
       T3_PERSIST_AGENT_CREDENTIALS: ${T3_PERSIST_AGENT_CREDENTIALS:-1}
       # Used by the DeepSeek-through-OpenCode example. Keys for the harnesses

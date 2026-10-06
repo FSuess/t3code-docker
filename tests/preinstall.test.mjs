@@ -29,7 +29,7 @@ function memoryFs() {
 }
 
 /** A fake manager: `installed` holds what is present, `fail` what will fail. */
-function fakeManager({ installed = [], fail = {}, busyFor = {}, declined = [] } = {}) {
+function fakeManager({ installed = [], fail = {}, busyFor = {}, declined = [], providedBy = {} } = {}) {
   const present = new Set(installed);
   const calls = [];
   const side = (kind) => ({
@@ -40,6 +40,7 @@ function fakeManager({ installed = [], fail = {}, busyFor = {}, declined = [] } 
         installedVersion: present.has(id) ? "1.0.0" : null,
         version: present.has(id) ? "1.0.0" : null,
         ...(declined.includes(id) ? { operation: "uninstall", operationState: "ok" } : {}),
+        providedBy: providedBy[id] ?? null,
       };
     },
     async install(id) {
@@ -104,7 +105,28 @@ test("source control CLIs are installed only when named, never by default or all
     assert.equal(ids(value).some((id) => id.startsWith("source-control:")), false, String(value));
   }
   assert.deepEqual(ids("az, claude, glab"), ["agent:claude", "source-control:glab", "source-control:az"]);
-  assert.deepEqual(parsePreinstall("gh").unknown, ["gh"], "the image's gh is not installed");
+  assert.deepEqual(parsePreinstall("gh"), { items: [], unknown: [], inImage: ["gh"] }, "the image's gh is already there");
+  // A group replaces the default unless named with it.
+  assert.equal(ids("default,source-control").length, ids("default").length + scm.length);
+});
+
+test("a CLI an added tool already provides is adopted, not installed a second time", async () => {
+  const fs = memoryFs();
+  const manager = fakeManager({ providedBy: { az: { tool: "azure-cli", version: "2.88.0" } } });
+  const logged = [];
+  const summary = await run(manager, fs, { T3_PREINSTALL: "az,gh" }, { log: (line) => logged.push(line) });
+  assert.deepEqual(manager.calls, []);
+  assert.deepEqual(summary.adopted, ["source-control:az"]);
+  const shown = await readPreinstall({ stateDir: STATE_DIR, fs });
+  assert.deepEqual(shown.items.map((item) => [item.id, item.state]), [["az", "done"]]);
+  assert.ok(logged.includes("T3_PREINSTALL: gh comes with the image; nothing to install"));
+
+  // Added between the look and the install: the refusal means it is there.
+  const raced = fakeManager();
+  raced.sourceControl.install = async (id) => { raced.calls.push(`source-control:${id}`); return { ok: false, code: "provided-elsewhere", error: "az already comes from the added tool azure-cli" }; };
+  const again = await run(raced, memoryFs(), { T3_PREINSTALL: "az" });
+  assert.deepEqual(again.installed, ["source-control:az"]);
+  assert.deepEqual(again.failed, []);
 });
 
 test("a named source control CLI installs after the rest, through its own surface", async () => {

@@ -135,10 +135,11 @@ docker compose exec -it t3code t3-login claude   # sign an agent in from a shell
 background the first time it runs, and not again. That's about 2 GB that stays
 on the volume you already keep instead of being part of every pull. "One click"
 means the setup page installs it when you ask. `T3_PREINSTALL` changes what the
-first start installs: `all` adds Grok and Cursor, `source-control` adds the four
-source control CLIs, and `agents`, `toolchains`, a list like `claude,codex,glab`,
-or `none` also work. Anything left out can be installed from the setup page
-later.
+first start installs: `all` adds Grok and Cursor, `default,source-control` adds
+the four source control CLIs to the usual set, and `agents`, `toolchains`, a
+list like `claude,codex,glab`, or `none` also work. Groups and ids combine; one
+named on its own replaces the default. Anything left out can be installed from
+the setup page later.
 
 Neither image contains credentials or model access. You bring your own
 subscriptions or API keys and sign the agents in yourself.
@@ -743,8 +744,10 @@ Code's own Settings → Source Control.
 `glab`, `fj`, `tea` and `az` install like a toolchain: into the volume through
 mise, at an exact version, one press to update or remove. None of them installs
 on its own, because which host a server talks to can't be guessed and the Azure
-CLI alone takes about 330 MB; `T3_PREINSTALL=source-control` (or a list such as
-`glab,az`) installs them on the first start. `az` comes with the `azure-devops`
+CLI alone takes about 330 MB; `T3_PREINSTALL=default,source-control` (or a
+list such as `default,glab,az`) installs them on the first start along with the
+usual set. A CLI you already added as a tool of your own (`azure-cli`, say) is
+used as it is, and never installed a second time. `az` comes with the `azure-devops`
 extension, which T3 Code needs to reach repositories; a row whose extension has
 gone missing offers **Repair**.
 
@@ -807,7 +810,7 @@ Environment variables (all optional except where noted):
 | `T3_WORKSPACE` | `/workspace` | Scanned for projects |
 | `T3_AUTO_ADD_PROJECTS` | `1` | Register each git checkout under the workspace |
 | `T3_PRINT_PAIRING_ON_START` | `0` | Create a pairing link at startup and print it to the log |
-| `T3_PREINSTALL` | `default` | What the first start installs onto the volume: `default` (Claude Code, Codex, OpenCode and the toolchains), `all` (every agent and toolchain), `agents`, `toolchains`, `source-control` (glab, fj, tea, az), ids like `claude,go,glab`, or `none` |
+| `T3_PREINSTALL` | `default` | What the first start installs onto the volume: `default` (Claude Code, Codex, OpenCode and the toolchains), `all` (every agent and toolchain), `agents`, `toolchains`, `source-control` (glab, fj, tea, az), ids like `claude,go,glab`, or `none`. They combine (`default,source-control`); one on its own replaces the default |
 | `T3_PAIR_TTL` | `30d` | How long links from `t3-pair` can be used |
 | `T3_SETUP_ENABLED` | `1` | Run the setup page |
 | `T3_SETUP_KEY` | *(generated)* | Password for the setup page. Without it, the first start generates one and keeps it on the volume, and the setup page can show and replace it. |

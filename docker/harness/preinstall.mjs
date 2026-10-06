@@ -42,6 +42,8 @@ const TOOLS = TOOLCHAINS.map((entry) => ({ kind: "toolchain", id: entry.id, name
 const SCM = SOURCE_CONTROL.filter((entry) => !entry.inImage)
   .map((entry) => ({ kind: "source-control", id: entry.id, name: entry.name }));
 const KNOWN = [...AGENTS, ...TOOLS, ...SCM];
+// Named, but already there: the image's own gh.
+const IN_IMAGE = new Set(SOURCE_CONTROL.filter((entry) => entry.inImage).map((entry) => entry.id));
 const FIRST_START = new Set(CATALOGUE.filter((entry) => entry.firstStart).map((entry) => entry.id));
 const DEFAULT_ITEMS = [...AGENTS.filter((item) => FIRST_START.has(item.id)), ...TOOLS];
 
@@ -50,16 +52,18 @@ export const keyOf = (item) => `${item.kind}:${item.id}`;
 /**
  * Turn T3_PREINSTALL into an ordered plan: agents first, because they are what
  * someone opening the app is waiting for, then toolchains, then source control
- * CLIs. Unknown words are reported rather than failing the container.
+ * CLIs. Unknown words are reported rather than failing the container, and so
+ * is a CLI the image already has (`inImage`).
  */
 export function parsePreinstall(value) {
   const raw = String(value ?? "").trim().toLowerCase();
-  if (OFF.has(raw)) return { items: [], unknown: [] };
-  if (DEFAULT.has(raw)) return { items: DEFAULT_ITEMS, unknown: [] };
-  if (ALL.has(raw)) return { items: [...AGENTS, ...TOOLS], unknown: [] };
+  if (OFF.has(raw)) return { items: [], unknown: [], inImage: [] };
+  if (DEFAULT.has(raw)) return { items: DEFAULT_ITEMS, unknown: [], inImage: [] };
+  if (ALL.has(raw)) return { items: [...AGENTS, ...TOOLS], unknown: [], inImage: [] };
 
   const wanted = new Set();
   const unknown = [];
+  const inImage = [];
   for (const token of raw.split(/[\s,]+/).filter(Boolean)) {
     if (token === "all") [...AGENTS, ...TOOLS].forEach((item) => wanted.add(keyOf(item)));
     else if (token === "default") DEFAULT_ITEMS.forEach((item) => wanted.add(keyOf(item)));
@@ -69,10 +73,11 @@ export function parsePreinstall(value) {
     else {
       const item = KNOWN.find((candidate) => candidate.id === token);
       if (item) wanted.add(keyOf(item));
+      else if (IN_IMAGE.has(token)) inImage.push(token);
       else unknown.push(token);
     }
   }
-  return { items: KNOWN.filter((item) => wanted.has(keyOf(item))), unknown };
+  return { items: KNOWN.filter((item) => wanted.has(keyOf(item))), unknown, inImage };
 }
 
 export function preinstallPath(stateDir) {
@@ -171,8 +176,9 @@ export async function runPreinstall({
     writes = writes.then(() => writeRecord(fs, file, record), () => writeRecord(fs, file, record));
     return writes;
   };
-  const { items, unknown } = parsePreinstall(env.T3_PREINSTALL);
+  const { items, unknown, inImage } = parsePreinstall(env.T3_PREINSTALL);
   if (unknown.length) log(`T3_PREINSTALL: ignoring unknown ${unknown.join(", ")}`);
+  if (inImage.length) log(`T3_PREINSTALL: ${inImage.join(", ")} comes with the image; nothing to install`);
 
   // Shell links follow what is installed, whatever this run does next.
   try { await manager.refreshLinks?.(); } catch { /* best effort */ }
@@ -191,13 +197,15 @@ export async function runPreinstall({
   summary.skipped = items.filter((item) => !unrecorded.includes(item)).map(keyOf);
 
   // Whatever is already on the volume - an upgrade from a release that ran
-  // this before, or something installed by hand - is adopted up front, so the
-  // page never shows a working agent as queued behind a download.
+  // this before, something installed by hand, or a source control CLI an
+  // added tool provides (azure-cli for az) - is adopted up front, so the page
+  // never shows a working agent as queued behind a download, and a CLI is
+  // never installed twice.
   const pending = [];
   for (const item of unrecorded) {
     const current = await opsFor(item).resolve(item.id, { authenticate: false }).catch(() => null);
-    if (current?.installed) {
-      const version = current.installedVersion ?? current.version ?? null;
+    if (current?.installed || current?.providedBy) {
+      const version = current.installedVersion ?? current.version ?? current.providedBy?.version ?? null;
       record.items[keyOf(item)] = { state: "done", version, at: now(), adopted: true };
       summary.adopted.push(keyOf(item));
     } else if (current?.operation === "uninstall" && current?.operationState === "ok") {
@@ -257,6 +265,8 @@ export async function runPreinstall({
       }
       result = await ops.install(item.id, { onProgress });
     }
+    // An added tool came to provide it in the meantime: what was asked for is there.
+    if (result?.code === "provided-elsewhere") result = { ok: true, adopted: true };
 
     const facts = result?.harness ?? result?.toolchain ?? null;
     failedInARow = result?.ok ? 0 : failedInARow + 1;
