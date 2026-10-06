@@ -489,27 +489,28 @@ const harnessCache = createHarnessCache({
   budgetMs: HARNESS_BUDGET_MS,
 });
 
-/** Authenticated snapshot for /status and /harnesses; explicit cheap polls
- * skip the auth refresh and answer from local state only. Returns the public
- * card rows plus the freshness of the answer.
- */
-// The source control CLIs' facts, the same way: who each is signed in as is
-// a CLI run per host (glab asks its API), so it is refreshed in the background
-// and a poll answers from what is known, or from a cheap read naming none.
+// Who each source control CLI is signed in as, the same way: a check asks the
+// CLI's server (glab its API), so it is refreshed in the background and a poll
+// answers from what is known, or with no verdicts at all. The rows themselves
+// come with the toolchains, from the same `mise ls`; the refresh asks about
+// the rows the last poll read (`sourceControlRows`), and the manager caches
+// each verdict until the CLI's credential files change.
+let sourceControlRows = null;
 const sourceControlCache = createHarnessCache({
   full: async () => {
-    const { sourceControl, degraded } = await (await loadHarness()).sourceControl.status();
-    return { harnesses: sourceControl, degraded };
+    const verdicts = await (await loadHarness()).sourceControl.auth(sourceControlRows);
+    return { harnesses: Object.entries(verdicts).map(([id, auth]) => ({ id, auth })), degraded: [] };
   },
-  cheap: async () => {
-    const { sourceControl, degraded } = await (await loadHarness()).sourceControl.status({ authenticate: false });
-    return { harnesses: sourceControl, degraded };
-  },
+  cheap: async () => ({ harnesses: [], degraded: [] }),
   budgetMs: HARNESS_BUDGET_MS,
 });
 /** The mise-installed source control CLIs the last status read found installed. */
 const knownSourceControl = new Set();
 
+/** Authenticated snapshot for /status and /harnesses; explicit cheap polls
+ * skip the auth refresh and answer from local state only. Returns the public
+ * card rows plus the freshness of the answer.
+ */
 const harnessLifecycleStatus = async (authenticate = true) => {
   const snap = authenticate === false
     ? await harnessCache.snapshotCheap()
@@ -692,6 +693,10 @@ const status = async () => {
   // Antigravity, as T3 reports it, read beside the rest. Its own short cache:
   // a poll waits on T3 only for the very first read.
   const antigravityRead = attempt("Antigravity", () => antigravity.status(), null);
+  // One local `mise ls`: cheap enough to read on every poll. It lists the
+  // source control CLIs too, whose sign-ins are read once it has.
+  const toolchainRead = attemptTimed("toolchains", async () => (await loadHarness()).toolchains.status(), HARNESS_BUDGET_MS,
+    { toolchains: [], sourceControl: [], degraded: [] });
   const [server, harnessSnap, pairings, sessions, toolchainSnap, setup, scmSnap] = await Promise.all([
     attempt("server health", health, { ok: false, detail: "health check failed" }),
     attempt("agent probes", () => harnessLifecycleStatus(true), {
@@ -700,14 +705,16 @@ const status = async () => {
     }),
     attemptTimed("pairing links", () => listJson(["auth", "pairing", "list", "--json"]), T3_LIST_BUDGET_MS, []),
     attemptTimed("paired devices", () => listJson(["auth", "session", "list", "--json"]), T3_LIST_BUDGET_MS, null),
-    // One local `mise ls`: cheap enough to read on every poll.
-    attemptTimed("toolchains", async () => (await loadHarness()).toolchains.status(), HARNESS_BUDGET_MS,
-      { toolchains: [], degraded: [] }),
+    toolchainRead,
     attempt("first-start setup", async () => {
       const manager = await loadHarness();
       return harnessModule.readPreinstall({ stateDir: manager.paths.stateDir });
     }, null),
-    attempt("source control", () => sourceControlCache.snapshot(), { harnesses: [], degraded: [] }),
+    attempt("source control", async () => {
+      const rows = (await toolchainRead)?.sourceControl;
+      if (rows?.length) sourceControlRows = rows;
+      return sourceControlCache.snapshot();
+    }, { harnesses: [], degraded: [] }),
   ]);
   const antigravityRow = await antigravityRead;
   const devices = Array.isArray(sessions) ? sessions.filter((session) => !isConsoleSession(session)) : sessions;
@@ -722,7 +729,8 @@ const status = async () => {
   // console (the row says so); while T3 itself is down the page already says.
   const t3Agents = antigravityRow && (antigravityRow.available || (!antigravityRow.reachable && server?.ok)) ? [antigravityRow] : [];
   const harnesses = harnessSnap?.harnesses ?? [];
-  const sourceControl = scmSnap?.harnesses ?? [];
+  const verdicts = new Map((scmSnap?.harnesses ?? []).map((row) => [row.id, row.auth]));
+  const sourceControl = (toolchainSnap?.sourceControl ?? []).map((row) => ({ ...row, auth: verdicts.get(row.id) ?? null }));
   knownSourceControl.clear();
   for (const row of sourceControl) if (row.installed && !row.inImage) knownSourceControl.add(row.id);
   const disk = storage.snapshot();
@@ -967,12 +975,6 @@ const connectFacts = async () => {
   return { ...connectCache.value, startedSinceLink: connectLinkedAt ? t3StartedAt() > connectLinkedAt : null };
 };
 
-/**
- * `t3 connect link --headless`, as a sign-in session the page's sheet shows
- * like an agent's device sign-in: a link, a code, and a wait for approval.
- * The link it saves is made on T3 Code's next start; the page offers that
- * restart once this is done.
- */
 // --- source control sign-in ----------------------------------------------------
 //
 // gh, glab, fj and tea sign in with a token for one host, which the manager
@@ -980,7 +982,10 @@ const connectFacts = async () => {
 // Code would see - T3 asks `az account show` - so it runs the device flow:
 // `az login --use-device-code` prints a page and a code, then waits for the
 // approval and exits. That is a sign-in session like an agent's.
-const AZ_CODE = /enter the code\s+([A-Z0-9]{6,12})\b/i;
+// The page and the code come from the one line that asks for them: az can
+// print warnings with longer links (aka.ms, docs) before it, and the longest
+// link in the output is not this one.
+const AZ_DEVICE = /open the page\s+(https:\/\/[^\s"'<>]+?)\.?\s+and enter the code\s+([A-Z0-9]{6,12})\b/i;
 const startAzSignin = async () => {
   const executable = await (await loadHarness()).sourceControl.executable("az");
   if (!executable) throw new Error("Azure CLI is not installed");
@@ -995,15 +1000,14 @@ const startAzSignin = async () => {
   };
   const absorb = (chunk) => {
     session.output = (session.output + stripAnsi(String(chunk))).slice(-8000);
-    if (!session.url) {
-      session.url = findUrl(session.output, session.output);
-      if (session.url) {
-        run("qrencode", ["-t", "SVG", "-m", "1", "-o", "-", session.url])
-          .then(({ stdout }) => { session.qr = stdout; })
-          .catch(() => {});
-      }
+    const asked = AZ_DEVICE.exec(session.output);
+    if (!session.url && asked) {
+      session.url = asked[1];
+      session.code = asked[2];
+      run("qrencode", ["-t", "SVG", "-m", "1", "-o", "-", session.url])
+        .then(({ stdout }) => { session.qr = stdout; })
+        .catch(() => {});
     }
-    session.code ??= AZ_CODE.exec(session.output)?.[1] ?? null;
     if (session.url && session.code && session.state === "starting") session.state = "awaiting-browser";
   };
   child.stdout.on("data", absorb);
@@ -1037,13 +1041,19 @@ const sourceControlSignIn = async (input, out = false) => {
     : await manager.sourceControl.signIn(id, { host: input?.host, token: input?.token });
   forgetSignInState(id);
   try { await sourceControlCache.invalidate(); } catch { /* the next poll refreshes */ }
-  const name = result.sourceControl?.name ?? SOURCE_CONTROL_NAMES[id] ?? id;
+  const name = result.sourceControl?.name ?? harnessModule?.getSourceControl?.(id)?.name ?? id;
   if (result.ok) recordEvent(out ? "signin.out" : "signin.ok", `${out ? "Signed out" : "Signed in"} ${name}`, result.host ?? input?.host ?? null);
   const http = result.ok ? 200 : ["invalid-host", "invalid-token", "unsupported"].includes(result.code) ? 400
     : result.code === "unknown-toolchain" ? 404 : result.code === "not-installed" ? 409 : 422;
   return { http, body: result };
 };
 
+/**
+ * `t3 connect link --headless`, as a sign-in session the page's sheet shows
+ * like an agent's device sign-in: a link, a code, and a wait for approval.
+ * The link it saves is made on T3 Code's next start; the page offers that
+ * restart once this is done.
+ */
 const startConnectLink = () => {
   const child = spawn(T3_LAUNCHER, ["connect", "link", "--headless"], {
     env: { ...process.env, NO_COLOR: "1" },
@@ -1727,13 +1737,12 @@ const operations = new Map(); // "harness:claude" -> { kind, state, error, progr
 const TOOLCHAIN_IDS = new Set(["go", "rust", "bun", "deno", "uv"]);
 const LIFECYCLE_PATHS = { harnesses: "harness", toolchains: "toolchain", packages: "package" };
 // The source control CLIs mise installs run as toolchains (the image's gh is
-// not one): the same routes, queue and lock.
-const SOURCE_CONTROL_NAMES = { glab: "GitLab CLI", fj: "Forgejo CLI", tea: "Gitea CLI", az: "Azure CLI" };
-const TOOLCHAIN_NAMES = { go: "Go", rust: "Rust", bun: "Bun", deno: "Deno", uv: "uv", ...SOURCE_CONTROL_NAMES };
-const MANAGED_TOOL_IDS = new Set([...TOOLCHAIN_IDS, ...Object.keys(SOURCE_CONTROL_NAMES)]);
-const isSourceControlJob = (job) => job.target === "toolchain" && Object.hasOwn(SOURCE_CONTROL_NAMES, job.id);
+// not one): the same routes, queue and lock. Both come from the harness
+// catalogue (getManagedTool), which every job has loaded before it runs.
+const isSourceControlJob = (job) => job.target === "toolchain" && Boolean(harnessModule?.getSourceControl?.(job.id));
 const lifecycleName = (target, id) =>
-  (target === "harness" ? AGENTS[id]?.name : target === "toolchain" ? TOOLCHAIN_NAMES[id] : harnessModule?.displayName?.(id)) ?? id;
+  (target === "harness" ? AGENTS[id]?.name : target === "toolchain" ? harnessModule?.getManagedTool?.(id)?.name
+    : harnessModule?.displayName?.(id)) ?? id;
 
 // The manager runs one operation at a time under its lock. Rather than turn a
 // second click into "busy", the page's operations queue here and run in order:
@@ -1790,6 +1799,15 @@ const finishJob = (job, { result, sync }) => {
   // lists it; look its newest release up now.
   if (job.target === "package" && result?.ok && job.kind !== "uninstall") {
     void latestCache.refreshOne(`package:${job.id}`);
+  }
+  // A source control CLI joins that check the same way: it only counts once
+  // installed, and the next status read would leave it waiting for the hourly pass.
+  if (isSourceControlJob(job) && result?.ok) {
+    if (job.kind === "uninstall") knownSourceControl.delete(job.id);
+    else {
+      knownSourceControl.add(job.id);
+      void latestCache.refreshOne(`toolchain:${job.id}`);
+    }
   }
   if (result?.ok) {
     const facts = result.harness ?? result.toolchain ?? result.package ?? null;
@@ -1921,8 +1939,9 @@ const lifecycleId = async (target, rawId) => {
     return { id: normalized.id };
   }
   if (target === "harness" && T3_AGENT_IDS.has(id)) return { id };
-  const ids = target === "harness" ? HARNESS_IDS : MANAGED_TOOL_IDS;
-  if (!ids.has(id)) {
+  if (target !== "harness") await loadHarness();
+  const known = target === "harness" ? HARNESS_IDS.has(id) : Boolean(harnessModule.getManagedTool(id));
+  if (!known) {
     const code = target === "harness" ? "unknown-harness" : "unknown-toolchain";
     return { refused: { http: 404, body: { ok: false, code, error: `unknown ${target}: ${id}` } } };
   }

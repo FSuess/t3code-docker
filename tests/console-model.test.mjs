@@ -881,14 +881,14 @@ const scmRow = (status, id, extra) => M.sourceControlRows(status, ui(extra), NOW
 test("a source control CLI says which host it is for and who is signed in", () => {
   const s = statusWith({
     sourceControl: [
-      scm("az", { auth: { status: "unauthenticated", account: null, host: null, detail: "ERROR: Please run 'az login'" } }),
-      scm("glab", { latestVersion: "1.1.0" }),
       scm("gh", { version: "2.102.0", auth: { status: "unauthenticated", account: null, host: null, detail: null } }),
-      scm("tea", { installed: false, version: null, auth: null }),
+      scm("glab", { latestVersion: "1.1.0" }),
       scm("fj", { auth: { status: "unknown", account: null, host: null, detail: "timed out" } }),
+      scm("tea", { installed: false, version: null, auth: null }),
+      scm("az", { auth: { status: "unauthenticated", account: null, host: null, detail: "ERROR: Please run 'az login'" } }),
     ],
   });
-  assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => r.id)), ["gh", "glab", "fj", "tea", "az"], "in the catalogue's order");
+  assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => r.id)), ["gh", "glab", "fj", "tea", "az"], "in the server's order, which is its catalogue's");
 
   const glab = scmRow(s, "glab");
   assert.equal(glab.provider, "GitLab");
@@ -920,6 +920,26 @@ test("a source control CLI says which host it is for and who is signed in", () =
   assert.equal(tea.action.cmd, "toolchain.install");
 
   assert.equal(scmRow(s, "fj").status.text, "Installed · sign-in could not be checked");
+});
+
+test("a CLI an added tool provides is signed in to here, and installed, updated and removed there", () => {
+  const providedBy = { tool: "gitlab:gitlab-org/cli", version: "1.118.0" };
+  const signedOut = statusWith({ sourceControl: [scm("glab", { installed: false, version: null, providedBy,
+    auth: { status: "unauthenticated", account: null, host: "gitlab.com", detail: null } })] });
+  const glab = scmRow(signedOut, "glab");
+  assert.equal(glab.badge.text, "Added tool");
+  assert.equal(glab.version, "1.118.0");
+  assert.equal(glab.providedBy, "gitlab:gitlab-org/cli");
+  assert.deepEqual(plain(glab.status), { dot: "warn", text: "Not signed in to gitlab.com" });
+  assert.deepEqual(plain(glab.action), { variant: "primary", cmd: "scm.signin", label: "Sign in", icon: "log-in" });
+  assert.equal(glab.attention, true, "added to be used: signed out wants the user");
+  assert.deepEqual(plain(M.managedSourceControlRows(signedOut, ui(), NOW)), [], "nothing to install or update here");
+
+  const signedIn = scmRow(statusWith({ sourceControl: [scm("glab", { installed: false, version: null, providedBy })] }), "glab");
+  assert.equal(signedIn.status.text, "Signed in as ana on gitlab.com");
+  assert.deepEqual(plain(signedIn.menu.map((m) => m.cmd)), ["scm.signin", "scm.signout"]);
+  const labels = M.paletteItems(statusWith({ sourceControl: [scm("glab", { installed: false, version: null, providedBy })] }), null, ui(), NOW).map((i) => i.label);
+  assert.ok(!labels.some((l) => /(Install|Update|Uninstall) GitLab CLI/.test(l)));
 });
 
 test("an az without its extension offers to repair it", () => {
