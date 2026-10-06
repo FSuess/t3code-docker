@@ -89,20 +89,26 @@ const startConsole = () => {
     T3_IMAGE_VERSION: "dev",
     T3_IMAGE_VARIANT: process.env.T3_IMAGE_VARIANT || "browser",
     T3_INFRA_LAUNCHER: T3_BINARY,
+    // This working tree's, not the copies an image installed under /opt,
+    // which the console would otherwise load first.
+    T3_HARNESS_MODULE: join(ROOT, "docker/harness/index.mjs"),
+    T3_PROVIDER_MODULE: join(ROOT, "docker/provider-integration/index.mjs"),
   });
 };
 startConsole();
-// The console inlines its files at startup: start it again when one changes.
-// Polled rather than watched: an editor or `sed -i` that replaces a file can
-// leave a watcher on the old one, and a few dozen stats a second cost nothing.
-const SETUP_DIR = join(ROOT, "docker/setup");
+// The console inlines its files at startup, and loads the harness and the
+// provider integration once: start it again when one of them changes. Polled
+// rather than watched: an editor or `sed -i` that replaces a file can leave a
+// watcher on the old one, and a few dozen stats a second cost nothing.
+const WATCHED = ["docker/setup", "docker/harness", "docker/provider-integration"].map((dir) => join(ROOT, dir));
 const newest = (dir) => readdirSync(dir, { withFileTypes: true }).reduce((latest, entry) => {
   const path = join(dir, entry.name);
   return Math.max(latest, entry.isDirectory() ? newest(path) : statSync(path).mtimeMs);
 }, 0);
-let seen = newest(SETUP_DIR);
+const newestWatched = () => Math.max(...WATCHED.map(newest));
+let seen = newestWatched();
 setInterval(() => {
-  const now = newest(SETUP_DIR);
+  const now = newestWatched();
   if (now === seen) return;
   seen = now;
   console.log("[setup] files changed; restarting");
