@@ -198,7 +198,13 @@ function createWorld(fs, { arch = "x64" } = {}) {
         return ok("");
       }
       if (scm && (argv.includes("whoami") || argv[1] === "api")) return world.verifyFails[scm] ? fail(world.verifyFails[scm]) : ok("{}");
-      if (scm && (argv.includes("logout") || argv.includes("setup-git"))) return ok("");
+      if (scm && argv.includes("logout")) {
+        // Signing out empties what the CLI keeps, as fj and tea do with their files.
+        const file = world.credentialFile[scm];
+        if (file && fs.files.has(file)) fs.seedFile(file, "{}", 0o600);
+        return ok("");
+      }
+      if (scm && argv.includes("setup-git")) return ok("");
       if (scm && ["auth", "login", "account"].includes(argv[1])) {
         const said = world.scmAuth[scm];
         return { code: said.code, signal: null, stdout: said.stdout, stderr: said.stderr, error: null };
@@ -1589,4 +1595,85 @@ test("source control rows come with the toolchains' one read, and their sign-ins
   // ...and asked again as soon as glab's own file changes, as a sign-out in a terminal would.
   fs.seedFile(path.join(HOME, ".config/glab-cli/config.yml"), "hosts: {}\n", 0o600);
   assert.equal((await manager.sourceControl.auth(sourceControl)).glab.status, "unauthenticated");
+});
+
+test("a device sign-in is planned for the setup service to run, and finished with gh's git setup", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const runs = [];
+  const run = world.run;
+  world.run = async (argv, options = {}) => {
+    runs.push(argv.slice(1).join(" "));
+    return run(argv, options);
+  };
+  const manager = managerFor(world);
+
+  // gh is the image's, run by name as T3 runs it; no process is started yet.
+  const gh = await manager.sourceControl.deviceSignIn("gh");
+  assert.equal(gh.ok, true, gh.error);
+  assert.equal(gh.host, "github.com");
+  assert.deepEqual(gh.command.slice(0, 4), ["gh", "auth", "login", "--web"]);
+  assert.equal(gh.env.GH_PROMPT_DISABLED, "1");
+  assert.equal(gh.env.HOME, HOME);
+  assert.deepEqual(gh.readPrompt("! First copy your one-time code: AB12-CD34\nOpen this URL to continue in your web browser: https://github.com/login/device\n"),
+    { url: "https://github.com/login/device", code: "AB12-CD34" });
+  assert.equal(runs.some((r) => r.startsWith("auth login")), false);
+
+  // Approved: git is set up to push with it, and the verdict is read afresh.
+  const done = await manager.sourceControl.finishDeviceSignIn("gh");
+  assert.equal(done.ok, true);
+  assert.equal(done.warning, null);
+  assert.ok(runs.includes("auth setup-git --hostname github.com"));
+  assert.equal(done.sourceControl.id, "gh");
+
+  // Not installed, or a CLI that only takes a token: refused before anything runs.
+  assert.equal((await manager.sourceControl.deviceSignIn("az")).code, "not-installed");
+  assert.equal((await manager.sourceControl.deviceSignIn("glab")).code, "unsupported");
+  assert.equal((await manager.sourceControl.deviceSignIn("svn")).code, "unknown-toolchain");
+});
+
+test("a refused fj token puts the old key back after its sign-out step; gh and tea sign out what the page showed", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const keys = path.join(HOME, ".local/share/forgejo-cli/keys.json");
+  world.credentialFile.fj = keys;
+  const manager = managerFor(world);
+  await manager.sourceControl.install("fj");
+
+  // fj keeps an old key over a new one, so it signs out first; a new key the
+  // host refuses must not leave it signed out of everything.
+  fs.seedFile(keys, '{"hosts":{"codeberg.org":{"type":"Application","token":"old"}}}', 0o600);
+  const before = await fs.readFile(keys);
+  world.verifyFails.fj = "Error: 401 Unauthorized";
+  const refused = await manager.sourceControl.signIn("fj", { token: "new-typo" });
+  assert.equal(refused.code, "not-accepted");
+  assert.ok(world.calls.some((call) => / auth logout codeberg\.org$/.test(call)), "signed out first, so the new key is the one checked");
+  assert.equal(await fs.readFile(keys), before, "and the old key is back");
+  world.verifyFails.fj = null;
+
+  // gh, with two accounts on a host, signs out the one the page showed.
+  const gh = await manager.sourceControl.signOut("gh", { host: "github.com", account: "octocat" });
+  assert.equal(gh.ok, true, gh.error);
+  assert.ok(world.calls.includes("gh auth logout --hostname github.com --user octocat"));
+
+  // tea signs out a login made in a terminal by its own name.
+  await manager.sourceControl.install("tea");
+  world.scmAuth.tea = { code: 0, stdout: JSON.stringify([{ name: "work", url: "https://git.example.com", default: "true", user: "ana" }]), stderr: "" };
+  const tea = await manager.sourceControl.signOut("tea", { host: "git.example.com" });
+  assert.equal(tea.ok, true, tea.error);
+  assert.ok(world.calls.some((call) => / logout work$/.test(call)));
+});
+
+test("while a check runs, the last verdicts are there to show, without asking any CLI", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  await manager.sourceControl.install("glab");
+  assert.deepEqual(manager.sourceControl.lastAuth(), {}, "nothing asked yet, nothing to show");
+  await manager.sourceControl.status();
+  world.calls.length = 0;
+  const last = manager.sourceControl.lastAuth();
+  assert.equal(last.glab.account, "dev-user");
+  assert.equal(last.gh.status, "unauthenticated", "the fake gh is signed out");
+  assert.deepEqual(world.calls, []);
 });

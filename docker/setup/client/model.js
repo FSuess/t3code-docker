@@ -37,19 +37,23 @@ const T3Model = (() => {
   // toolchain, when someone asks for them. Bitbucket has none: T3 talks to
   // its API with a token saved in T3 Code itself.
   //
-  // How each signs in here: a token for one host (`host` is the one most
-  // people mean; `tokenPage` makes one there with `scopes` ticked, where the
-  // host lets a link do that), or az's device code.
+  // How each signs in here: gh and az with a device code (`flow: 'device'`,
+  // `command`), nothing to make or paste; gh, glab, fj and tea with a token
+  // for one host (`tokenCommand`, handed over as `handover` says; `host` is
+  // the one most people mean, and `tokenPage` makes a token there with
+  // `scopes` ticked, where the host lets a link do that). `mark` is the
+  // host's mark (design/ui.js); az keeps its monogram.
   const SOURCE_CONTROL = {
-    gh: { name: 'GitHub CLI', mono: 'gh', hue: '--id-toolchain', provider: 'GitHub', flow: 'token', host: 'github.com', command: 'gh auth login', handover: 'on stdin',
+    gh: { name: 'GitHub CLI', mono: 'gh', mark: 'github', hue: '--id-toolchain', provider: 'GitHub', flow: 'device', command: 'gh auth login --web',
+      host: 'github.com', tokenCommand: 'gh auth login --with-token', handover: 'on stdin',
       tokenPage: (host) => 'https://' + host + '/settings/tokens/new?scopes=repo,read:org,workflow&description=T3+Code', scopes: 'repo, read:org, workflow' },
-    glab: { name: 'GitLab CLI', mono: 'GL', hue: '--id-toolchain', provider: 'GitLab', flow: 'token', host: 'gitlab.com', command: 'glab auth login', handover: 'on stdin',
+    glab: { name: 'GitLab CLI', mono: 'GL', mark: 'gitlab', hue: '--id-toolchain', provider: 'GitLab', flow: 'token', host: 'gitlab.com', tokenCommand: 'glab auth login', handover: 'on stdin',
       tokenPage: (host) => 'https://' + host + '/-/user_settings/personal_access_tokens?name=T3+Code&scopes=api,write_repository', scopes: 'api, write_repository' },
-    fj: { name: 'Forgejo CLI', mono: 'fj', hue: '--id-toolchain', provider: 'Forgejo', flow: 'token', host: 'codeberg.org', command: 'fj auth add-token', handover: 'on stdin',
+    fj: { name: 'Forgejo CLI', mono: 'fj', mark: 'forgejo', hue: '--id-toolchain', provider: 'Forgejo', flow: 'token', host: 'codeberg.org', tokenCommand: 'fj auth add-token', handover: 'on stdin',
       tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
-    tea: { name: 'Gitea CLI', mono: 'tea', hue: '--id-toolchain', provider: 'Gitea', flow: 'token', host: 'gitea.com', command: 'tea login add', handover: 'in its environment',
+    tea: { name: 'Gitea CLI', mono: 'tea', mark: 'gitea', hue: '--id-toolchain', provider: 'Gitea', flow: 'token', host: 'gitea.com', tokenCommand: 'tea login add', handover: 'in its environment',
       tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
-    az: { name: 'Azure CLI', mono: 'az', hue: '--id-toolchain', provider: 'Azure DevOps', flow: 'device', how: 'device code', command: 'az login --use-device-code' },
+    az: { name: 'Azure CLI', mono: 'az', hue: '--id-toolchain', provider: 'Azure DevOps', flow: 'device', command: 'az login --use-device-code' },
   };
 
   const DONE = { install: 'Installed', update: 'Updated', uninstall: 'Uninstalled' };
@@ -584,6 +588,12 @@ const T3Model = (() => {
   // ------------------------------------------------------- source control --
   /** "Signed in as ana on gitlab.com", with what the CLI says of itself. */
   const signedInText = (a) => 'Signed in' + (a.account ? ' as ' + a.account : '') + (a.host ? (a.account ? ' on ' : ' to ') + a.host : '');
+  /** "sign-in could not be checked: gitlab.example.com does not resolve": a check that got no answer, and why, kept to a line. */
+  const uncheckedText = (a) => {
+    const why = a && a.detail ? String(a.detail).trim() : '';
+    return 'sign-in could not be checked' + (why ? ': ' + (why.length > 90 ? why.slice(0, 89) + '…' : why) : '');
+  };
+  const capital = (text) => text.charAt(0).toUpperCase() + text.slice(1);
 
   /**
    * One source control CLI. The ones mise installs are toolchain rows (same
@@ -598,8 +608,10 @@ const T3Model = (() => {
     const meta = SOURCE_CONTROL[c.id] || { name: c.name || c.id, mono: String(c.id || '?').slice(0, 2), provider: c.provider || '' };
     const auth = c.auth || null;
     const signIn = { cmd: 'scm.signin', label: 'Sign in', icon: 'log-in' };
-    let row;
+    const withToken = { cmd: 'scm.token', label: 'Sign in with a token…', icon: 'key-round' };
     const added = !c.inImage && !c.installed && c.providedBy ? c.providedBy : null;
+    const missing = (c.missingExtensions || []).filter(Boolean);
+    let row;
     if (c.inImage || added) {
       const present = c.inImage ? c.installed : true;
       row = {
@@ -608,21 +620,31 @@ const T3Model = (() => {
         status: { dot: null, text: '' }, badge: { tone: null, text: added ? 'Added tool' : 'In the image' }, action: null, menu: [],
         progress: null, cancellable: false, attention: false, dim: !present, description: null, bins: [],
       };
-      row.status.text = !present ? 'Not found in the image'
+      // The image always has gh: one that is not there did not answer.
+      row.status.text = !present ? 'Could not be run'
         : auth && auth.status === 'authenticated' ? signedInText(auth)
           : auth && auth.status === 'unauthenticated' ? 'Not signed in' + (auth.host ? ' to ' + auth.host : '')
-            : added ? 'From ' + added.tool + ', under Added tools' : 'Part of the image';
-      if (present && auth && auth.status === 'unauthenticated') {
+            : auth && auth.status === 'unknown' ? capital(uncheckedText(auth))
+              : added ? 'From ' + added.tool + ', under Added tools' : 'Part of the image';
+      if (added && missing.length) {
+        // An added az without azure-devops cannot reach a repository. It is
+        // the added tool's, so the fix is az's own command.
+        row.state = 'failed';
+        row.attention = true;
+        row.status = { dot: 'warn', text: 'Missing the ' + listOf(missing) + ' extension:', code: 'az extension add --name ' + missing[0] };
+      } else if (present && auth && auth.status === 'unauthenticated') {
         // gh's is offered, never pressed on anyone: a quiet button. One the
         // user added is one they mean to use, like a CLI installed here.
         row.action = added ? Object.assign({ variant: 'primary' }, signIn) : signIn;
         if (added) { row.state = 'signin'; row.attention = true; row.status.dot = 'warn'; }
+        // A device code is the quick way in; a token is for another server
+        // (GitHub Enterprise) or a token with narrower scopes.
+        if (meta.flow === 'device' && meta.tokenCommand) row.menu = [withToken];
       }
     } else {
       row = toolRow(c, 'toolchain', status, ui, now);
       if (row.state === 'missing') row.status = { dot: null, text: 'Not installed' };
       const settled = row.state === 'ok' || row.state === 'update';
-      const missing = (c.missingExtensions || []).filter(Boolean);
       if (settled && missing.length) {
         // az without azure-devops cannot reach a repository: installing it
         // again adds the extension.
@@ -639,24 +661,42 @@ const T3Model = (() => {
         // Signed out wins the one visible verb; an update stays in the menu.
         row.action = Object.assign({ variant: 'primary' }, signIn);
       } else if (settled && auth && auth.status === 'unknown') {
-        row.status = { dot: null, text: [row.status.text, 'sign-in could not be checked'].filter(Boolean).join(' · ') };
+        // What T3 Code cannot be sure of comes first; an update after it, as
+        // for a signed-in row.
+        row.status = { dot: null, text: [capital(uncheckedText(auth)), row.updateAvailable ? row.latest + ' is available' : null].filter(Boolean).join(' · ') };
       }
     }
-    if (ui && ui.signingIn === c.id && (c.installed || added)) {
+    const usable = Boolean(c.installed || added) && !c.inProgress && row.state !== 'running' && row.state !== 'queued';
+    if (ui && (ui.signingIn === c.id || ui.signingOut === c.id) && (c.installed || added)) {
+      const out = ui.signingOut === c.id;
       row.state = 'signing';
-      row.badge = { tone: 'info', text: 'Signing in', spinner: true };
-      row.status = { dot: null, text: 'Waiting for approval on another device' };
+      row.badge = { tone: 'info', text: out ? 'Signing out' : 'Signing in', spinner: true };
+      row.status = { dot: null, text: out ? 'Signing out' + (auth && auth.host && meta.tokenCommand ? ' of ' + auth.host : '') : 'Waiting for approval on another device' };
       row.action = null;
       row.menu = [];
-    } else if ((c.installed || added) && !c.inProgress && auth && (auth.status === 'authenticated' || auth.status === 'unknown')) {
-      // Signed in (or not known): another host, or another account, and out again.
-      const extra = [{ cmd: 'scm.signin', label: meta.flow === 'device' ? 'Sign in again…' : 'Sign in to another host…', icon: 'log-in' }];
-      if (auth.status === 'authenticated') extra.push({ cmd: 'scm.signout', label: 'Sign out' + (auth.host && meta.flow !== 'device' ? ' of ' + auth.host : '') + '…', icon: 'log-out' });
+    } else if (usable && auth) {
+      const extra = [];
+      if (auth.status === 'unauthenticated') {
+        // Signing in is the row's one button, unless something else holds it
+        // (a failed update's Retry): then it waits here.
+        if (!row.action || row.action.cmd !== 'scm.signin') extra.push(Object.assign({}, signIn, { label: 'Sign in…' }));
+      } else {
+        // Signed in, or not known: another account or host, and out again. Not
+        // known keeps the host it had, so signing in again is the way back.
+        if (meta.flow === 'device') extra.push({ cmd: 'scm.signin', label: 'Sign in again…', icon: 'log-in' }, ...(meta.tokenCommand ? [withToken] : []));
+        else extra.push({ cmd: 'scm.signin', label: auth.status === 'authenticated' ? 'Sign in to another host…' : 'Sign in again…', icon: 'log-in' });
+        // A CLI with a sign-in per host signs out of that one; az of everything.
+        if (auth.status === 'authenticated' || auth.host) {
+          extra.push({ cmd: 'scm.signout', label: 'Sign out' + (auth.host && meta.tokenCommand ? ' of ' + auth.host : '') + '…', icon: 'log-out' });
+        }
+      }
+      const fresh = extra.filter((item) => !row.menu.some((m) => m.cmd === item.cmd && m.label === item.label));
       const at = row.menu.findIndex((m) => m.sep);
-      row.menu = at === -1 ? [...row.menu, ...extra] : [...row.menu.slice(0, at), ...extra, ...row.menu.slice(at)];
+      row.menu = at === -1 ? [...row.menu, ...fresh] : [...row.menu.slice(0, at), ...fresh, ...row.menu.slice(at)];
     }
+    row.mark = meta.mark || null;
     row.provider = meta.provider;
-    row.command = meta.command;
+    row.command = meta.command || meta.tokenCommand;
     row.flow = meta.flow;
     row.inImage = Boolean(c.inImage);
     row.providedBy = added ? added.tool : null;
@@ -1149,7 +1189,9 @@ const T3Model = (() => {
     const items = [
       ...agents.filter((a) => a.state in rank),
       ...tools.filter((t) => t.state === 'failed' || t.state === 'update'),
-      ...managedSourceControlRows(s, ui, 0).filter((c) => c.state in rank),
+      // Every CLI T3 Code would use and cannot yet, an added tool's too; the
+      // image's gh is never pressed on anyone.
+      ...sourceControlRows(s, ui, 0).filter((c) => !c.inImage && c.state in rank),
     ];
     if (ports) {
       for (const p of portRows(ports, ui, 0)) {
@@ -1290,7 +1332,7 @@ const T3Model = (() => {
       agents: { text: installed.length ? signed + ' of ' + installed.length + ' signed in' : 'None installed yet' },
       toolchains: { text: [tools.filter((t) => t.installed).length + ' of ' + tools.length + ' installed', added ? added + ' added' : null, 'through mise'].filter(Boolean).join(' · ') },
       sourcecontrol: { text: (() => {
-        const scm = (s.sourceControl || []).filter((c) => c.installed);
+        const scm = (s.sourceControl || []).filter((c) => c.installed || c.providedBy);
         const signed = scm.filter((c) => c.auth && c.auth.status === 'authenticated').length;
         return scm.length ? signed + ' of ' + plural(scm.length, 'CLI') + ' signed in' : 'Not readable yet';
       })() },
@@ -1367,12 +1409,20 @@ const T3Model = (() => {
       const keywords = 'source control git ' + c.provider + ' ' + c.id + ' ' + (KEYWORDS[c.action ? c.action.cmd : ''] || '');
       if (c.state === 'missing') add('Source control', 'Install ' + c.name, 'download', { cmd: 'toolchain.install', id: c.id }, { meta: { text: c.provider }, keywords: keywords + ' add download' });
       if (c.updateAvailable) add('Source control', 'Update ' + c.name + ' to ' + c.latest, 'circle-arrow-up', { cmd: 'toolchain.update', id: c.id }, { meta: { text: c.version, mono: true }, attention: true, keywords: keywords + ' upgrade' });
-      if (c.state === 'failed' && c.action) add('Source control', (c.action.label === 'Repair' ? 'Repair ' : 'Retry ') + c.name, c.action.icon || 'refresh-cw', { cmd: c.action.cmd, id: c.id }, { meta: { text: 'failed', dot: 'danger' }, attention: true, keywords });
+      if (c.state === 'failed' && c.action) {
+        const repair = c.action.label === 'Repair';
+        add('Source control', (repair ? 'Repair ' : 'Retry ') + c.name, c.action.icon || 'refresh-cw', { cmd: c.action.cmd, id: c.id },
+          { meta: repair ? { text: 'needs repair', dot: 'warn' } : { text: 'failed', dot: 'danger' }, attention: true, keywords });
+      }
       if (c.version && c.state !== 'running') add('Source control', 'Uninstall ' + c.name + '…', 'trash-2', { cmd: 'toolchain.uninstall', id: c.id }, { keywords: keywords + ' remove delete' });
     }
     for (const c of sourceControlRows(s, ui, now)) {
       const keywords = 'source control git login log in auth token ' + c.provider + ' ' + c.id;
-      if (c.action && c.action.cmd === 'scm.signin') add('Source control', 'Sign in ' + c.name, 'log-in', { cmd: 'scm.signin', id: c.id }, { meta: { text: 'not signed in', dot: c.inImage ? null : 'warn' }, attention: !c.inImage, keywords });
+      // Signed out, with sign-in on the row's button or, behind a Retry, in its menu.
+      const signsIn = (c.action && c.action.cmd === 'scm.signin') || c.menu.some((m) => m.cmd === 'scm.signin' && m.label === 'Sign in…');
+      if (signsIn && c.auth && c.auth.status === 'unauthenticated') {
+        add('Source control', 'Sign in ' + c.name, 'log-in', { cmd: 'scm.signin', id: c.id }, { meta: { text: 'not signed in', dot: c.inImage ? null : 'warn' }, attention: !c.inImage, keywords });
+      }
       for (const m of c.menu) {
         if (m.cmd === 'scm.signout') add('Source control', m.label.replace('Sign out', 'Sign ' + c.name + ' out'), 'log-out', { cmd: 'scm.signout', id: c.id }, { keywords: keywords + ' log out logout' });
       }

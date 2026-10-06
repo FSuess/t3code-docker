@@ -496,14 +496,23 @@ const harnessCache = createHarnessCache({
 // the rows the last poll read (`sourceControlRows`), and the manager caches
 // each verdict until the CLI's credential files change.
 let sourceControlRows = null;
+const verdictRows = (verdicts) => Object.entries(verdicts).map(([id, auth]) => ({ id, auth }));
 const sourceControlCache = createHarnessCache({
-  full: async () => {
-    const verdicts = await (await loadHarness()).sourceControl.auth(sourceControlRows);
-    return { harnesses: Object.entries(verdicts).map(([id, auth]) => ({ id, auth })), degraded: [] };
-  },
-  cheap: async () => ({ harnesses: [], degraded: [] }),
+  full: async () => ({ harnesses: verdictRows(await (await loadHarness()).sourceControl.auth(sourceControlRows)), degraded: [] }),
+  // While a check runs, the last verdicts reached, however old, without
+  // asking any CLI: a slow server is not news about anyone's sign-in.
+  cheap: async () => ({ harnesses: verdictRows((await loadHarness()).sourceControl.lastAuth()), degraded: [] }),
   budgetMs: HARNESS_BUDGET_MS,
 });
+/**
+ * Read every source control sign-in again, from rows read afresh: after an
+ * install, a sign-in or a sign-out, the last poll's rows are out of date (a
+ * CLI that was installing then had no command to ask).
+ */
+const refreshSourceControl = () => {
+  sourceControlRows = null;
+  return sourceControlCache.invalidate();
+};
 /** The mise-installed source control CLIs the last status read found installed. */
 const knownSourceControl = new Set();
 
@@ -548,6 +557,7 @@ const lifecycleHttpStatus = (code) => {
     case "unknown-harness":
     case "unknown-toolchain": return 404;
     case "cancelled": return 409;
+    case "provided-elsewhere": return 409;
     case "invalid-version":
     case "version-below-minimum":
     case "not-installed":
@@ -978,55 +988,70 @@ const connectFacts = async () => {
 // --- source control sign-in ----------------------------------------------------
 //
 // gh, glab, fj and tea sign in with a token for one host, which the manager
-// hands to the CLI on stdin (sourceControl.signIn). az has no token sign-in T3
-// Code would see - T3 asks `az account show` - so it runs the device flow:
-// `az login --use-device-code` prints a page and a code, then waits for the
-// approval and exits. That is a sign-in session like an agent's.
-// The page and the code come from the one line that asks for them: az can
-// print warnings with longer links (aka.ms, docs) before it, and the longest
-// link in the output is not this one.
-const AZ_DEVICE = /open the page\s+(https:\/\/[^\s"'<>]+?)\.?\s+and enter the code\s+([A-Z0-9]{6,12})\b/i;
-const startAzSignin = async () => {
-  const executable = await (await loadHarness()).sourceControl.executable("az");
-  if (!executable) throw new Error("Azure CLI is not installed");
-  const child = spawn(executable, ["login", "--use-device-code", "--allow-no-subscriptions", "--output", "none"], {
-    env: { ...process.env, NO_COLOR: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const id = randomBytes(9).toString("hex");
+// hands to the CLI on stdin (sourceControl.signIn). gh and az also sign in
+// with a device code, which needs no token at all: `gh auth login --web` and
+// `az login --use-device-code` print a page and a code, wait for someone to
+// approve on any device, and exit. That is a sign-in session like an agent's,
+// in the same sheet. az has no other way T3 Code would see: T3 asks
+// `az account show`. The manager says what to run and how to read it; this
+// owns the process, for as long as the code is good.
+const startScmDeviceSignin = async (id) => {
+  const manager = await loadHarness();
+  const plan = await manager.sourceControl.deviceSignIn(id);
+  if (!plan.ok) throw new Error(plan.error);
+  const [command, ...args] = plan.command;
+  const child = spawn(command, args, { env: plan.env, cwd: plan.cwd, stdio: ["ignore", "pipe", "pipe"] });
+  const sessionId = randomBytes(9).toString("hex");
+  const startedAt = Date.now();
   const session = {
-    id, agentId: "az", state: "starting", url: null, code: null, needsCode: false,
-    output: "", error: null, child, startedAt: Date.now(),
+    id: sessionId, agentId: id, state: "starting", url: null, code: null, needsCode: false,
+    output: "", error: null, child, startedAt, expiresAt: startedAt + SESSION_TTL_MS,
   };
   const absorb = (chunk) => {
     session.output = (session.output + stripAnsi(String(chunk))).slice(-8000);
-    const asked = AZ_DEVICE.exec(session.output);
-    if (!session.url && asked) {
-      session.url = asked[1];
-      session.code = asked[2];
-      run("qrencode", ["-t", "SVG", "-m", "1", "-o", "-", session.url])
-        .then(({ stdout }) => { session.qr = stdout; })
-        .catch(() => {});
-    }
-    if (session.url && session.code && session.state === "starting") session.state = "awaiting-browser";
+    if (session.url && session.code) return;
+    const asked = plan.readPrompt(session.output);
+    // The page and the code arrive together, or the sheet would offer a page
+    // with nothing to type into it.
+    if (!asked.url || !asked.code) return;
+    session.url = asked.url;
+    session.code = asked.code;
+    run("qrencode", ["-t", "SVG", "-m", "1", "-o", "-", session.url])
+      .then(({ stdout }) => { session.qr = stdout; })
+      .catch(() => {});
+    if (session.state === "starting") session.state = "awaiting-browser";
   };
   child.stdout.on("data", absorb);
   child.stderr.on("data", absorb);
   child.on("error", (error) => { session.state = "failed"; session.error = String(error.message); });
-  child.on("close", (code) => {
-    forgetSignInState("az");
-    void sourceControlCache.invalidate().catch(() => {});
+  child.on("close", async (code) => {
+    if (TERMINAL_STATES.has(session.state)) {
+      forgetSignInState(id);
+      void refreshSourceControl().catch(() => {});
+      return;
+    }
+    if (code !== 0) {
+      forgetSignInState(id);
+      void refreshSourceControl().catch(() => {});
+      session.state = "failed";
+      session.error = session.output.trim().split("\n").slice(-3).join(" ").slice(0, 300) || `exited with code ${code}`;
+      return;
+    }
+    // Approved. What comes after (gh as git's credential helper) runs before
+    // the sheet says done, so the next poll already reads the new sign-in.
+    const finished = await manager.sourceControl.finishDeviceSignIn(id).catch((error) => ({ ok: false, error: String(error?.message ?? error) }));
+    try { await refreshSourceControl(); } catch { /* the next poll refreshes */ }
     if (TERMINAL_STATES.has(session.state)) return;
-    session.state = code === 0 ? "done" : "failed";
-    if (code === 0) recordEvent("signin.ok", "Signed in Azure CLI");
-    else session.error = session.output.trim().split("\n").slice(-3).join(" ").slice(0, 300) || `exited with code ${code}`;
+    session.state = "done";
+    session.warning = finished.warning ?? null;
+    recordEvent("signin.ok", `Signed in ${plan.name}`, finished.sourceControl?.auth?.host ?? plan.host ?? null);
   });
-  sessions.set(id, session);
+  sessions.set(sessionId, session);
   setTimeout(() => {
     if (!TERMINAL_STATES.has(session.state)) {
       try { child.kill(); } catch {}
       session.state = "failed";
-      session.error = "Timed out waiting for the approval.";
+      session.error = "The code expired before it was approved.";
     }
   }, SESSION_TTL_MS).unref?.();
   return session;
@@ -1037,10 +1062,11 @@ const sourceControlSignIn = async (input, out = false) => {
   const manager = await loadHarness();
   const id = String(input?.id ?? "");
   const result = out
-    ? await manager.sourceControl.signOut(id, { host: input?.host })
+    ? await manager.sourceControl.signOut(id, { host: input?.host, account: input?.account })
     : await manager.sourceControl.signIn(id, { host: input?.host, token: input?.token });
-  forgetSignInState(id);
-  try { await sourceControlCache.invalidate(); } catch { /* the next poll refreshes */ }
+  // The manager has just read the verdict afresh; asking the CLI again for
+  // the page would only cost another round trip to its server.
+  try { await refreshSourceControl(); } catch { /* the next poll refreshes */ }
   const name = result.sourceControl?.name ?? harnessModule?.getSourceControl?.(id)?.name ?? id;
   if (result.ok) recordEvent(out ? "signin.out" : "signin.ok", `${out ? "Signed out" : "Signed in"} ${name}`, result.host ?? input?.host ?? null);
   const http = result.ok ? 200 : ["invalid-host", "invalid-token", "unsupported"].includes(result.code) ? 400
@@ -1398,7 +1424,7 @@ const startAntigravitySignin = async () => {
 
 const publicSession = (s) => ({
   id: s.id, agent: s.agentId, state: s.state, url: s.url, code: s.code, qr: s.qr ?? null,
-  needsCode: s.needsCode, error: s.error, identity: s.identity ?? null,
+  needsCode: s.needsCode, error: s.error, identity: s.identity ?? null, warning: s.warning ?? null,
   // When the wait for the browser step gives up, for the device code's countdown.
   startedAt: s.startedAt, expiresAt: s.expiresAt ?? s.startedAt + SESSION_TTL_MS,
   tail: s.output.trim().split("\n").slice(-4).join("\n"),
@@ -1847,7 +1873,7 @@ const runJob = async (job) => {
       markStarted(null);
       // Let the next poll see the lock instead of the facts from before it.
       void harnessCache.invalidate().catch(() => {});
-      if (isSourceControlJob(job)) void sourceControlCache.invalidate().catch(() => {});
+      if (isSourceControlJob(job)) void refreshSourceControl().catch(() => {});
     },
     onProgress: (progress) => {
       const op = operations.get(job.key);
@@ -1869,7 +1895,7 @@ const runJob = async (job) => {
     forgetSignInState(job.id);
     try { await harnessCache.invalidate(); } catch { /* the next poll refreshes */ }
     if (isSourceControlJob(job)) {
-      try { await sourceControlCache.invalidate(); } catch { /* the next poll refreshes */ }
+      try { await refreshSourceControl(); } catch { /* the next poll refreshes */ }
     }
     return { result, sync };
   }, (error) => ({ result: { ok: false, code: "failed", error: String(error?.message ?? error) }, sync: null }));
@@ -2363,7 +2389,9 @@ const server = createServer(async (req, res) => {
         const input = JSON.parse((await readBody(req)) || "{}");
         if (input.agent === "antigravity") return sendJson(res, 200, publicSession(await startAntigravitySignin()));
         if (input.agent === "connect") return sendJson(res, 200, publicSession(startConnectLink()));
-        if (input.agent === "az") return sendJson(res, 200, publicSession(await startAzSignin()));
+        // gh and az: a source control CLI's device code, from the harness's catalogue.
+        await loadHarness();
+        if (harnessModule.getSourceControl(input.agent)) return sendJson(res, 200, publicSession(await startScmDeviceSignin(input.agent)));
         return sendJson(res, 200, publicSession(await startSignin(input.agent)));
       } catch (error) {
         return sendJson(res, 400, { error: String(error?.message ?? error) });

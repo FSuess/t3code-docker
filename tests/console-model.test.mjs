@@ -910,16 +910,66 @@ test("a source control CLI says which host it is for and who is signed in", () =
   assert.equal(gh.state, "ok");
   assert.equal(gh.attention, false);
   assert.deepEqual(plain(gh.action), { cmd: "scm.signin", label: "Sign in", icon: "log-in" });
-  assert.deepEqual(plain(gh.menu), []);
+  assert.equal(gh.flow, "device", "a device code: nothing to make or paste");
+  assert.deepEqual(plain(gh.menu), [{ cmd: "scm.token", label: "Sign in with a token…", icon: "key-round" }], "a token for GitHub Enterprise, or narrower scopes");
   assert.equal(gh.status.text, "Not signed in");
   assert.equal(gh.badge.text, "In the image");
+
+  // Each host's own mark; Azure DevOps has none to use, so az keeps its monogram.
+  assert.deepEqual(plain(M.sourceControlRows(s, ui(), NOW).map((r) => [r.id, r.mark])),
+    [["gh", "github"], ["glab", "gitlab"], ["fj", "forgejo"], ["tea", "gitea"], ["az", null]]);
 
   const tea = scmRow(s, "tea");
   assert.equal(tea.state, "missing");
   assert.deepEqual(plain(tea.status), { dot: null, text: "Not installed" }, "never left out of T3_PREINSTALL: nothing installs it unasked");
   assert.equal(tea.action.cmd, "toolchain.install");
 
-  assert.equal(scmRow(s, "fj").status.text, "Installed · sign-in could not be checked");
+  assert.equal(scmRow(s, "fj").status.text, "Sign-in could not be checked: timed out", "and why");
+});
+
+test("source control rows keep sign-in within reach in every state, and say why a check failed", () => {
+  // An update failed on a CLI that is also signed out: Retry holds the button,
+  // and signing in waits in the menu, and in the palette.
+  const failed = statusWith({ sourceControl: [scm("glab", { failed: true, failure: "network down", operation: "update",
+    auth: { status: "unauthenticated", account: null, host: "gitlab.com", detail: null } })] });
+  const glab = scmRow(failed, "glab");
+  assert.equal(glab.state, "failed");
+  assert.notEqual(glab.action.cmd, "scm.signin");
+  assert.ok(glab.menu.some((m) => m.cmd === "scm.signin"), "sign-in is still reachable");
+  assert.ok(M.paletteItems(failed, null, ui(), NOW).some((i) => i.label === "Sign in GitLab CLI"));
+
+  // Not known: the reason, signing in again to the same host, and out of it.
+  const unknown = scmRow(statusWith({ sourceControl: [scm("glab", { auth: { status: "unknown", account: null, host: "git.example.com",
+    detail: "x509: certificate signed by unknown authority" } })] }), "glab");
+  assert.equal(unknown.status.text, "Sign-in could not be checked: x509: certificate signed by unknown authority");
+  assert.deepEqual(plain(unknown.menu.filter((m) => m.cmd && m.cmd.startsWith("scm.")).map((m) => m.label)), ["Sign in again…", "Sign out of git.example.com…"]);
+  const gh = scmRow(statusWith({ sourceControl: [scm("gh", { auth: { status: "unknown", account: null, host: "github.com", detail: "github.com did not answer in time" } })] }), "gh");
+  assert.equal(gh.status.text, "Sign-in could not be checked: github.com did not answer in time", "the image's gh says so too");
+  const long = scmRow(statusWith({ sourceControl: [scm("fj", { auth: { status: "unknown", detail: "x".repeat(200) } })] }), "fj");
+  assert.ok(long.status.text.length < 140, "a long reason is cut to a line");
+
+  // While it waits its turn or works, no sign-in is offered over it.
+  const queued = scmRow(statusWith({ sourceControl: [scm("glab", { inProgress: true, operation: "update" })] }), "glab");
+  assert.equal(queued.menu.some((m) => m.cmd && m.cmd.startsWith("scm.")), false);
+
+  // Signing out shows on the row while it runs.
+  const signingOut = scmRow(statusWith({ sourceControl: [scm("glab")] }), "glab", { signingOut: "glab" });
+  assert.equal(signingOut.badge.text, "Signing out");
+  assert.equal(signingOut.status.text, "Signing out of gitlab.com");
+  assert.equal(signingOut.action, null);
+
+  // gh did not answer its version check: it is in the image, so it says that, not "missing".
+  assert.equal(scmRow(statusWith({ sourceControl: [scm("gh", { installed: false, version: null, auth: null })] }), "gh").status.text, "Could not be run");
+});
+
+test("an az an added tool provides, without its extension, says how to add it", () => {
+  const s = statusWith({ sourceControl: [scm("az", { installed: false, version: null, providedBy: { tool: "azure-cli", version: "2.88.0" },
+    missingExtensions: ["azure-devops"], auth: { status: "authenticated", account: "ana@example.com", host: "dev.azure.com" } })] });
+  const az = scmRow(s, "az");
+  assert.equal(az.state, "failed");
+  assert.equal(az.attention, true);
+  assert.deepEqual(plain(az.status), { dot: "warn", text: "Missing the azure-devops extension:", code: "az extension add --name azure-devops" });
+  assert.equal(az.action, null, "nothing to repair here: it is the added tool's");
 });
 
 test("a CLI an added tool provides is signed in to here, and installed, updated and removed there", () => {
@@ -934,6 +984,8 @@ test("a CLI an added tool provides is signed in to here, and installed, updated 
   assert.deepEqual(plain(glab.action), { variant: "primary", cmd: "scm.signin", label: "Sign in", icon: "log-in" });
   assert.equal(glab.attention, true, "added to be used: signed out wants the user");
   assert.deepEqual(plain(M.managedSourceControlRows(signedOut, ui(), NOW)), [], "nothing to install or update here");
+  assert.deepEqual(plain(M.needsYou(signedOut, null, ui()).map((r) => r.id)), ["glab"], "and on the Overview, like one installed here");
+  assert.equal(M.summaries(signedOut, null, ui(), NOW).sourcecontrol.text, "0 of 1 CLI signed in");
 
   const signedIn = scmRow(statusWith({ sourceControl: [scm("glab", { installed: false, version: null, providedBy })] }), "glab");
   assert.equal(signedIn.status.text, "Signed in as ana on gitlab.com");
@@ -1008,6 +1060,11 @@ test("a signed-in CLI offers another host and signing out; az signs in with a de
   const az = scmRow(s, "az");
   assert.equal(az.flow, "device");
   assert.deepEqual(plain(az.menu.filter((m) => m.cmd && m.cmd.startsWith("scm.")).map((m) => m.label)), ["Sign in again…", "Sign out…"]);
+  // gh signs in again with a device code, or with a token for another host,
+  // and signs out of the host it is signed in to.
+  const gh = scmRow(statusWith({ sourceControl: [scm("gh", { auth: { status: "authenticated", account: "ana", host: "github.com" } })] }), "gh");
+  assert.deepEqual(plain(gh.menu.map((m) => [m.cmd, m.label])),
+    [["scm.signin", "Sign in again…"], ["scm.token", "Sign in with a token…"], ["scm.signout", "Sign out of github.com…"]]);
   const signing = scmRow(s, "az", { signingIn: "az" });
   assert.equal(signing.state, "signing");
   assert.equal(signing.badge.text, "Signing in");

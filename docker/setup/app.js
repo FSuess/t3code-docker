@@ -109,6 +109,8 @@
     expandedPorts,
     providerNames: [],
     signingIn: null,
+    // A source control CLI being signed out, while its request runs.
+    signingOut: null,
     // This page's own address, once confirmed to be T3 Code's too: see checkHere.
     here: null,
   };
@@ -517,8 +519,8 @@
     }
     // The sign-in state below is the last definite answer, not a fresh probe:
     // offline, the refresh exceeds its budget and warms the next poll instead.
-    const cache = s.harnessCache;
-    if (route === 'agents' && cache && cache.stale && (cache.source === 'cache' || cache.source === 'cheap')) {
+    const cache = route === 'agents' ? s.harnessCache : route === 'sourcecontrol' ? s.sourceControlCache : null;
+    if (cache && cache.stale && (cache.source === 'cache' || cache.source === 'cheap')) {
       out.push(notice(null, 'history', null, 'Sign-in state is from the last check while a fresh one finishes. It refreshes on the next poll.'));
     }
     return out;
@@ -631,15 +633,24 @@
     { actions: muted('Since the setup service started') });
   };
 
+  /** The page a "Needs you" item lives on, and that page's link. */
+  const NEEDS_PAGES = { agents: 'All agents', toolchains: 'All toolchains', sourcecontrol: 'Source control', ports: 'All ports' };
+  const needsPage = (x) => x.target === 'port' ? 'ports' : x.target === 'harness' ? 'agents'
+    : x.target === 'toolchain' && M.SOURCE_CONTROL[x.id] ? 'sourcecontrol' : 'toolchains';
+
   const overviewPage = (s, n) => {
     const r = M.readiness(s, ui);
     const needs = M.needsYou(s, state.ports, ui);
     const devices = M.deviceRows(s.sessions, n);
+    // A link to the one page they all live on; from several, each row's own
+    // action is the way in.
+    const pages = new Set(needs.map(needsPage));
+    const [page] = pages;
     return html`
       ${pageNotices('overview')}
       ${r.ready ? readyLine(s) : readinessGroup(r)}
       ${needs.length ? section('needs-title', 'Needs you', html`<div class="tc-group"><div class="tc-list">${needs.map(attentionRow)}</div></div>`,
-        { actions: needs.every((x) => x.target === 'port') ? linkButton('#ports', 'All ports') : linkButton('#agents', 'All agents') }) : ''}
+        pages.size === 1 ? { actions: linkButton('#' + page, NEEDS_PAGES[page]) } : undefined) : ''}
       ${activitySection(M.activity(s, ui, n), n)}
       ${r.ready ? html`
         ${glanceSection(s, state.ports, n)}
@@ -922,8 +933,8 @@
         <div class="tc-card-foot">${icon('info', 'tc-icon--sm')}<span>T3 Code opens pull requests through these. Bitbucket needs none: add its token in T3 Code under Settings → Source Control.</span></div>
       </div>`)}
       ${section('sc-how', 'How sign-in works', html`<div class="tc-group"><dl class="tc-kv">
-        <dt>Tokens</dt><dd class="tc-kv-prose">GitHub, GitLab, Forgejo and Gitea take a token you make on the server. It goes to the CLI on stdin, and the server has to accept it before it counts.</dd>
-        <dt>Azure DevOps</dt><dd class="tc-kv-prose">A device code, approved on Microsoft’s page.</dd>
+        <dt>Device code</dt><dd class="tc-kv-prose">GitHub and Azure DevOps: approve a code on github.com or Microsoft’s page, from any device. There is no token to make.</dd>
+        <dt>Tokens</dt><dd class="tc-kv-prose">GitLab, Forgejo, Gitea, and GitHub Enterprise: a token you make on the server. The CLI gets it on stdin or in its environment, never on a command line, and it only counts once the server accepts it.</dd>
         <dt>Credentials</dt><dd class="tc-kv-prose">On the state volume at <code>${(s.paths && s.paths.volume) || '/home/t3'}</code>. They survive a recreate.</dd>
         <dt>From a shell</dt><dd><code>t3-harness source-control</code></dd>
       </dl></div>`)}`;
@@ -1368,7 +1379,7 @@
         ${step(2, 'Approve, then come back', 'active', waiting('Waiting for ' + meta.name + ' to report a session…'))}`;
     }
     return html`
-      <div class="tc-sheet-head">${tile(meta, 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : meta.flow === 'redirect' ? html`<span class="tc-small tc-muted">T3 Code’s own Google sign-in</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
+      <div class="tc-sheet-head">${tile(meta, 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="signin-title">Sign in to ${meta.provider || meta.name}</h2>${meta.command ? html`<span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you</span>` : meta.flow === 'redirect' ? html`<span class="tc-small tc-muted">T3 Code’s own Google sign-in</span>` : ''}</div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="cancel" aria-label="Close and cancel sign-in">${icon('x')}</button></div>
       <div class="tc-sheet-body" aria-live="polite">${body}</div>
       <div class="tc-sheet-foot">${signin.phase === 'failed'
         ? html`<button class="tc-btn tc-btn--ghost" type="button" data-sheet="close">Close</button><button class="tc-btn tc-btn--primary" type="button" data-sheet="retry">${icon('refresh-cw')}Try again</button>`
@@ -1405,9 +1416,12 @@
     const st = res.data;
     signin.session = Object.assign({}, signin.session, st, { expiresAt: st.expiresAt || signin.session.expiresAt });
     if (st.state === 'done') {
-      const name = signinMeta(signin.agent).name || signin.agent;
+      const meta = signinMeta(signin.agent);
       signin.layer.close('done');
-      Kit.toast('Signed in to ' + name);
+      // A source control CLI names its host (GitHub), an agent itself. What
+      // came after the sign-in and did not work (gh as git's credential
+      // helper) is said, without undoing it.
+      Kit.toast('Signed in to ' + (meta.provider || meta.name || signin.agent), st.warning ? { detail: st.warning } : undefined);
       loadStatus();
       return;
     }
@@ -1523,7 +1537,7 @@
     const host = scmHostOf() || meta.host;
     const page = meta.tokenPage ? meta.tokenPage(host) : null;
     return html`
-      <div class="tc-sheet-head">${tile(Object.assign({}, meta, { hue: '--id-toolchain' }), 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="scm-title">Sign in to ${meta.provider}</h2><span class="tc-small tc-muted">Runs <code>${meta.command}</code> for you, the token ${meta.handover}</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
+      <div class="tc-sheet-head">${tile(Object.assign({}, meta, { hue: '--id-toolchain' }), 'lg')}<div class="tc-sheet-head-text"><h2 class="tc-sheet-title" id="scm-title">Sign in to ${meta.provider}</h2><span class="tc-small tc-muted">Runs <code>${meta.tokenCommand}</code> for you, with the token ${meta.handover}</span></div><span class="tc-spacer"></span><button class="tc-btn tc-btn--ghost tc-btn--icon tc-btn--sm" type="button" data-sheet="close" aria-label="Close">${icon('x')}</button></div>
       <div class="tc-sheet-body">
         <div class="tc-sheet-step" data-state="done"><span class="tc-step-mark">1</span><div class="tc-sheet-step-body"><label class="tc-sheet-step-title" for="scm-host">Server</label>
           <input id="scm-host" name="host" class="tc-input tc-input--mono" value="${scmSheet.host}" placeholder="${meta.host}" autocomplete="off" spellcheck="false" autocapitalize="off" inputmode="url">
@@ -1594,16 +1608,18 @@
       renderScmSheet();
       const res = await api('/source-control/signin', { body: { id: scmSheet.id, host: scmHostOf() || meta.host, token } });
       scmSheet.saving = false;
-      if (!scmSheet.layer) return;
       if (!res.ok) {
-        // Leave a refused token on screen, to fix or replace.
-        scmSheet.error = res.error;
-        renderScmSheet();
+        // Leave a refused token on screen, to fix or replace; with the sheet
+        // closed while it was checked, say so instead.
+        if (scmSheet.layer) { scmSheet.error = res.error; renderScmSheet(); } else Kit.toast('Could not sign in to ' + meta.provider, { tone: 'danger', detail: res.error });
         return;
       }
+      // The account the row reads is the CLI's current one, which is only this
+      // host's when the host is the one it reads.
       const auth = res.data.sourceControl && res.data.sourceControl.auth;
-      scmSheet.layer.close('saved');
-      Kit.toast('Signed in to ' + (res.data.host || meta.provider) + (auth && auth.account ? ' as ' + auth.account : ''),
+      const account = auth && auth.account && auth.host === res.data.host ? auth.account : null;
+      if (scmSheet.layer) scmSheet.layer.close('saved');
+      Kit.toast('Signed in to ' + (res.data.host || meta.provider) + (account ? ' as ' + account : ''),
         res.data.warning ? { detail: res.data.warning } : undefined);
       loadStatus();
     });
@@ -1612,14 +1628,20 @@
   const confirmScmSignOut = async (id) => {
     const meta = M.SOURCE_CONTROL[id] || {};
     const auth = (toolchain(id) || {}).auth || {};
-    const host = id === 'az' ? null : auth.host || meta.host;
+    const host = meta.tokenCommand ? auth.host || meta.host : null;
     const ok = await Kit.confirm({
       title: 'Sign ' + meta.name + ' out' + (host ? ' of ' + host : '') + '?',
-      body: 'T3 Code stops opening ' + meta.provider + ' pull requests' + (host ? ' on ' + host : '') + ' until it is signed in again.' + (id === 'gh' ? ' git push over HTTPS to it stops working too.' : ''),
+      // gh and tea are git's credential helper for the hosts they sign in to.
+      body: 'T3 Code stops opening ' + meta.provider + ' pull requests' + (host ? ' on ' + host : '') + ' until it is signed in again.'
+        + (id === 'gh' || id === 'tea' ? ' git push over HTTPS to it stops working too.' : ''),
       confirm: 'Sign out',
     });
     if (!ok) return;
-    const res = await api('/source-control/signout', { body: { id, host } });
+    ui.signingOut = id;
+    render();
+    // gh will not guess which of two accounts on a host to sign out.
+    const res = await api('/source-control/signout', { body: { id, host, account: auth.account || null } });
+    ui.signingOut = null;
     if (!res.ok) Kit.toast('Could not sign ' + meta.name + ' out', { tone: 'danger', detail: res.error });
     else Kit.toast('Signed ' + meta.name + ' out' + (host ? ' of ' + host : ''));
     loadStatus();
@@ -2697,6 +2719,7 @@
     'toolchain.uninstall': (a) => confirmUninstall('toolchain', a.id),
     'toolchain.updateAll': () => updateAll('tools'),
     'scm.signin': (a, el) => ((M.SOURCE_CONTROL[a.id] || {}).flow === 'device' ? openSignin(a.id, el) : openScmSheet(a.id, el)),
+    'scm.token': (a, el) => openScmSheet(a.id, el),
     'scm.signout': (a) => confirmScmSignOut(a.id),
     'scm.updateAll': () => updateAll('scm'),
     'tools.updateAll': () => updateAll('tools'),

@@ -728,11 +728,11 @@ The `v0.4.x` tags still have the old images if you need to roll back.
 T3 Code opens, lists and checks out pull requests through each host's own
 command-line tool, which it looks for on `PATH` and asks whether it is signed in
 (Settings → Source Control in T3 Code). The setup page's **Source control**
-page, under Toolchains, has one row per host:
+page (under **More** on a phone) has one row per host:
 
 | Host | CLI | In the image | Signs in with |
 | --- | --- | :---: | --- |
-| GitHub | `gh` | ✅ | a token |
+| GitHub | `gh` | ✅ | a device code, or a token |
 | GitLab | `glab` | one click | a token |
 | Forgejo (Codeberg) | `fj` | one click | a token |
 | Gitea (and Forgejo) | `tea` | one click | a token |
@@ -755,18 +755,22 @@ Each row says who the CLI is signed in as, the same way T3 Code asks. One you
 installed and haven't signed in counts as needing you, since T3 Code can't use
 it yet; the image's `gh` never does. **Sign in** opens a sheet:
 
-- **gh, glab, fj, tea**: name the server (github.com, gitlab.com, codeberg.org
+- **gh and az**: a device code, like the agents': open github.com's or
+  Microsoft's page on any device, enter the code, approve. There is no token to
+  make. `gh` asks for the `workflow` scope on top of its own, so T3 Code can
+  push a branch that changes `.github/workflows`.
+- **glab, fj, tea**, and **gh** with a token (its row's menu, for GitHub
+  Enterprise or a narrower token): name the server (gitlab.com, codeberg.org
   and gitea.com unless yours runs elsewhere), open its token page, which links
   to a new token with the scopes T3 Code needs where the host allows that, and
   paste the token. It goes to the CLI on stdin (to `tea` in its environment),
   never as an argument, and the server has to accept it before the sheet
-  closes; a token it refused is removed again. `gh` and `tea` also become git's
-  credential helper for that server, so a push over HTTPS uses the same token.
-- **az**: the device-code flow, like the agents': open the page, enter the
-  code, approve.
+  closes. A token it refused leaves things as they were: a sign-in that worked
+  before is still there.
 
-Once signed in, the row's menu signs in to another server or signs out. From a
-shell:
+`gh` and `tea` also become git's credential helper for the server they sign in
+to, so a push over HTTPS uses the same sign-in. Once signed in, the row's menu
+signs in again, to another server, or out. From a shell:
 
 ```bash
 docker compose exec t3code t3-harness source-control     # every CLI, its host and who it is signed in as

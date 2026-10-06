@@ -11,8 +11,9 @@ import test from "node:test";
 
 import { getSourceControl } from "../docker/harness/catalogue.mjs";
 import {
-  DEFAULT_HOSTS, azExtensionDir, credentialFiles, detectSourceControlAuth, failureLine, fjKeysPath, missingExtensions,
-  parseAzAuth, parseFjKeys, parseGhAuth, parseGlabAuth, parseHost, parseTeaAuth, parseToken, safeLine, signOutArgs, tokenSignIn,
+  DEFAULT_HOSTS, azExtensionDir, credentialFiles, detectSourceControlAuth, deviceSignIn, failureLine, fjKeysPath, missingExtensions,
+  parseAzAuth, parseDevicePrompt, parseFjKeys, parseGhAuth, parseGlabAuth, parseHost, parseTeaAuth, parseToken, safeLine, signOutArgs,
+  teaLoginFor, tokenSignIn,
 } from "../docker/harness/source-control.mjs";
 
 test("gh: the active account that signed in, else why not", () => {
@@ -40,10 +41,12 @@ test("gh: the active account that signed in, else why not", () => {
 
   // A host gh never reached is not a host it is signed out of.
   const timeout = JSON.stringify({ hosts: { "github.com": [{ state: "timeout", active: true, host: "github.com", login: "octocat" }] } });
-  assert.equal(parseGhAuth({ stdout: timeout }).status, "unknown");
+  assert.deepEqual(parseGhAuth({ stdout: timeout }),
+    { status: "unknown", account: null, host: "github.com", detail: "github.com did not answer in time" });
   const offline = JSON.stringify({ hosts: { "github.com": [{ state: "error", active: true, host: "github.com", login: "octocat",
     error: 'Get "https://api.github.com/": dial tcp: lookup api.github.com on 127.0.0.11:53: no such host' }] } });
   assert.equal(parseGhAuth({ stdout: offline }).status, "unknown");
+  assert.equal(parseGhAuth({ stdout: offline }).detail, "github.com does not resolve", "the point, not the wrapping");
 
   const old = parseGhAuth({ stdout: "", stderr: "unknown flag: --json\n", code: 1 });
   assert.equal(old.status, "unknown", "an old gh is not a signed-out one");
@@ -82,8 +85,11 @@ test("glab: the host block that says who is logged in", () => {
   const unknown = parseGlabAuth({ stderr: offline, code: 1 });
   assert.equal(unknown.status, "unknown");
   assert.equal(unknown.host, "gitlab.example.com");
+  assert.equal(unknown.detail, "gitlab.example.com does not resolve");
   const tls = offline.replace("dial tcp: lookup gitlab.example.com: no such host", "remote error: tls: unrecognized name");
   assert.equal(parseGlabAuth({ stderr: tls, code: 1 }).status, "unknown", "a TLS failure never got an answer either");
+  const x509 = offline.replace("dial tcp: lookup gitlab.example.com: no such host", "tls: failed to verify certificate: x509: certificate signed by unknown authority");
+  assert.equal(parseGlabAuth({ stderr: x509, code: 1 }).detail, "gitlab.example.com's certificate is not trusted");
 });
 
 test("tea: the default login, valid or not", () => {
@@ -106,6 +112,11 @@ test("az: a user name, or az's own complaint", () => {
   assert.equal(out.status, "unauthenticated");
   assert.equal(out.detail, "ERROR: Please run 'az login' to setup account.");
   assert.equal(parseAzAuth({ stdout: "\n", code: 0 }).status, "unknown");
+  // An az that is broken is not signed out: that would offer a sign-in that cannot work.
+  const broken = parseAzAuth({ stderr: "Traceback (most recent call last):\nModuleNotFoundError: No module named 'azure.cli.command_modules.profile'\n", code: 1 });
+  assert.equal(broken.status, "unknown");
+  assert.equal(broken.detail, "ModuleNotFoundError: No module named 'azure.cli.command_modules.profile'");
+  assert.equal(parseAzAuth({ stderr: "ERROR: AADSTS700082: The refresh token has expired due to inactivity.\n", code: 1 }).status, "unauthenticated");
 });
 
 test("fj: a saved key is the answer, and its host is the account", () => {
@@ -238,7 +249,7 @@ test("a token goes to the CLI on stdin or in the environment, never as an argume
     assert.ok(handed, `${id} is given the token`);
   }
   assert.deepEqual(tokenSignIn(getSourceControl("gh"), "github.com", TOKEN).steps[1],
-    { args: ["auth", "setup-git", "--hostname", "github.com"], optional: true, warn: true });
+    { args: ["auth", "setup-git", "--hostname", "github.com"], optional: true, warn: "Signed in, but git push over HTTPS will not use it" });
   // fj keeps a key it already has (and exits 0), tea refuses a login name in
   // use: both sign out of the host first, and either may have nothing to sign out of.
   assert.deepEqual(tokenSignIn(getSourceControl("fj"), "codeberg.org", TOKEN).steps.map((step) => [step.args.join(" "), Boolean(step.optional)]),
@@ -257,4 +268,65 @@ test("a failed sign-in says what the CLI said, with the token cut out", () => {
     "error validating token: HTTP 401: Bad credentials");
   assert.equal(failureLine({ code: 1, stderr: "access token does not exist [sha: tok-123]\n", stdout: "" }, "tok-123"), "access token does not exist [sha: …]");
   assert.equal(failureLine({ code: 1, stderr: "", stdout: "" }, "ghp_0123456789abcdef"), "exited with code 1");
+});
+
+test("gh and az sign in with a device code; the others only take a token", () => {
+  const gh = deviceSignIn(getSourceControl("gh"));
+  assert.equal(gh.host, "github.com");
+  assert.deepEqual(gh.args, ["auth", "login", "--web", "--hostname", "github.com", "--git-protocol", "https", "--insecure-storage",
+    "--skip-ssh-key", "--scopes", "workflow"], "workflow on top of gh's own scopes, so T3 can push workflow files");
+  assert.deepEqual(gh.after, [{ args: ["auth", "setup-git", "--hostname", "github.com"], warn: "Signed in, but git push over HTTPS will not use it" }],
+    "git push over HTTPS signs in the same way");
+  assert.equal(deviceSignIn(getSourceControl("gh"), "github.example.com").args[4], "github.example.com");
+  assert.deepEqual(deviceSignIn(getSourceControl("az")).args, ["login", "--use-device-code", "--allow-no-subscriptions", "--output", "none"]);
+  for (const id of ["glab", "fj", "tea"]) assert.equal(deviceSignIn(getSourceControl(id)), null, id);
+});
+
+test("a device sign-in's page and code come from the lines that ask for them", () => {
+  // gh 2.102, with no clipboard and no browser, as in the container.
+  const gh = getSourceControl("gh");
+  const ghSaid = [
+    "! Failed to copy one-time code to clipboard",
+    "  No clipboard utilities available. Please install xsel, xclip, wl-clipboard or Termux:API add-on for termux-clipboard-get/set.",
+    "! First copy your one-time code: 30B3-A660",
+    "Open this URL to continue in your web browser: https://github.com/login/device",
+  ].join("\n");
+  assert.deepEqual(parseDevicePrompt(gh, ghSaid), { url: "https://github.com/login/device", code: "30B3-A660" });
+  assert.deepEqual(parseDevicePrompt(gh, ghSaid.split("\n").slice(0, 3).join("\n")), { url: null, code: "30B3-A660" }, "the code comes first");
+  assert.deepEqual(parseDevicePrompt(gh, ""), { url: null, code: null });
+
+  // az 2.90's line; a warning with a longer link can come before it.
+  const az = getSourceControl("az");
+  const azSaid = [
+    "WARNING: A web browser has been opened at https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?client_id=04b07795-8ddb-461a-bbee-02f9e1bf7b46. Please continue the login there.",
+    "To sign in, use a web browser to open the page https://login.microsoft.com/device and enter the code AATJL9P8Y to authenticate.",
+  ].join("\n");
+  assert.deepEqual(parseDevicePrompt(az, azSaid), { url: "https://login.microsoft.com/device", code: "AATJL9P8Y" });
+  assert.deepEqual(parseDevicePrompt(az, "To sign in, use a web browser to open the page https://microsoft.com/devicelogin and enter the code DXQ8ZRT7K to authenticate."),
+    { url: "https://microsoft.com/devicelogin", code: "DXQ8ZRT7K" }, "and the older page");
+  assert.deepEqual(parseDevicePrompt(az, azSaid.split("\n")[0]), { url: null, code: null });
+  assert.deepEqual(parseDevicePrompt(getSourceControl("glab"), azSaid), { url: null, code: null });
+});
+
+test("signing out names the account gh should drop, and the login tea knows the host by", () => {
+  const gh = getSourceControl("gh");
+  assert.deepEqual(signOutArgs(gh, "github.com"), ["auth", "logout", "--hostname", "github.com"]);
+  assert.deepEqual(signOutArgs(gh, "github.com", { account: "octocat" }), ["auth", "logout", "--hostname", "github.com", "--user", "octocat"],
+    "with two accounts on one host, gh will not guess");
+  assert.deepEqual(signOutArgs(gh, "github.com", { account: "--hostname=evil" }), ["auth", "logout", "--hostname", "github.com"], "never an option");
+  assert.deepEqual(signOutArgs(getSourceControl("glab"), "gitlab.com"), ["auth", "logout", "--hostname", "gitlab.com"]);
+  assert.deepEqual(signOutArgs(getSourceControl("fj"), "codeberg.org"), ["auth", "logout", "codeberg.org"]);
+  assert.deepEqual(signOutArgs(getSourceControl("az"), null), ["logout"]);
+
+  const tea = getSourceControl("tea");
+  const listed = JSON.stringify([
+    { name: "work", url: "https://git.example.com", default: "true", user: "ana" },
+    { name: "gitea.com", url: "https://gitea.com", default: "false", user: "ana" },
+  ]);
+  assert.equal(teaLoginFor(listed, "git.example.com"), "work", "made in a terminal, under a name of its own");
+  assert.equal(teaLoginFor(listed, "gitea.com"), "gitea.com");
+  assert.equal(teaLoginFor(listed, "codeberg.org"), null);
+  assert.equal(teaLoginFor("not json", "gitea.com"), null);
+  assert.deepEqual(signOutArgs(tea, "git.example.com", { login: "work" }), ["logout", "work"]);
+  assert.deepEqual(signOutArgs(tea, "gitea.com"), ["logout", "gitea.com"], "the name the page gives a login");
 });

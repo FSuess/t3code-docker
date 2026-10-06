@@ -35,6 +35,23 @@ export function safeLine(text) {
 const UNREACHABLE = /\b(?:timeout|timed out|deadline exceeded|no such host|name resolution|dial tcp|connection refused|connection reset|network is unreachable|no route to host|certificate|EOF|error sending request|request failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b|\b(?:tls|x509):/i;
 export const unreachable = (text) => UNREACHABLE.test(String(text ?? ""));
 
+// Why a server was not reached, in a few words. A CLI's own message is a
+// chain of wrapped errors ("API call failed: Get ...: dial tcp: lookup ...:
+// no such host") whose point is at the end, past any line's worth of room.
+const WHY_UNREACHED = [
+  [/no such host|name resolution|ENOTFOUND|EAI_AGAIN|server misbehaving/i, (host) => `${host} does not resolve`],
+  [/x509|certificate|\btls:/i, (host) => `${host}'s certificate is not trusted`],
+  [/connection refused|ECONNREFUSED/i, (host) => `${host} refused the connection`],
+  [/network is unreachable|no route to host/i, (host) => `there is no route to ${host}`],
+  [/connection reset|ECONNRESET|\bEOF\b/i, (host) => `the connection to ${host} dropped`],
+  [/timeout|timed out|deadline exceeded|ETIMEDOUT/i, (host) => `${host} did not answer in time`],
+];
+/** "gitlab.example.com does not resolve", or the CLI's own line when the reason is none of those. */
+export function unreachedReason(text, host = null) {
+  const why = WHY_UNREACHED.find(([pattern]) => pattern.test(String(text ?? "")))?.[1];
+  return why ? why(host || "the server") : safeLine(text);
+}
+
 /** What every sign-in check and sign-in runs with: no colour, and never a prompt. */
 export const NO_PROMPT = Object.freeze({ NO_COLOR: "1", GH_PROMPT_DISABLED: "1", GLAB_NO_PROMPT: "1" });
 
@@ -64,7 +81,7 @@ export function parseGhAuth({ stdout = "", stderr = "", code = 0 } = {}) {
     const failed = active[0];
     const detail = failed?.error?.trim() || null;
     if (failed && (failed.state === "timeout" || unreachable(detail))) {
-      return verdict("unknown", { host: failed.host, detail: detail ?? `${failed.host} did not answer in time` });
+      return verdict("unknown", { host: failed.host, detail: unreachedReason(detail ?? "timed out", failed.host) });
     }
     return verdict("unauthenticated", { host: failed?.host, detail });
   }
@@ -100,7 +117,8 @@ export function parseGlabAuth({ stdout = "", stderr = "", code = 0 } = {}) {
   if (account) return verdict("authenticated", { account, host: hosts[0]?.host });
   const said = hosts.length ? hosts[0].lines.join("\n") : text;
   const offline = hosts.length ? unreachable(said) : unreachable(text);
-  return verdict(code === 0 || offline ? "unknown" : "unauthenticated", { host: hosts[0]?.host, detail: safeLine(said) });
+  return verdict(code === 0 || offline ? "unknown" : "unauthenticated",
+    { host: hosts[0]?.host, detail: offline ? unreachedReason(said, hosts[0]?.host) : safeLine(said) });
 }
 
 /**
@@ -126,15 +144,26 @@ export function parseTeaAuth({ stdout = "", stderr = "" } = {}) {
 export function teaReachable(signedOut, { stdout = "", stderr = "", code = 0 } = {}) {
   const { login, ...answer } = signedOut;
   const said = `${stderr}\n${stdout}`;
-  if (code !== 0 && unreachable(said)) return verdict("unknown", { host: answer.host, detail: safeLine(said) });
+  if (code !== 0 && unreachable(said)) return verdict("unknown", { host: answer.host, detail: unreachedReason(said, answer.host) });
   // The server's own message names no token, only that it refused one.
   const message = parseJson(stdout)?.message;
   return { ...answer, detail: typeof message === "string" && message.trim() ? message.trim().slice(0, 200) : safeLine(said) };
 }
 
-/** `az account show --query user.name -o tsv`: a user name, or az's own complaint. */
+/**
+ * `az account show --query user.name -o tsv`: a user name, or az's own
+ * complaint. Only "run az login" (or a sign-in that expired) means signed
+ * out; an az that fails some other way - a broken install, a missing module
+ * after a partial upgrade - is unknown, with what it said.
+ */
+const AZ_SIGNED_OUT = /az login|AADSTS70043|AADSTS700082|refresh token has expired|no subscription found/i;
 export function parseAzAuth({ stdout = "", stderr = "", code = 0 } = {}) {
-  if (code !== 0) return verdict("unauthenticated", { detail: safeLine(`${stderr}\n${stdout}`) });
+  if (code !== 0) {
+    const said = `${stderr}\n${stdout}`;
+    // A Python traceback says what went wrong on its last line, not its first.
+    const told = /^Traceback /m.test(said) ? safeLine(said.trim().split(/\r?\n/).at(-1)) : safeLine(said);
+    return verdict(AZ_SIGNED_OUT.test(said) ? "unauthenticated" : "unknown", { detail: told });
+  }
   const account = String(stdout).trim().split(/\r?\n/)[0]?.trim();
   return account ? verdict("authenticated", { account, host: "dev.azure.com" })
     : verdict("unknown", { host: "dev.azure.com" });
@@ -243,10 +272,14 @@ export async function missingExtensions(ctx, entry) {
 // --- signing in and out -------------------------------------------------------
 //
 // gh, glab, fj and tea sign in with a token for one host, handed over on stdin
-// or in the environment - never as an argument, where `ps` would show it. az
-// signs in with a device code instead (the setup service runs that flow), so
-// it has no token plan. Each plan is fixed argv per CLI; only the host, which
-// is checked first, comes from the request.
+// or in the environment - never as an argument, where `ps` would show it. gh
+// and az also sign in with a device code: a page and a code to approve on any
+// device, with no token to make (the setup service runs that flow). Each plan
+// is fixed argv per CLI; only the host, which is checked first, comes from the
+// request.
+
+/** What a sign-in that worked says when git could not be set up to push with it. */
+const GIT_NOT_SET_UP = "Signed in, but git push over HTTPS will not use it";
 
 /** The host most people mean, when they do not name another. */
 export const DEFAULT_HOSTS = Object.freeze({ gh: "github.com", glab: "gitlab.com", fj: "codeberg.org", tea: "gitea.com" });
@@ -296,7 +329,7 @@ export function tokenSignIn(entry, host, token) {
           { args: ["auth", "login", "--hostname", host, "--with-token", "--git-protocol", "https", "--insecure-storage"], input: `${token}\n` },
           // So git push over HTTPS uses the same token. Signed in without it
           // is still signed in: a failure here is a warning, not a rollback.
-          { args: ["auth", "setup-git", "--hostname", host], optional: true, warn: true },
+          { args: ["auth", "setup-git", "--hostname", host], optional: true, warn: GIT_NOT_SET_UP },
         ],
         verify: null,
       };
@@ -328,21 +361,85 @@ export function tokenSignIn(entry, host, token) {
   }
 }
 
-/** How one CLI signs out of `host` (az of everything). */
-export function signOutArgs(entry, host) {
+// What each device sign-in prints when it is ready, read from the line that
+// asks for it: az can print warnings with longer links (aka.ms, docs) first.
+//   gh:  ! First copy your one-time code: 30B3-A660
+//        Open this URL to continue in your web browser: https://github.com/login/device
+//   az:  To sign in, use a web browser to open the page https://microsoft.com/devicelogin
+//        and enter the code ABCD1234 to authenticate.
+const GH_DEVICE_CODE = /one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})\b/;
+const GH_DEVICE_PAGE = /Open this URL to continue in your web browser:\s*(https:\/\/[^\s"'<>]+)/;
+const AZ_DEVICE = /open the page\s+(https:\/\/[^\s"'<>]+?)\.?\s+and enter the code\s+([A-Z0-9]{6,12})\b/i;
+
+/** The device page and code a device sign-in has printed so far; each is null until it has. */
+export function parseDevicePrompt(entry, output) {
+  const text = String(output ?? "");
+  if (entry.auth === "gh") {
+    return { url: GH_DEVICE_PAGE.exec(text)?.[1] ?? null, code: GH_DEVICE_CODE.exec(text)?.[1] ?? null };
+  }
+  if (entry.auth === "az") {
+    const asked = AZ_DEVICE.exec(text);
+    return { url: asked?.[1] ?? null, code: asked?.[2] ?? null };
+  }
+  return { url: null, code: null };
+}
+
+/**
+ * How one CLI signs in with a device code, where it can: the command, which
+ * prints a page and a code (`parseDevicePrompt`), waits for the approval and
+ * exits 0, then any steps to run once it has. Null for the CLIs that only
+ * take a token. gh asks for `workflow` on top of its own scopes (repo,
+ * read:org, gist), so T3 Code can push a branch that touches .github/workflows,
+ * and is set up as git's credential helper afterwards, as a token sign-in is.
+ */
+export function deviceSignIn(entry, host = DEFAULT_HOSTS[entry.auth] ?? null) {
   switch (entry.auth) {
     case "gh":
+      return {
+        host,
+        args: ["auth", "login", "--web", "--hostname", host, "--git-protocol", "https", "--insecure-storage",
+          "--skip-ssh-key", "--scopes", "workflow"],
+        after: [{ args: ["auth", "setup-git", "--hostname", host], warn: GIT_NOT_SET_UP }],
+      };
+    case "az":
+      return { host: null, args: ["login", "--use-device-code", "--allow-no-subscriptions", "--output", "none"], after: [] };
+    default:
+      return null;
+  }
+}
+
+/** An account name as gh prints it, safe to hand back to it. */
+const ACCOUNT = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+
+/**
+ * How one CLI signs out of `host` (az of everything). gh signs `account` out
+ * when it is named, since with two accounts on one host it will not guess
+ * which; tea signs out the login by its own name (`login`), which a login made
+ * in a terminal may not share with its host.
+ */
+export function signOutArgs(entry, host, { account = null, login = null } = {}) {
+  switch (entry.auth) {
+    case "gh":
+      return ["auth", "logout", "--hostname", host, ...(account && ACCOUNT.test(account) ? ["--user", account] : [])];
     case "glab":
       return ["auth", "logout", "--hostname", host];
     case "fj":
       return ["auth", "logout", host];
     case "tea":
-      return ["logout", host];
+      return ["logout", login || host];
     case "az":
       return ["logout"];
     default:
       return null;
   }
+}
+
+/** `tea login list --output json`: the name of the login for `host`, or null. */
+export function teaLoginFor(stdout, host) {
+  const logins = parseJson(stdout);
+  if (!Array.isArray(logins)) return null;
+  const login = logins.find((entry) => entry && hostOf(entry.url) === host);
+  return typeof login?.name === "string" && login.name ? login.name : null;
 }
 
 /**

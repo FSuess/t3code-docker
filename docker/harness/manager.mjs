@@ -23,8 +23,8 @@ import {
 } from "./packages.mjs";
 import { credentialSurface, detectAuth, probeVersion } from "./probe.mjs";
 import {
-  DEFAULT_HOSTS, NO_PROMPT, credentialFiles, detectSourceControlAuth, failureLine, missingExtensions, parseHost, parseToken,
-  signOutArgs, tokenSignIn,
+  DEFAULT_HOSTS, NO_PROMPT, credentialFiles, detectSourceControlAuth, deviceSignIn, failureLine, missingExtensions,
+  parseDevicePrompt, parseHost, parseToken, signOutArgs, teaLoginFor, tokenSignIn,
 } from "./source-control.mjs";
 import * as state from "./state.mjs";
 import { compareVersions, meetsMinimum } from "./version.mjs";
@@ -1062,7 +1062,8 @@ export function createHarnessManager(options = {}) {
       // added tool it is.
       providedBy: elsewhere ? { tool: elsewhere.tool, version: elsewhere.version } : null,
       executable: own ?? elsewhere?.executable ?? null,
-      missingExtensions: base.installed ? await missingExtensions(ctx, entry) : [],
+      // An az from an added tool needs the extension as much as one installed here.
+      missingExtensions: base.installed || elsewhere ? await missingExtensions(ctx, entry) : [],
     };
   }
 
@@ -1190,7 +1191,7 @@ export function createHarnessManager(options = {}) {
         const result = await runScm(executable, step.args, { input: step.input ?? null, env: step.env ?? {} });
         if (result.code === 0) continue;
         const said = failureLine(result, token.token);
-        if (step.optional) { if (step.warn) warnings.push(said); continue; }
+        if (step.optional) { if (step.warn) warnings.push(`${step.warn}: ${said}`); continue; }
         return await failed(said);
       }
       if (plan.verify) {
@@ -1204,18 +1205,79 @@ export function createHarnessManager(options = {}) {
     return { ok: true, code: "ok", host: host.host, ...(warnings.length ? { warning: warnings[0] } : {}), sourceControl: facts };
   }
 
-  /** Sign a CLI out of one host (az out of everything). Its other hosts stay signed in. */
-  async function signOutSourceControl(id, { host: rawHost } = {}) {
+  /**
+   * Sign a CLI out of one host (az out of everything). Its other hosts stay
+   * signed in. `account` is the one the page showed, for gh with more than one.
+   */
+  async function signOutSourceControl(id, { host: rawHost, account = null } = {}) {
     const entry = getSourceControl(id);
     if (!entry) return { ok: false, code: "unknown-toolchain", error: `unknown source control CLI: ${id}` };
     const host = entry.auth === "az" ? { ok: true, host: null } : parseHost(rawHost || DEFAULT_HOSTS[id]);
     if (!host.ok) return { ok: false, code: "invalid-host", error: host.error };
     const executable = await sourceControlExecutable(id);
     if (!executable) return { ok: false, code: "not-installed", error: `${entry.name} is not installed` };
-    const result = await runScm(executable, signOutArgs(entry, host.host));
+    // tea names its logins; one made in a terminal may not be named for its host.
+    const login = entry.auth === "tea" ? teaLoginFor((await runScm(executable, ["login", "list", "--output", "json"])).stdout, host.host) : null;
+    const result = await runScm(executable, signOutArgs(entry, host.host, { account: typeof account === "string" ? account : null, login }));
     authCache.delete(id);
     if (result.code !== 0) return { ok: false, code: "failed", error: failureLine(result) };
     return { ok: true, code: "ok", sourceControl: await resolveSourceControl(id) };
+  }
+
+  /**
+   * A device-code sign-in for a CLI that has one (gh, az), resolved to what
+   * the setup service spawns and watches: the command, its environment, and
+   * how to read the page and the code it prints. The setup service owns the
+   * process, since it waits on someone approving on another device;
+   * `finishDeviceSignIn` runs what comes after.
+   */
+  async function deviceSignInSourceControl(id) {
+    const entry = getSourceControl(id);
+    if (!entry) return { ok: false, code: "unknown-toolchain", error: `unknown source control CLI: ${id}` };
+    const plan = deviceSignIn(entry);
+    if (!plan) return { ok: false, code: "unsupported", error: `${entry.name} signs in with a token` };
+    const executable = await sourceControlExecutable(id);
+    if (!executable) return { ok: false, code: "not-installed", error: `${entry.name} is not installed` };
+    return {
+      ok: true,
+      name: entry.name,
+      host: plan.host,
+      command: [executable, ...plan.args],
+      env: { ...ctx.env, ...NO_PROMPT },
+      cwd: ctx.home,
+      readPrompt: (output) => parseDevicePrompt(entry, output),
+    };
+  }
+
+  /**
+   * After a device sign-in was approved: its follow-up steps (gh as git's
+   * credential helper), whose failure is a warning, not a failed sign-in.
+   */
+  async function finishDeviceSignIn(id) {
+    const entry = getSourceControl(id);
+    const plan = entry ? deviceSignIn(entry) : null;
+    if (!plan) return { ok: false, code: "unknown-toolchain", error: `unknown source control CLI: ${id}` };
+    const executable = await sourceControlExecutable(id);
+    const warnings = [];
+    for (const step of executable ? plan.after : []) {
+      const result = await runScm(executable, step.args);
+      if (result.code !== 0) warnings.push(`${step.warn}: ${failureLine(result)}`);
+    }
+    authCache.delete(id);
+    return { ok: true, code: "ok", host: plan.host, warning: warnings[0] ?? null, sourceControl: await resolveSourceControl(id) };
+  }
+
+  /**
+   * The last sign-in verdict reached for each source control CLI, however old,
+   * by id, without asking any: what a poll shows while a fresh check runs.
+   */
+  function lastSourceControlAuth() {
+    const verdicts = {};
+    for (const entry of SOURCE_CONTROL) {
+      const cached = authCache.get(entry.id);
+      if (cached) verdicts[entry.id] = cached.value;
+    }
+    return verdicts;
   }
 
   /** Drop the cached sign-in verdict after a sign-in changes it. */
@@ -1239,10 +1301,13 @@ export function createHarnessManager(options = {}) {
     sourceControl: {
       status: sourceControlStatus,
       auth: sourceControlAuthById,
+      lastAuth: lastSourceControlAuth,
       resolve: resolveSourceControl,
       executable: sourceControlExecutable,
       signIn: signInSourceControl,
       signOut: signOutSourceControl,
+      deviceSignIn: deviceSignInSourceControl,
+      finishDeviceSignIn,
       // The mise-installed ones run as toolchains: same lock, same record.
       install: installToolchain,
       update: updateToolchain,
