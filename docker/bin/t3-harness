@@ -17,9 +17,10 @@
 #   t3-harness uninstall <id> [--json]
 #
 # Agent ids: claude, codex, opencode, grok, cursor. Toolchain ids: go, rust,
-# bun, deno, uv. Source control CLIs: glab, fj, tea, az (and gh, which is
-# part of the image and only listed). Install defaults to mise's latest and records that exact
-# version; update is always explicit. Uninstalling an agent removes the managed
+# bun, deno, uv. Source control CLIs: glab, fj, tea, az, and gh, which is
+# part of the image: installing gh adds a newer one through mise, as an added
+# tool, and update and uninstall act on that one. Install defaults to mise's
+# latest and records that exact version; update is always explicit. Uninstalling an agent removes the managed
 # selection and executables but preserves credentials.
 #
 # Exit codes: 0 ok; 1 the lifecycle operation failed (see the JSON error);
@@ -63,7 +64,8 @@ Usage: t3-harness <command> [options]
 
   id is an agent (claude, codex, opencode, grok, cursor), a toolchain
   (go, rust, bun, deno, uv), a source control CLI (glab, fj, tea, az; gh comes
-  with the image), or any other mise tool, which is managed as an
+  with the image, and installing it adds a newer one as an added tool), or any
+  other mise tool, which is managed as an
   added tool: a registry name (ripgrep, kubectl) or a backend spec
   (npm:prettier, github:owner/repo). --version applies to agents, and to
   installing an added tool, where a prefix (3.12) takes the newest under it.
@@ -173,10 +175,11 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
   const AGENT_IDS = ["claude", "codex", "opencode", "grok", "cursor"];
   const SCM_IDS = catalogue.SOURCE_CONTROL.map((entry) => entry.id);
   // The gh in the image is not managed here, but a newer one added through mise
-  // (`mise use -g gh`, or Add a tool) is an added tool like any other.
+  // (`install gh`, `mise use -g gh`, or Add a tool on the page) is an added
+  // tool like any other: installed, updated and removed as one.
   const IMAGE_IDS = catalogue.SOURCE_CONTROL.filter((entry) => entry.inImage).map((entry) => entry.id);
   const addedInstead = async (id) => IMAGE_IDS.includes(id) && command !== "status"
-    && Boolean((await manager.packages.resolve(id).catch(() => null))?.configured);
+    && (command === "install" || Boolean((await manager.packages.resolve(id).catch(() => null))?.configured));
   const isPackage = (id) => Boolean(id) && !TOOLCHAIN_IDS.includes(id) && !AGENT_IDS.includes(id) && !SCM_IDS.includes(id);
   const packageRow = (p) => `${p.id}\t${p.version ?? "-"}\t${p.inProgress ? `${p.operation ?? "working"}…`
     : p.failed ? `failed: ${p.failure ?? "unknown error"}` : p.installed ? (p.adopted ? "installed (added with mise use)" : "installed") : "not installed"}`;
@@ -184,9 +187,12 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
     : t.installed ? "installed" : t.failed ? `failed: ${t.failure ?? "unknown error"}` : "not installed"}`;
   const signIn = (a) => !a ? "" : a.status === "authenticated"
     ? `signed in${a.account ? ` as ${a.account}` : ""}${a.host ? ` on ${a.host}` : ""}`
-    : a.status === "unauthenticated" ? `not signed in${a.detail ? ` (${a.detail})` : ""}` : "sign-in unknown";
-  const scmRow = (c) => `${c.id}\t${c.version ?? "-"}\t${c.provider}\t${c.inProgress ? `${c.operation ?? "working"}…`
-    : c.installed ? [c.inImage ? "in the image" : "installed", signIn(c.auth),
+    : a.status === "unauthenticated" ? `not signed in${a.detail ? ` (${a.detail})` : ""}`
+      : `sign-in could not be checked${a.detail ? ` (${a.detail})` : ""}`;
+  // A CLI an added tool provides is used and signed in to like one installed
+  // here; it is only updated and removed as that tool.
+  const scmRow = (c) => `${c.id}\t${c.version ?? c.providedBy?.version ?? "-"}\t${c.provider}\t${c.inProgress ? `${c.operation ?? "working"}…`
+    : c.installed || c.providedBy ? [c.inImage ? "in the image" : c.providedBy ? `from the added tool ${c.providedBy.tool}` : "installed", signIn(c.auth),
       c.missingExtensions?.length ? `missing extension ${c.missingExtensions.join(", ")}` : ""].filter(Boolean).join("; ")
     : c.failed ? `failed: ${c.failure ?? "unknown error"}` : "not installed"}`;
 
@@ -211,7 +217,10 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
         return;
       }
       if (IMAGE_IDS.includes(arg)) {
-        process.stderr.write(`t3-harness: ${arg} is part of the image; pulling a newer image updates it\n`);
+        // Only update and uninstall reach here, with no added one to act on.
+        process.stderr.write(command === "update"
+          ? `t3-harness: ${arg} is part of the image, and a newer image updates it; \`t3-harness install ${arg}\` adds a newer one now\n`
+          : `t3-harness: ${arg} is part of the image and stays; only one added with \`t3-harness install ${arg}\` can be removed\n`);
         process.exit(2);
       }
       if (version) {
