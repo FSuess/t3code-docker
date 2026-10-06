@@ -86,6 +86,10 @@ test("Setup's commands answer to their own words in T3's palette, and not to T3'
   for (const q of ["settings", "open", "sign", "go to", "new thread", "setup ports x", "theme"]) assert.deepEqual(found(q), ["", false], q);
   assert.deepEqual(found("gitlab"), ["sourcecontrol", true]);
   assert.deepEqual(found("setup azure"), ["sourcecontrol", true]);
+  assert.deepEqual(found("codeberg"), ["sourcecontrol", true]);
+  // T3's own pull request actions and Source Control settings answer to these:
+  // Setup must not take Enter from them.
+  for (const q of ["github", "pull requests", "source control"]) assert.deepEqual(found(q), ["", false], q);
   for (const item of B.PALETTE_ITEMS) assert.ok(item.route === null || /^[a-z]+$/.test(item.route), item.id);
 });
 

@@ -65,15 +65,17 @@
 
   // Setup's commands in T3's command palette. Each answers to its own few
   // words, chosen not to collide with T3's commands ("open", "sign" and "go"
-  // would), and every word of a search has to start one of them. The page
+  // would, and so would "github", "pull requests" and "source control", which
+  // T3's own actions and settings answer to), and every word of a search has
+  // to start one of them. The page
   // commands also answer to "setup" with another word ("setup ports"), and
   // "setup" alone finds only Open setup.
   const PALETTE_ITEMS = [
-    { id: 'setup', route: null, title: 'Open setup', meta: 'Agents, toolchains, ports and devices on this server', words: ['setup', 'console'] },
+    { id: 'setup', route: null, title: 'Open setup', meta: 'Agents, toolchains, source control, ports and devices on this server', words: ['setup', 'console'] },
     { id: 'agents', route: 'agents', title: 'Agents', meta: 'Setup · sign in, install and update', words: ['agents'] },
     { id: 'pair', route: 'devices', title: 'Pair a device', meta: 'Setup · Devices', words: ['pair', 'pairing', 'devices'] },
     { id: 'toolchains', route: 'toolchains', title: 'Toolchains', meta: 'Setup · Go, Rust, Bun, Deno, uv and any mise tool', words: ['toolchains', 'mise'] },
-    { id: 'sourcecontrol', route: 'sourcecontrol', title: 'Source control', meta: 'Setup · the GitLab, Forgejo, Gitea and Azure DevOps CLIs, and their sign-ins', words: ['gitlab', 'forgejo', 'gitea', 'azure', 'glab'] },
+    { id: 'sourcecontrol', route: 'sourcecontrol', title: 'Source control', meta: 'Setup · sign in to GitHub, GitLab, Forgejo, Gitea and Azure DevOps', words: ['gitlab', 'forgejo', 'codeberg', 'gitea', 'azure', 'glab'] },
     { id: 'ports', route: 'ports', title: 'Ports', meta: 'Setup · publish a dev server', words: ['ports', 'publish'] },
   ];
 
@@ -619,7 +621,7 @@
       const meta = document.createElement('span');
       meta.className = twoLine ? twoLine.meta : 't3-setup-cmd-meta';
       meta.textContent = item.id === 'setup' && state.attention > 0
-        ? (state.attention === 1 ? '1 thing needs you' : state.attention + ' things need you') + ' · agents, toolchains, ports and devices'
+        ? (state.attention === 1 ? '1 thing needs you' : state.attention + ' things need you') + ' · agents, toolchains, source control, ports and devices'
         : item.meta;
       text.append(title, meta);
       row.append(icon, text);
