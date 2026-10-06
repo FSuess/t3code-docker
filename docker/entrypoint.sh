@@ -277,6 +277,13 @@ persist_agent_credentials() {
     src="${T3_HOME}/${rel}"
     dst="${store}/$(printf '%s' "$rel" | tr '/' '_')"
     [ -L "$src" ] && continue
+    # Mounted on its own, or inside something mounted on its own (the host's
+    # ~/.config/gh, to share its gh sign-in): it already outlives the
+    # container, and moving it would empty the host's directory. Leave it.
+    if [ "$(covering_mount "$src")" != "$(covering_mount "$T3_HOME")" ]; then
+      log "leaving ${rel} where it is: it is mounted from elsewhere"
+      continue
+    fi
     mkdir -p "$dst" "$(dirname "$src")"
     if [ -d "$src" ]; then
       # Anything signed in before this existed comes along rather than being

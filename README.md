@@ -835,8 +835,9 @@ CLIs in `~/.config/gh`, `~/.config/glab-cli`, `~/.config/tea`,
 `~/.local/share/forgejo-cli` and `~/.azure`, which only persist when the whole
 home directory is mounted. The container keeps them under
 `$T3CODE_HOME/agents` instead and links them back, so a sign-in survives even
-when only the state directory is mounted. Set `T3_PERSIST_AGENT_CREDENTIALS=0`
-to leave them where the CLIs put them.
+when only the state directory is mounted. A directory you mount yourself, such
+as the host's `~/.config/gh` to share its gh sign-in, is left where it is. Set
+`T3_PERSIST_AGENT_CREDENTIALS=0` to leave them all where the CLIs put them.
 
 **Watch out for anonymous volumes.** Because the image declares `VOLUME`,
 running without `-v` still creates a volume, and it looks persistent from
