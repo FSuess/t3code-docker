@@ -23,7 +23,8 @@ import {
 } from "./packages.mjs";
 import { credentialSurface, detectAuth, probeVersion } from "./probe.mjs";
 import {
-  DEFAULT_HOSTS, detectSourceControlAuth, failureLine, missingExtensions, parseHost, parseToken, signOutArgs, tokenSignIn,
+  DEFAULT_HOSTS, NO_PROMPT, credentialFiles, detectSourceControlAuth, failureLine, missingExtensions, parseHost, parseToken,
+  signOutArgs, tokenSignIn,
 } from "./source-control.mjs";
 import * as state from "./state.mjs";
 import { compareVersions, meetsMinimum } from "./version.mjs";
@@ -78,6 +79,11 @@ export function createHarnessManager(options = {}) {
     // holder is detected from its pid and start time straight away.
     lockStaleMs: options.lockStaleMs ?? 60 * 60 * 1000,
     authCacheTtlMs: options.authCacheTtlMs ?? 10_000,
+    // A source control CLI's check asks its server, and the setup page polls
+    // it every 15 seconds. Signing in or out here, or anywhere that writes the
+    // CLI's credential files, is seen at once (the files are part of the
+    // key); only a token revoked on the server waits this long to show.
+    scmAuthCacheTtlMs: options.scmAuthCacheTtlMs ?? 5 * 60 * 1000,
     timeouts: { ...DEFAULT_TIMEOUTS, ...(options.timeouts ?? {}) },
   };
   ctx.lockPath = lock.lockPath(ctx.stateDir);
@@ -179,7 +185,8 @@ export function createHarnessManager(options = {}) {
     const authExecutable = executableExists ? executable : null;
     const authenticated =
       authenticate && authExecutable
-        ? await authFor(entry, authExecutable, installedVersion ?? recordedVersion)
+        ? await authFor(entry, authExecutable, installedVersion ?? recordedVersion,
+          () => detectAuth(ctx, entry, { executable: authExecutable, runnable: true }))
         : null;
 
     return {
@@ -210,11 +217,15 @@ export function createHarnessManager(options = {}) {
     };
   }
 
-  async function authFor(entry, executable, version) {
-    const key = `${executable}:${version ?? ""}`;
+  /**
+   * A sign-in verdict, cached per id for `ttl` while the executable, its
+   * version and `stamp` (whatever else should invalidate it) stay the same.
+   */
+  async function authFor(entry, executable, version, detect, { ttl = ctx.authCacheTtlMs, stamp = "" } = {}) {
+    const key = `${executable}:${version ?? ""}:${stamp}`;
     const cached = authCache.get(entry.id);
-    if (cached && cached.key === key && ctx.now() - cached.at < ctx.authCacheTtlMs) return cached.value;
-    const value = await detectAuth(ctx, entry, { executable, runnable: true });
+    if (cached && cached.key === key && ctx.now() - cached.at < ttl) return cached.value;
+    const value = await detect();
     authCache.set(entry.id, { at: ctx.now(), key, value });
     return value;
   }
@@ -463,14 +474,16 @@ export function createHarnessManager(options = {}) {
   }
 
   /**
-   * The five toolchains, and every other tool in the global config (see
-   * packages below), from one `mise ls`: the console reads this on every poll.
+   * The five toolchains, every other tool in the global config (see packages
+   * below) and the source control CLIs without their sign-ins, from one
+   * `mise ls`: the console reads this on every poll.
    */
   async function toolchainStatus() {
     const snap = await snapshot();
     return {
       toolchains: TOOLCHAINS.map((entry) => toolchainFacts(entry, snap)),
       packages: packageIds(snap).map((id) => packageFacts(id, snap)),
+      sourceControl: await Promise.all(SOURCE_CONTROL.map((entry) => sourceControlFacts(entry, snap))),
       degraded: snap.degraded,
     };
   }
@@ -535,7 +548,16 @@ export function createHarnessManager(options = {}) {
     return { version: target, updatedAt: ctx.now(), managedVersions: union(previous.managedVersions, [target]) };
   }
 
-  function installToolchain(id, options = {}) {
+  async function installToolchain(id, options = {}) {
+    // A source control CLI someone already added as a tool of their own
+    // (azure-cli, gitlab:gitlab-org/cli) is not installed a second time: two
+    // shims for one command, and only one of them wins on PATH.
+    const scm = getSourceControl(id);
+    const owner = scm && !scm.inImage ? await providerOf(scm, await snapshot()) : null;
+    if (owner) {
+      return { ok: false, code: "provided-elsewhere",
+        error: `${scm.bin} already comes from the added tool ${owner.tool}; remove it there first to install ${scm.name} here` };
+    }
     return runToolchain(id, "install", selectToolchain, options);
   }
 
@@ -954,7 +976,10 @@ export function createHarnessManager(options = {}) {
   // same lock and record); this adds what a toolchain does not have: which
   // host each is for, whether it is signed in, and the image's own gh.
 
-  /** The image's gh, read once: it only changes with the image. */
+  /**
+   * The image's gh, read once: it only changes with the image. Run by its own
+   * path, so a newer gh someone added through mise is not taken for it.
+   */
   let imageVersionRead = null;
   function imageVersion(entry) {
     imageVersionRead ??= (async () => {
@@ -966,68 +991,135 @@ export function createHarnessManager(options = {}) {
     return imageVersionRead;
   }
 
-  async function sourceControlAuth(entry, executable, version) {
-    const key = `${executable}:${version ?? ""}`;
-    const cached = authCache.get(entry.id);
-    if (cached && cached.key === key && ctx.now() - cached.at < ctx.authCacheTtlMs) return cached.value;
-    const value = await detectSourceControlAuth(ctx, entry, executable);
-    authCache.set(entry.id, { at: ctx.now(), key, value });
-    return value;
+  /** A command in a mise install: at its root, or in its bin directory (pipx, glab). */
+  async function binIn(installPath, bin) {
+    if (!installPath) return null;
+    for (const candidate of [path.join(installPath, "bin", bin), path.join(installPath, bin)]) {
+      if (await isExecutable(ctx.fs, candidate)) return candidate;
+    }
+    return null;
   }
 
-  async function sourceControlFacts(entry, snap, { authenticate = true } = {}) {
-    const base = entry.inImage
-      ? await (async () => {
-        const version = await imageVersion(entry);
-        return { id: entry.id, name: entry.name, installed: Boolean(version), version, inProgress: false,
-          operation: null, operationState: null, managedVersions: [], failed: false, failure: null };
-      })()
-      : toolchainFacts(entry, snap);
-    let auth = null;
-    if (authenticate && base.installed && !base.inProgress) {
-      // gh is looked up on PATH, as T3 does; a mise CLI by its own shim.
-      const executable = entry.inImage ? entry.bin : await mise.which(ctx, entry.bin);
-      auth = await sourceControlAuth(entry, executable, base.version);
+  /**
+   * The added tool that already provides a source control CLI's command, when
+   * the CLI itself is not installed: `{ tool, version, executable }`, or null.
+   * Read from the snapshot's install paths; no process is started.
+   */
+  async function providerOf(entry, snap) {
+    for (const [tool, entries] of Object.entries(snap.tools)) {
+      if (tool === entry.miseTool || isReservedTool(tool)) continue;
+      const global = entries.filter((candidate) => isGlobal(candidate) && candidate.installed);
+      const selected = global.find((candidate) => candidate.active) ?? global[0];
+      const executable = await binIn(selected?.install_path, entry.bin);
+      if (executable) return { tool, version: selected.version ?? null, executable };
     }
+    return null;
+  }
+
+  /** The credential files' modification times: a sign-in that writes them changes the key. */
+  async function credentialStamp(entry) {
+    const times = [];
+    for (const file of credentialFiles(entry, ctx.env, ctx.home)) {
+      try {
+        const stat = await ctx.fs.stat(file);
+        times.push(`${stat.mtimeMs ?? 0}/${stat.size ?? 0}`);
+      } catch {
+        times.push("-");
+      }
+    }
+    return times.join(",");
+  }
+
+  async function sourceControlAuth(entry, executable, version) {
+    return authFor(entry, executable, version, () => detectSourceControlAuth(ctx, entry, executable),
+      { ttl: ctx.scmAuthCacheTtlMs, stamp: await credentialStamp(entry) });
+  }
+
+  /**
+   * One CLI's facts from a snapshot, without asking it anything: whether it is
+   * installed and where its command is. The image's gh is run by name, as T3
+   * runs it; a mise one by the command in its install.
+   */
+  async function sourceControlFacts(entry, snap) {
+    if (entry.inImage) {
+      const version = await imageVersion(entry);
+      return { id: entry.id, name: entry.name, installed: Boolean(version), version, inProgress: false,
+        operation: null, operationState: null, managedVersions: [], failed: false, failure: null,
+        provider: entry.provider, bin: entry.bin, inImage: true, providedBy: null,
+        executable: version ? entry.bin : null, missingExtensions: [] };
+    }
+    const base = toolchainFacts(entry, snap);
+    const global = (snap.tools[entry.miseTool] ?? []).filter((candidate) => isGlobal(candidate) && candidate.installed);
+    const selected = global.find((candidate) => candidate.active) ?? global[0];
+    const own = base.installed ? (await binIn(selected?.install_path, entry.bin)) ?? await mise.which(ctx, entry.bin) : null;
+    const elsewhere = base.installed || base.inProgress ? null : await providerOf(entry, snap);
     return {
       ...base,
       provider: entry.provider,
       bin: entry.bin,
-      inImage: Boolean(entry.inImage),
-      auth,
-      missingExtensions: base.installed && !entry.inImage ? await missingExtensions(ctx, entry) : [],
+      inImage: false,
+      // Signed in to or out of like any other, but updated and removed as the
+      // added tool it is.
+      providedBy: elsewhere ? { tool: elsewhere.tool, version: elsewhere.version } : null,
+      executable: own ?? elsewhere?.executable ?? null,
+      missingExtensions: base.installed ? await missingExtensions(ctx, entry) : [],
     };
   }
 
   /**
-   * Every source control CLI, from one `mise ls`. `authenticate` runs each
-   * installed CLI's sign-in check (cached briefly): too slow for every poll,
-   * so the setup service reads it in the background.
+   * Each CLI's sign-in verdict, by id, for rows already read (`facts`), or
+   * from a fresh snapshot. Only installed CLIs that are not busy are asked,
+   * each through the cache above.
    */
-  async function sourceControlStatus(options = {}) {
-    const snap = await snapshot();
-    const rows = await Promise.all(SOURCE_CONTROL.map((entry) => sourceControlFacts(entry, snap, options)));
-    return { sourceControl: rows, degraded: snap.degraded };
+  async function sourceControlAuthById(facts = null) {
+    let rows = facts;
+    if (!rows) {
+      const snap = await snapshot();
+      rows = await Promise.all(SOURCE_CONTROL.map((entry) => sourceControlFacts(entry, snap)));
+    }
+    const verdicts = {};
+    await Promise.all(rows.map(async (row) => {
+      const entry = getSourceControl(row.id);
+      if (!entry || !row.executable || row.inProgress) return;
+      verdicts[row.id] = await sourceControlAuth(entry, row.executable, row.version ?? row.providedBy?.version);
+    }));
+    return verdicts;
   }
 
-  async function resolveSourceControl(id, options = {}) {
+  async function withAuth(rows, authenticate) {
+    const verdicts = authenticate ? await sourceControlAuthById(rows) : {};
+    return rows.map((row) => ({ ...row, auth: verdicts[row.id] ?? null }));
+  }
+
+  /**
+   * Every source control CLI, from one `mise ls`. `authenticate` runs each
+   * installed CLI's sign-in check (cached): too slow for every poll, so the
+   * setup service reads the rows with the toolchains and the verdicts
+   * (`auth`) in the background.
+   */
+  async function sourceControlStatus({ authenticate = true } = {}) {
+    const snap = await snapshot();
+    const rows = await Promise.all(SOURCE_CONTROL.map((entry) => sourceControlFacts(entry, snap)));
+    return { sourceControl: await withAuth(rows, authenticate), degraded: snap.degraded };
+  }
+
+  async function resolveSourceControl(id, { authenticate = true } = {}) {
     const entry = getSourceControl(id);
     if (!entry) throw new Error(`unknown source control CLI: ${id}`);
-    return sourceControlFacts(entry, await snapshot(), options);
+    const [row] = await withAuth([await sourceControlFacts(entry, await snapshot())], authenticate);
+    return row;
   }
 
-  /** The command to run a source control CLI by: gh by name, as T3 does; a mise one by its shim. */
+  /** The command to run a source control CLI by: gh by name, as T3 does; a mise one by its own. */
   async function sourceControlExecutable(id) {
     const entry = getSourceControl(id);
     if (!entry) return null;
-    if (entry.inImage) return (await imageVersion(entry)) ? entry.bin : null;
-    return mise.which(ctx, entry.bin);
+    return (await sourceControlFacts(entry, await snapshot())).executable;
   }
 
   // Signing in runs the CLI against a server across the network: longer than
   // a version probe, still bounded.
   const SIGN_IN_TIMEOUT_MS = 60_000;
-  const NO_PROMPT = { NO_COLOR: "1", GH_PROMPT_DISABLED: "1", GLAB_NO_PROMPT: "1" };
 
   async function runScm(executable, args, { input = null, env = {} } = {}) {
     return ctx.run([executable, ...args], {
@@ -1038,10 +1130,36 @@ export function createHarnessManager(options = {}) {
     });
   }
 
+  /** The CLI's credential files as they are: their text, or null for one that does not exist. */
+  async function saveCredentials(entry) {
+    const saved = [];
+    for (const file of credentialFiles(entry, ctx.env, ctx.home)) {
+      try {
+        saved.push({ file, text: await ctx.fs.readFile(file, "utf8") });
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+        saved.push({ file, text: null });
+      }
+    }
+    return saved;
+  }
+
+  /** Put them back: the text each had, and no file where there was none. */
+  async function restoreCredentials(saved) {
+    for (const { file, text } of saved) {
+      try {
+        if (text === null) await ctx.fs.unlink(file);
+        else await ctx.fs.writeFile(file, text, { mode: 0o600 });
+      } catch { /* ENOENT on unlink: nothing to remove */ }
+    }
+  }
+
   /**
    * Sign a CLI in to one host with a token, and prove the host took it before
-   * saying so: a token glab or fj stored but the server refused is taken back
-   * out, so a failed attempt leaves things as they were. The token never
+   * saying so. Its credential files are copied first and put back when any
+   * step fails, so a failed attempt leaves things exactly as they were: a
+   * token glab or fj stored but the server refused is gone, and a sign-in that
+   * worked before - to this host or another - is still there. The token never
    * reaches an argument, a log line or the answer.
    */
   async function signInSourceControl(id, { host: rawHost, token: rawToken } = {}) {
@@ -1056,24 +1174,28 @@ export function createHarnessManager(options = {}) {
     const executable = await sourceControlExecutable(id);
     if (!executable) return { ok: false, code: "not-installed", error: `${entry.name} is not installed` };
 
+    let saved;
+    try {
+      saved = await saveCredentials(entry);
+    } catch (error) {
+      return { ok: false, code: "failed", error: `could not read ${entry.name}'s sign-ins to keep them safe: ${error?.message ?? error}` };
+    }
     const warnings = [];
-    const undo = async () => {
-      try { await runScm(executable, plan.undo); } catch { /* the failure being reported is the one that matters */ }
+    const failed = async (error) => {
+      await restoreCredentials(saved);
+      return { ok: false, code: "not-accepted", error };
     };
     try {
       for (const step of plan.steps) {
         const result = await runScm(executable, step.args, { input: step.input ?? null, env: step.env ?? {} });
         if (result.code === 0) continue;
         const said = failureLine(result, token.token);
-        if (step.optional) { warnings.push(said); continue; }
-        return { ok: false, code: "not-accepted", error: said };
+        if (step.optional) { if (step.warn) warnings.push(said); continue; }
+        return await failed(said);
       }
       if (plan.verify) {
         const checked = await runScm(executable, plan.verify);
-        if (checked.code !== 0) {
-          await undo();
-          return { ok: false, code: "not-accepted", error: `${host.host} did not accept the token: ${failureLine(checked, token.token)}` };
-        }
+        if (checked.code !== 0) return await failed(`${host.host} did not accept the token: ${failureLine(checked, token.token)}`);
       }
     } finally {
       authCache.delete(id);
@@ -1116,6 +1238,7 @@ export function createHarnessManager(options = {}) {
     refreshLinks,
     sourceControl: {
       status: sourceControlStatus,
+      auth: sourceControlAuthById,
       resolve: resolveSourceControl,
       executable: sourceControlExecutable,
       signIn: signInSourceControl,

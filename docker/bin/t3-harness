@@ -146,8 +146,10 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
   const providerPath = process.env.T3_PROVIDER_MODULE || "/opt/t3-provider/index.mjs";
 
   let manager;
+  let catalogue;
   try {
-    manager = (await import(modulePath)).createHarnessManager();
+    catalogue = await import(modulePath);
+    manager = catalogue.createHarnessManager();
   } catch (error) {
     process.stderr.write(`t3-harness: cannot load the harness manager (${modulePath}): ${error?.message ?? error}\n`);
     process.exit(4);
@@ -169,7 +171,12 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
 
   const TOOLCHAIN_IDS = ["go", "rust", "bun", "deno", "uv"];
   const AGENT_IDS = ["claude", "codex", "opencode", "grok", "cursor"];
-  const SCM_IDS = ["gh", "glab", "fj", "tea", "az"];
+  const SCM_IDS = catalogue.SOURCE_CONTROL.map((entry) => entry.id);
+  // The gh in the image is not managed here, but a newer one added through mise
+  // (`mise use -g gh`, or Add a tool) is an added tool like any other.
+  const IMAGE_IDS = catalogue.SOURCE_CONTROL.filter((entry) => entry.inImage).map((entry) => entry.id);
+  const addedInstead = async (id) => IMAGE_IDS.includes(id) && command !== "status"
+    && Boolean((await manager.packages.resolve(id).catch(() => null))?.configured);
   const isPackage = (id) => Boolean(id) && !TOOLCHAIN_IDS.includes(id) && !AGENT_IDS.includes(id) && !SCM_IDS.includes(id);
   const packageRow = (p) => `${p.id}\t${p.version ?? "-"}\t${p.inProgress ? `${p.operation ?? "working"}…`
     : p.failed ? `failed: ${p.failure ?? "unknown error"}` : p.installed ? (p.adopted ? "installed (added with mise use)" : "installed") : "not installed"}`;
@@ -196,15 +203,15 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
       else for (const c of sourceControl) process.stdout.write(scmRow(c) + "\n");
       return;
     }
-    if (SCM_IDS.includes(arg)) {
+    if (SCM_IDS.includes(arg) && !(await addedInstead(arg))) {
       if (command === "status") {
         const cli = await manager.sourceControl.resolve(arg);
         if (wantJson) process.stdout.write(JSON.stringify({ sourceControl: cli }, null, 2) + "\n");
         else process.stdout.write(scmRow(cli) + "\n");
         return;
       }
-      if (arg === "gh") {
-        process.stderr.write("t3-harness: gh is part of the image; pulling a newer image updates it\n");
+      if (IMAGE_IDS.includes(arg)) {
+        process.stderr.write(`t3-harness: ${arg} is part of the image; pulling a newer image updates it\n`);
         process.exit(2);
       }
       if (version) {
@@ -224,7 +231,7 @@ export T3_HARNESS_COMMAND="$command" T3_HARNESS_ARG="${1:-}"
       else for (const p of packages) process.stdout.write(packageRow(p) + "\n");
       return;
     }
-    if (isPackage(arg)) {
+    if (isPackage(arg) || (await addedInstead(arg))) {
       if (command === "status") {
         const normalized = await manager.packages.normalize(arg);
         if (!normalized.ok) { process.stderr.write(`t3-harness: ${normalized.error}\n`); process.exit(2); }

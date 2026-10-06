@@ -32,10 +32,12 @@ class MemoryFs {
     this.files = new Map();
     this.links = new Map();
     this.dirs = new Set(["/"]);
+    // Every write moves time on, so a rewritten file reads as changed.
+    this.clock = 0;
   }
 
   seedFile(filePath, content, mode = 0o644) {
-    this.files.set(filePath, { content: String(content), mode });
+    this.files.set(filePath, { content: String(content), mode, mtimeMs: ++this.clock });
     const parent = path.dirname(filePath);
     if (parent && parent !== "/") this.dirs.add(parent);
   }
@@ -101,7 +103,7 @@ class MemoryFs {
 
   async stat(target) {
     const entry = this.files.get(target);
-    if (entry) return { isFile: () => true, isDirectory: () => false, mode: entry.mode };
+    if (entry) return { isFile: () => true, isDirectory: () => false, mode: entry.mode, mtimeMs: entry.mtimeMs, size: entry.content.length };
     if (this.dirs.has(target)) return { isFile: () => false, isDirectory: () => true, mode: 0o755 };
     throw Object.assign(new Error(`ENOENT: ${target}`), { code: "ENOENT" });
   }
@@ -135,6 +137,7 @@ function createWorld(fs, { arch = "x64" } = {}) {
       az: { code: 1, stdout: "", stderr: "ERROR: Please run 'az login' to setup account." },
     },
     failExtension: null,
+    credentialFile: { glab: path.join(HOME, ".config/glab-cli/config.yml") },
     // How the CLIs answer a sign-in, its check, and a sign-out.
     signInFails: {},
     verifyFails: {},
@@ -179,11 +182,21 @@ function createWorld(fs, { arch = "x64" } = {}) {
 
     if (bin !== "mise") {
       if (world.failProbe.some((fragment) => bin.includes(fragment))) return fail("Illegal instruction");
-      // The image's gh, run by name.
-      if (bin === "gh" && argv[1] === "--version") return ok("gh version 2.102.0 (2026-09-30)\nhttps://github.com/cli/cli/releases/tag/v2.102.0\n");
+      // The image's gh, by its path in the image.
+      if (bin === "/usr/bin/gh" && argv[1] === "--version") return ok("gh version 2.102.0 (2026-09-30)\nhttps://github.com/cli/cli/releases/tag/v2.102.0\n");
       const scm = ["gh", "glab", "fj", "tea", "az"].find((name) => path.basename(bin) === name);
       const signingIn = argv.includes("--with-token") || argv.includes("--stdin") || argv.includes("add-token") || (argv[1] === "login" && argv[2] === "add");
-      if (scm && signingIn) return world.signInFails[scm] ? fail(world.signInFails[scm]) : ok("");
+      if (scm && signingIn) {
+        if (world.signInFails[scm]) return fail(world.signInFails[scm]);
+        // A sign-in that goes through writes the CLI's credential file, as
+        // glab and fj do before anyone has asked the host about the token.
+        const file = world.credentialFile[scm];
+        if (file) {
+          const host = argv[argv.indexOf("--hostname") + 1];
+          fs.seedFile(file, `${fs.files.get(file)?.content ?? ""}${host}\n`, 0o600);
+        }
+        return ok("");
+      }
       if (scm && (argv.includes("whoami") || argv[1] === "api")) return world.verifyFails[scm] ? fail(world.verifyFails[scm]) : ok("{}");
       if (scm && (argv.includes("logout") || argv.includes("setup-git"))) return ok("");
       if (scm && ["auth", "login", "account"].includes(argv[1])) {
@@ -362,7 +375,8 @@ test("the source control catalogue names one CLI per provider T3 drives through 
     ["gh", "GitHub"], ["glab", "GitLab"], ["fj", "Forgejo"], ["tea", "Gitea"], ["az", "Azure DevOps"],
   ]);
   for (const entry of SOURCE_CONTROL) {
-    assert.ok(entry.bin && entry.probe[0] === entry.bin, `${entry.id} probes the command T3 runs`);
+    assert.ok(entry.bin && path.basename(entry.probe[0]) === entry.bin, `${entry.id} probes the command T3 runs`);
+    if (entry.inImage) assert.ok(path.isAbsolute(entry.probe[0]), `${entry.id} is read by its path in the image, not whatever PATH finds`);
     assert.ok(entry.auth, `${entry.id} declares how to ask it about sign-in`);
     assert.equal(Boolean(entry.miseTool), !entry.inImage, `${entry.id} is in the image or installed through mise`);
   }
@@ -1489,11 +1503,23 @@ test("signing a source control CLI in hands it the token on stdin, and takes bac
   assert.ok(runs.some((r) => r.argv.slice(1).join(" ") === "api user --hostname gitlab.example.com"), "asked the host");
   assert.equal(runs.some((r) => r.argv.some((arg) => arg.includes("glpat-secret"))), false, "never an argument");
 
+  // A refused token is taken back by putting glab's file back as it was:
+  // the sign-in that worked before is still there, and nothing signs out.
+  const config = path.join(HOME, ".config/glab-cli/config.yml");
+  const before = await fs.readFile(config);
   world.verifyFails.glab = "glab: 401 Unauthorized (HTTP 401)";
-  const refused = await manager.sourceControl.signIn("glab", { token: "glpat-secret" });
+  const refused = await manager.sourceControl.signIn("glab", { host: "gitlab.example.com", token: "glpat-typo" });
   assert.equal(refused.code, "not-accepted");
-  assert.equal(refused.error, "gitlab.com did not accept the token: glab: 401 Unauthorized (HTTP 401)");
-  assert.deepEqual(runs.at(-1).argv.slice(1), ["auth", "logout", "--hostname", "gitlab.com"], "the stored token is taken back");
+  assert.equal(refused.error, "gitlab.example.com did not accept the token: glab: 401 Unauthorized (HTTP 401)");
+  assert.equal(await fs.readFile(config), before, "the working sign-in survives");
+  assert.equal(runs.some((r) => r.argv.includes("logout")), false, "nothing is signed out");
+
+  // With no sign-in before, there is no file afterwards either.
+  await fs.unlink(config);
+  const first = await manager.sourceControl.signIn("glab", { token: "glpat-typo" });
+  assert.equal(first.code, "not-accepted");
+  assert.equal(await fs.exists(config), false);
+  world.verifyFails.glab = null;
 
   // gh refuses a bad token itself; the image's gh needs no install.
   world.signInFails.gh = "error validating token: HTTP 401: Bad credentials";
@@ -1506,4 +1532,58 @@ test("signing a source control CLI in hands it the token on stdin, and takes bac
   const out = await manager.sourceControl.signOut("glab", { host: "gitlab.example.com" });
   assert.equal(out.ok, true);
   assert.ok(runs.some((r) => r.argv.slice(1).join(" ") === "auth logout --hostname gitlab.example.com"));
+});
+
+test("a source control CLI an added tool already provides is used, signed in to, and never installed twice", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = managerFor(world);
+  // glab added before the Source control page existed, under its GitLab spec.
+  const install = path.join(DATA_DIR, "installs", "gitlab-gitlab-org-cli", "1.118.0");
+  fs.seedFile(path.join(install, "bin", "glab"), "", 0o755);
+  world.tools["gitlab:gitlab-org/cli"] = [{
+    version: "1.118.0", requested_version: "1.118.0", install_path: install, installed: true, active: true,
+    source: { type: "mise.toml", path: path.join(HOME, ".config/mise/config.toml") },
+  }];
+
+  const glab = await manager.sourceControl.resolve("glab");
+  assert.equal(glab.installed, false, "not installed as the source control CLI");
+  assert.deepEqual(glab.providedBy, { tool: "gitlab:gitlab-org/cli", version: "1.118.0" });
+  assert.equal(glab.executable, path.join(install, "bin", "glab"));
+  assert.equal(glab.auth.status, "authenticated", "its sign-in is what T3 sees, so it is read");
+
+  const twice = await manager.sourceControl.install("glab");
+  assert.equal(twice.ok, false);
+  assert.equal(twice.code, "provided-elsewhere");
+  assert.match(twice.error, /added tool gitlab:gitlab-org\/cli/);
+  assert.equal(world.useSpecs.length, 0, "mise was never asked to install a second glab");
+});
+
+test("source control rows come with the toolchains' one read, and their sign-ins are cached until a credential file changes", async () => {
+  const fs = new MemoryFs();
+  const world = createWorld(fs);
+  const manager = createHarnessManager({
+    env: { HOME, MISE_DATA_DIR: DATA_DIR, MISE_STATE_DIR: STATE_DIR, MISE_CONFIG_DIR: path.join(HOME, ".config/mise") },
+    fs, run: world.run, home: HOME, dataDir: DATA_DIR, stateDir: STATE_DIR, arch: world.arch,
+    now: () => 1_700_000_000_000, pid: 4242, isAlive: (pid) => pid === 4242, startTimeOf: (pid) => (pid === 4242 ? "100" : null),
+  });
+  await manager.sourceControl.install("glab");
+
+  world.calls.length = 0;
+  const { sourceControl } = await manager.toolchains.status();
+  assert.deepEqual(sourceControl.map((row) => [row.id, row.installed]), [["gh", true], ["glab", true], ["fj", false], ["tea", false], ["az", false]]);
+  assert.equal(sourceControl.find((row) => row.id === "glab").executable, path.join(DATA_DIR, "installs/glab/1.120.0/bin/glab"));
+  assert.equal(world.calls.filter((call) => call.startsWith("mise")).length, 1, "one mise ls, no mise which");
+  assert.equal(world.calls.some((call) => / auth status/.test(call)), false, "no sign-in asked");
+
+  const verdicts = await manager.sourceControl.auth(sourceControl);
+  assert.equal(verdicts.glab.account, "dev-user");
+  assert.equal(world.calls.filter((call) => call.startsWith("mise")).length, 1, "the rows given are used, not read again");
+
+  // Cached (for minutes, by default) while nothing changes...
+  world.scmAuth.glab = { code: 1, stdout: "", stderr: "gitlab.com\n  x gitlab.com: API call failed: 401\n" };
+  assert.equal((await manager.sourceControl.auth(sourceControl)).glab.status, "authenticated");
+  // ...and asked again as soon as glab's own file changes, as a sign-out in a terminal would.
+  fs.seedFile(path.join(HOME, ".config/glab-cli/config.yml"), "hosts: {}\n", 0o600);
+  assert.equal((await manager.sourceControl.auth(sourceControl)).glab.status, "unauthenticated");
 });
