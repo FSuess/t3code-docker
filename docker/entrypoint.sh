@@ -268,12 +268,15 @@ register_projects
 # and az keep their sign-ins in these.
 AGENT_DIRS=".claude .codex .cursor .grok .config/opencode .local/share/opencode"
 AGENT_DIRS="$AGENT_DIRS .config/gh .config/glab-cli .config/tea .local/share/forgejo-cli .azure"
+# And git's own settings: who you commit as, and the credential helpers gh and
+# tea set up so an HTTPS push uses their sign-in. git writes through the link.
+AGENT_FILES=".gitconfig"
 
 persist_agent_credentials() {
   [ "$T3_PERSIST_AGENT_CREDENTIALS" = "1" ] || return 0
-  local store="${T3CODE_HOME}/agents" src dst
+  local store="${T3CODE_HOME}/agents" src dst rel
   mkdir -p "$store"
-  for rel in $AGENT_DIRS; do
+  for rel in $AGENT_DIRS $AGENT_FILES; do
     src="${T3_HOME}/${rel}"
     dst="${store}/$(printf '%s' "$rel" | tr '/' '_')"
     [ -L "$src" ] && continue
@@ -284,14 +287,28 @@ persist_agent_credentials() {
       log "leaving ${rel} where it is: it is mounted from elsewhere"
       continue
     fi
-    mkdir -p "$dst" "$(dirname "$src")"
-    if [ -d "$src" ]; then
-      # Anything signed in before this existed comes along rather than being
-      # silently orphaned behind the new link.
-      cp -a "$src/." "$dst/" 2>/dev/null || true
-      rm -rf "$src"
-      log "moved ${rel} onto the state volume"
-    fi
+    mkdir -p "$(dirname "$src")"
+    case " $AGENT_FILES " in
+      *" $rel "*)
+        # Anything written before this existed comes along, as for a directory.
+        if [ -f "$src" ]; then
+          cp -a "$src" "$dst"
+          rm -f "$src"
+          log "moved ${rel} onto the state volume"
+        fi
+        [ -e "$dst" ] || : > "$dst"
+        ;;
+      *)
+        mkdir -p "$dst"
+        if [ -d "$src" ]; then
+          # Anything signed in before this existed comes along rather than being
+          # silently orphaned behind the new link.
+          cp -a "$src/." "$dst/" 2>/dev/null || true
+          rm -rf "$src"
+          log "moved ${rel} onto the state volume"
+        fi
+        ;;
+    esac
     ln -sfn "$dst" "$src"
   done
 }

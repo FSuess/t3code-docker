@@ -771,8 +771,9 @@ docker compose exec t3code t3-harness install glab
 docker compose exec -u t3 -it t3code bash -lc 'glab auth login'   # or any CLI's own sign-in
 ```
 
-Sign-ins are kept on the state volume like the agents' (see
-[Configuration](#configuration)), so they survive a recreate.
+Sign-ins are kept on the state volume like the agents', and so is
+`~/.gitconfig` with the credential helpers (see
+[Configuration](#configuration)), so both survive a recreate.
 
 ## How long things last
 
@@ -832,10 +833,11 @@ reinstalls the tools.
 Agent CLIs normally store their sign-ins in `~/.claude`, `~/.codex`,
 `~/.cursor`, `~/.grok` and OpenCode's XDG directories, and the source control
 CLIs in `~/.config/gh`, `~/.config/glab-cli`, `~/.config/tea`,
-`~/.local/share/forgejo-cli` and `~/.azure`, which only persist when the whole
-home directory is mounted. The container keeps them under
-`$T3CODE_HOME/agents` instead and links them back, so a sign-in survives even
-when only the state directory is mounted. A directory you mount yourself, such
+`~/.local/share/forgejo-cli` and `~/.azure`, and git its settings in
+`~/.gitconfig` (who you commit as, and the credential helpers `gh` and `tea`
+set up), which only persist when the whole home directory is mounted. The
+container keeps them under `$T3CODE_HOME/agents` instead and links them back,
+so a sign-in survives even when only the state directory is mounted. A directory you mount yourself, such
 as the host's `~/.config/gh` to share its gh sign-in, is left where it is. Set
 `T3_PERSIST_AGENT_CREDENTIALS=0` to leave them all where the CLIs put them.
 

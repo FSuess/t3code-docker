@@ -33,6 +33,7 @@ jobs:
           bash tests/image-profile.test.sh
           bash tests/user-env.test.sh
           bash tests/run-t3.test.sh
+          bash tests/persist-credentials.test.sh
           for f in docker/setup/app.js docker/setup/client/*.js docker/setup/design/ui.js docker/router/*.mjs; do
             node --check "$f"
           done
