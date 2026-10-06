@@ -51,7 +51,6 @@ const T3Model = (() => {
       tokenPage: (host) => 'https://' + host + '/user/settings/applications', scopes: 'repository and issue: read and write; user: read' },
     az: { name: 'Azure CLI', mono: 'az', hue: '--id-toolchain', provider: 'Azure DevOps', flow: 'device', how: 'device code', command: 'az login --use-device-code' },
   };
-  const SOURCE_CONTROL_ORDER = ['gh', 'glab', 'fj', 'tea', 'az'];
 
   const DONE = { install: 'Installed', update: 'Updated', uninstall: 'Uninstalled' };
   const WORKING = { install: 'Installing', update: 'Updating', uninstall: 'Removing' };
@@ -591,26 +590,34 @@ const T3Model = (() => {
    * verbs, queue and commands) that also say which host they are for and who
    * is signed in; one that is installed and signed out needs the user, since
    * T3 Code cannot use it. The image's gh has no verbs, and is never a
-   * warning: plenty of servers never talk to GitHub.
+   * warning: plenty of servers never talk to GitHub. Nor has a CLI that an
+   * added tool provides (`providedBy`): it is updated and removed there, and
+   * only signed in to here.
    */
   const sourceControlRow = (c, status, ui, now) => {
     const meta = SOURCE_CONTROL[c.id] || { name: c.name || c.id, mono: String(c.id || '?').slice(0, 2), provider: c.provider || '' };
     const auth = c.auth || null;
     const signIn = { cmd: 'scm.signin', label: 'Sign in', icon: 'log-in' };
     let row;
-    if (c.inImage) {
+    const added = !c.inImage && !c.installed && c.providedBy ? c.providedBy : null;
+    if (c.inImage || added) {
+      const present = c.inImage ? c.installed : true;
       row = {
         id: c.id, key: 'toolchain:' + c.id, target: 'toolchain', name: meta.name, mono: meta.mono, hue: '--id-toolchain',
-        version: c.version || null, latest: null, updateAvailable: false, state: c.installed ? 'ok' : 'missing',
-        status: { dot: null, text: '' }, badge: { tone: null, text: 'In the image' }, action: null, menu: [],
-        progress: null, cancellable: false, attention: false, dim: !c.installed, description: null, bins: [],
+        version: (added ? added.version : c.version) || null, latest: null, updateAvailable: false, state: present ? 'ok' : 'missing',
+        status: { dot: null, text: '' }, badge: { tone: null, text: added ? 'Added tool' : 'In the image' }, action: null, menu: [],
+        progress: null, cancellable: false, attention: false, dim: !present, description: null, bins: [],
       };
-      row.status.text = !c.installed ? 'Not found on PATH'
+      row.status.text = !present ? 'Not found in the image'
         : auth && auth.status === 'authenticated' ? signedInText(auth)
-          : auth && auth.status === 'unauthenticated' ? 'Not signed in'
-            : 'Part of the image';
-      // Offered, never pressed on anyone: a quiet button, not a primary one.
-      if (c.installed && auth && auth.status === 'unauthenticated') row.action = signIn;
+          : auth && auth.status === 'unauthenticated' ? 'Not signed in' + (auth.host ? ' to ' + auth.host : '')
+            : added ? 'From ' + added.tool + ', under Added tools' : 'Part of the image';
+      if (present && auth && auth.status === 'unauthenticated') {
+        // gh's is offered, never pressed on anyone: a quiet button. One the
+        // user added is one they mean to use, like a CLI installed here.
+        row.action = added ? Object.assign({ variant: 'primary' }, signIn) : signIn;
+        if (added) { row.state = 'signin'; row.attention = true; row.status.dot = 'warn'; }
+      }
     } else {
       row = toolRow(c, 'toolchain', status, ui, now);
       if (row.state === 'missing') row.status = { dot: null, text: 'Not installed' };
@@ -635,13 +642,13 @@ const T3Model = (() => {
         row.status = { dot: null, text: [row.status.text, 'sign-in could not be checked'].filter(Boolean).join(' · ') };
       }
     }
-    if (ui && ui.signingIn === c.id && c.installed) {
+    if (ui && ui.signingIn === c.id && (c.installed || added)) {
       row.state = 'signing';
       row.badge = { tone: 'info', text: 'Signing in', spinner: true };
       row.status = { dot: null, text: 'Waiting for approval on another device' };
       row.action = null;
       row.menu = [];
-    } else if (c.installed && !c.inProgress && auth && (auth.status === 'authenticated' || auth.status === 'unknown')) {
+    } else if ((c.installed || added) && !c.inProgress && auth && (auth.status === 'authenticated' || auth.status === 'unknown')) {
       // Signed in (or not known): another host, or another account, and out again.
       const extra = [{ cmd: 'scm.signin', label: meta.flow === 'device' ? 'Sign in again…' : 'Sign in to another host…', icon: 'log-in' }];
       if (auth.status === 'authenticated') extra.push({ cmd: 'scm.signout', label: 'Sign out' + (auth.host && meta.flow !== 'device' ? ' of ' + auth.host : '') + '…', icon: 'log-out' });
@@ -652,16 +659,15 @@ const T3Model = (() => {
     row.command = meta.command;
     row.flow = meta.flow;
     row.inImage = Boolean(c.inImage);
+    row.providedBy = added ? added.tool : null;
     row.auth = auth;
     return row;
   };
-  const sourceControlRows = (status, ui, now) => {
-    const list = (status && status.sourceControl) || [];
-    const rank = (id) => { const at = SOURCE_CONTROL_ORDER.indexOf(id); return at === -1 ? SOURCE_CONTROL_ORDER.length : at; };
-    return [...list].sort((a, b) => rank(a.id) - rank(b.id)).map((c) => sourceControlRow(c, status || {}, ui, now));
-  };
-  /** The source control rows that are managed like a toolchain: not the image's gh. */
-  const managedSourceControlRows = (status, ui, now) => sourceControlRows(status, ui, now).filter((row) => !row.inImage);
+  /** In the server's order, which is its catalogue's. */
+  const sourceControlRows = (status, ui, now) =>
+    ((status && status.sourceControl) || []).map((c) => sourceControlRow(c, status || {}, ui, now));
+  /** The source control rows that are managed like a toolchain: not the image's gh, nor one an added tool provides. */
+  const managedSourceControlRows = (status, ui, now) => sourceControlRows(status, ui, now).filter((row) => !row.inImage && !row.providedBy);
 
   /** The name a tool's row shows: its registry name, or the last part of a backend spec (npm:@biomejs/biome -> biome). */
   const toolName = (id) => {
