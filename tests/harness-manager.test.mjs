@@ -927,9 +927,12 @@ test("source control CLIs install like toolchains, and say which host they are f
   assert.ok(world.useSpecs.includes("forgejo:gitea/tea[api_url=https://gitea.com/api/v1]@0.16.0"));
   assert.equal((await manager.sourceControl.latest("tea")), "0.16.0");
 
-  // az comes with the extension T3's Azure DevOps support needs.
+  // az comes with the extension T3's Azure DevOps support needs. That runs pip
+  // in az's environment, which uv (mise's pipx backend, when uv is installed)
+  // leaves out unless asked.
   const az = await manager.sourceControl.install("az");
   assert.equal(az.ok, true, az.error);
+  assert.ok(world.useSpecs.includes("pipx:azure-cli[uvx_args=--with=pip]@2.90.0"));
   assert.ok(world.calls.some((call) => / extension add --name azure-devops --yes$/.test(call)));
   const azFacts = await manager.sourceControl.resolve("az");
   assert.deepEqual(azFacts.missingExtensions, []);

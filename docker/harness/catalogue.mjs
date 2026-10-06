@@ -239,8 +239,12 @@ export const SOURCE_CONTROL = Object.freeze([
     provider: "Azure DevOps",
     // Through pipx, which the image has. mise's registry installs azure-cli
     // from PyPI with options only uv understands, and uv is a toolchain that
-    // may not be installed. pipx uses uv when it is there anyway.
+    // may not be installed. pipx uses uv when it is there anyway, and a uv
+    // environment has no pip, which `az extension add` runs: without it the
+    // azure-devops extension cannot be added, and the install is rolled back.
+    // `--with pip` puts it there; pipx's own environments already have it.
     miseTool: "pipx:azure-cli",
+    miseOptions: "uvx_args=--with=pip",
     // The registry's own name for the same package: refused as an added tool,
     // so az is never installed twice.
     registryNames: ["azure-cli"],
