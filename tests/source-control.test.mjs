@@ -11,7 +11,7 @@ import test from "node:test";
 
 import { getSourceControl } from "../docker/harness/catalogue.mjs";
 import {
-  DEFAULT_HOSTS, azExtensionDir, detectSourceControlAuth, failureLine, fjKeysPath, missingExtensions,
+  DEFAULT_HOSTS, azExtensionDir, credentialFiles, detectSourceControlAuth, failureLine, fjKeysPath, missingExtensions,
   parseAzAuth, parseFjKeys, parseGhAuth, parseGlabAuth, parseHost, parseTeaAuth, parseToken, safeLine, signOutArgs, tokenSignIn,
 } from "../docker/harness/source-control.mjs";
 
@@ -28,6 +28,22 @@ test("gh: the active account that signed in, else why not", () => {
   // Signed out: gh says so on stderr and still exits 0 with empty hosts.
   const none = parseGhAuth({ stdout: '{"hosts":{}}\n', stderr: "You are not logged into any GitHub hosts. To log in, run: gh auth login\n" });
   assert.equal(none.status, "unauthenticated");
+
+  // Only the active account counts: every gh call runs as it, so a second
+  // account that works does not make up for an active one that does not.
+  const inactive = JSON.stringify({ hosts: { "github.com": [
+    { state: "error", error: "HTTP 401: Bad credentials (https://api.github.com/)", active: true, host: "github.com", login: "alice" },
+    { state: "success", active: false, host: "github.com", login: "bob" },
+  ] } });
+  assert.deepEqual(parseGhAuth({ stdout: inactive }),
+    { status: "unauthenticated", account: null, host: "github.com", detail: "HTTP 401: Bad credentials (https://api.github.com/)" });
+
+  // A host gh never reached is not a host it is signed out of.
+  const timeout = JSON.stringify({ hosts: { "github.com": [{ state: "timeout", active: true, host: "github.com", login: "octocat" }] } });
+  assert.equal(parseGhAuth({ stdout: timeout }).status, "unknown");
+  const offline = JSON.stringify({ hosts: { "github.com": [{ state: "error", active: true, host: "github.com", login: "octocat",
+    error: 'Get "https://api.github.com/": dial tcp: lookup api.github.com on 127.0.0.11:53: no such host' }] } });
+  assert.equal(parseGhAuth({ stdout: offline }).status, "unknown");
 
   const old = parseGhAuth({ stdout: "", stderr: "unknown flag: --json\n", code: 1 });
   assert.equal(old.status, "unknown", "an old gh is not a signed-out one");
@@ -55,6 +71,19 @@ test("glab: the host block that says who is logged in", () => {
   assert.equal(out.status, "unauthenticated");
   assert.equal(out.host, "gitlab.com");
   assert.match(out.detail, /API call failed/);
+
+  // What glab 1.120 prints for a host it cannot reach: unknown, not signed out.
+  const offline = [
+    "gitlab.example.com",
+    '  x gitlab.example.com: API call failed: Get "https://gitlab.example.com/api/v4/user": dial tcp: lookup gitlab.example.com: no such host',
+    "  ✓ Git operations for gitlab.example.com configured to use https protocol.",
+    "  ✓ Token found in configuration file (plaintext): **************************",
+  ].join("\n");
+  const unknown = parseGlabAuth({ stderr: offline, code: 1 });
+  assert.equal(unknown.status, "unknown");
+  assert.equal(unknown.host, "gitlab.example.com");
+  const tls = offline.replace("dial tcp: lookup gitlab.example.com: no such host", "remote error: tls: unrecognized name");
+  assert.equal(parseGlabAuth({ stderr: tls, code: 1 }).status, "unknown", "a TLS failure never got an answer either");
 });
 
 test("tea: the default login, valid or not", () => {
@@ -63,8 +92,10 @@ test("tea: the default login, valid or not", () => {
     { name: "gitea.com", url: "https://gitea.com", user: "ana-g", default: "true", valid: "true" },
   ]);
   assert.deepEqual(parseTeaAuth({ stdout: logins }), { status: "authenticated", account: "ana-g", host: "gitea.com", detail: null });
-  const invalid = JSON.stringify([{ name: "x", url: "https://git.example.com", user: "ana", default: "true", valid: "false" }]);
-  assert.equal(parseTeaAuth({ stdout: invalid }).status, "unauthenticated");
+  // tea says "false" alike for a refused token and an unreachable server, so
+  // the verdict keeps the login's name for the follow-up question.
+  const invalid = JSON.stringify([{ name: "x", url: "https://git.example.com", user: "", default: "true", valid: "false" }]);
+  assert.deepEqual(parseTeaAuth({ stdout: invalid }), { status: "unauthenticated", account: null, host: "git.example.com", detail: null, login: "x" });
   assert.equal(parseTeaAuth({ stdout: "[]\n" }).status, "unauthenticated");
   assert.equal(parseTeaAuth({ stdout: "not json" }).status, "unknown");
 });
@@ -112,6 +143,38 @@ function fakeCtx({ files = {}, run } = {}) {
     },
   };
 }
+
+test("tea: an invalid login is asked once more, to tell a refused token from a server it never reached", async () => {
+  const status = JSON.stringify([{ name: "gitea.com", url: "https://gitea.com", user: "", default: "true", valid: "false" }]);
+  // tea 0.16: the server's refusal comes back as its JSON with exit 0; a
+  // request that never got an answer fails with exit 1.
+  const refused = fakeCtx({ run: (argv) => argv[1] === "login"
+    ? { code: 0, stdout: status, stderr: "", error: null }
+    : { code: 0, stdout: '{"message":"invalid username, password or token","url":"https://gitea.com/api/swagger"}', stderr: "", error: null } });
+  assert.deepEqual(await detectSourceControlAuth(refused, getSourceControl("tea"), "/x/tea"),
+    { status: "unauthenticated", account: null, host: "gitea.com", detail: "invalid username, password or token" });
+  assert.deepEqual(refused.calls[1].argv, ["/x/tea", "api", "--login", "gitea.com", "/user"]);
+
+  const offline = fakeCtx({ run: (argv) => argv[1] === "login"
+    ? { code: 0, stdout: status, stderr: "", error: null }
+    : { code: 1, stdout: "", stderr: 'Error: request failed: Get "https://gitea.com/api/v1/user": dial tcp: lookup gitea.com: no such host\n', error: null } });
+  assert.equal((await detectSourceControlAuth(offline, getSourceControl("tea"), "/x/tea")).status, "unknown");
+
+  const valid = fakeCtx({ run: () => ({ code: 0, stdout: status.replace('"valid":"false"', '"valid":"true"'), stderr: "", error: null }) });
+  await detectSourceControlAuth(valid, getSourceControl("tea"), "/x/tea");
+  assert.equal(valid.calls.length, 1, "a valid login is not asked twice");
+});
+
+test("each CLI's credential files are where it writes them", () => {
+  const home = "/home/t3";
+  const files = (id, env = {}) => credentialFiles(getSourceControl(id), env, home);
+  assert.deepEqual(files("gh"), ["/home/t3/.config/gh/hosts.yml"]);
+  assert.deepEqual(files("gh", { GH_CONFIG_DIR: "/gh" }), ["/gh/hosts.yml"]);
+  assert.deepEqual(files("glab"), ["/home/t3/.config/glab-cli/config.yml"]);
+  assert.deepEqual(files("tea", { XDG_CONFIG_HOME: "/cfg" }), ["/cfg/tea/config.yml"]);
+  assert.deepEqual(files("fj"), ["/home/t3/.local/share/forgejo-cli/keys.json"]);
+  assert.deepEqual(files("az"), ["/home/t3/.azure/azureProfile.json", "/home/t3/.azure/msal_token_cache.json"]);
+});
 
 test("detection asks the CLI the question T3 asks, and never prompts", async () => {
   const ctx = fakeCtx({ run: () => ({ code: 0, stdout: '{"hosts":{"github.com":[{"state":"success","active":true,"host":"github.com","login":"octocat"}]}}', stderr: "", error: null }) });
@@ -173,9 +236,15 @@ test("a token goes to the CLI on stdin or in the environment, never as an argume
     }
     const handed = plan.steps.some((step) => step.input === `${TOKEN}\n` || step.env?.GITEA_SERVER_TOKEN === TOKEN);
     assert.ok(handed, `${id} is given the token`);
-    assert.ok(plan.undo, `${id} can take a refused token back`);
   }
-  assert.deepEqual(tokenSignIn(getSourceControl("gh"), "github.com", TOKEN).steps[1], { args: ["auth", "setup-git", "--hostname", "github.com"], optional: true });
+  assert.deepEqual(tokenSignIn(getSourceControl("gh"), "github.com", TOKEN).steps[1],
+    { args: ["auth", "setup-git", "--hostname", "github.com"], optional: true, warn: true });
+  // fj keeps a key it already has (and exits 0), tea refuses a login name in
+  // use: both sign out of the host first, and either may have nothing to sign out of.
+  assert.deepEqual(tokenSignIn(getSourceControl("fj"), "codeberg.org", TOKEN).steps.map((step) => [step.args.join(" "), Boolean(step.optional)]),
+    [["auth logout codeberg.org", true], ["--host https://codeberg.org auth add-token", false]]);
+  assert.deepEqual(tokenSignIn(getSourceControl("tea"), "gitea.com", TOKEN).steps.map((step) => [step.args.join(" "), Boolean(step.optional)]),
+    [["logout gitea.com", true], ["login add --name gitea.com --url https://gitea.com --git-credentials", false]]);
   assert.deepEqual(tokenSignIn(getSourceControl("glab"), "gitlab.com", TOKEN).verify, ["api", "user", "--hostname", "gitlab.com"]);
   assert.deepEqual(tokenSignIn(getSourceControl("fj"), "codeberg.org", TOKEN).verify, ["--host", "https://codeberg.org", "whoami"]);
   assert.equal(tokenSignIn(getSourceControl("az"), "x", TOKEN), null, "az signs in with a device code");

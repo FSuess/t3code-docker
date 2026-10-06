@@ -2,9 +2,11 @@
 //
 // T3 Code asks each CLI whether it is signed in before it offers that host's
 // pull requests, and says so in its Settings > Source Control. These ask the
-// same questions the same way, so the setup page and T3 never disagree about
-// a host: `gh auth status --json hosts`, `glab auth status`, tea's logins,
-// `az account show`, and fj's key file, which is what T3 reads for fj too.
+// same questions: `gh auth status --json hosts`, `glab auth status`, tea's
+// logins, `az account show`, and fj's key file, which is what T3 reads for fj
+// too. Where an answer is ambiguous they read it more strictly than T3 does:
+// only gh's active account counts, and a server that could not be reached
+// (or a tea login that might only be offline) is unknown, not signed out.
 //
 // A verdict is `{ status, account, host, detail }`. `status` is
 // "authenticated", "unauthenticated" or "unknown"; unknown is a real answer
@@ -16,16 +18,25 @@ import path from "node:path";
 const verdict = (status, { account = null, host = null, detail = null } = {}) =>
   ({ status, account: account || null, host: host || null, detail: detail || null });
 
-/**
- * The first line worth showing, never one that prints a token. Status marks
- * go: glab starts its lines with ✓, ! or a plain x.
- */
+/** A CLI's lines without their status marks: glab starts them with ✓, ! or a plain x. */
+const unmarked = (text) => String(text ?? "").split(/\r?\n/)
+  .map((line) => line.replace(/^(?:[^A-Za-z0-9]+|x\s+)+/, "").trim());
+
+/** The first line worth showing, never one that prints a token. */
 export function safeLine(text) {
-  return String(text ?? "")
-    .split(/\r?\n/)
-    .map((line) => line.replace(/^(?:[^A-Za-z0-9]+|x\s+)+/, "").trim())
-    .find((line) => line && !/token/i.test(line)) ?? null;
+  return unmarked(text).find((line) => line && !/token/i.test(line)) ?? null;
 }
+
+/**
+ * What a CLI says when it never reached the server - no DNS, no route, a
+ * timeout, a TLS failure - as opposed to the server refusing the token. Gone
+ * offline is not signed out: such a check is unknown.
+ */
+const UNREACHABLE = /\b(?:timeout|timed out|deadline exceeded|no such host|name resolution|dial tcp|connection refused|connection reset|network is unreachable|no route to host|certificate|EOF|error sending request|request failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ETIMEDOUT)\b|\b(?:tls|x509):/i;
+export const unreachable = (text) => UNREACHABLE.test(String(text ?? ""));
+
+/** What every sign-in check and sign-in runs with: no colour, and never a prompt. */
+export const NO_PROMPT = Object.freeze({ NO_COLOR: "1", GH_PROMPT_DISABLED: "1", GLAB_NO_PROMPT: "1" });
 
 function parseJson(text) {
   try {
@@ -35,18 +46,27 @@ function parseJson(text) {
   }
 }
 
-/** `gh auth status --json hosts`: an account whose state is success, the active one first. */
+/**
+ * `gh auth status --json hosts`: the active account of a host. Only the active
+ * one counts - every gh call, and T3's, runs as it - so a second account that
+ * works does not make up for an active one whose token was revoked. A host gh
+ * could not reach (state "timeout", or an error that never got an answer) is
+ * unknown, not signed out.
+ */
 export function parseGhAuth({ stdout = "", stderr = "", code = 0 } = {}) {
   const parsed = parseJson(stdout);
   const hosts = parsed && typeof parsed.hosts === "object" && parsed.hosts !== null ? parsed.hosts : null;
   if (hosts) {
-    const accounts = Object.values(hosts).flatMap((list) => (Array.isArray(list) ? list : []))
-      .filter((entry) => entry && typeof entry.login === "string" && entry.login.trim());
-    const signed = accounts.find((entry) => entry.state === "success" && entry.active)
-      ?? accounts.find((entry) => entry.state === "success");
+    const active = Object.values(hosts).flatMap((list) => (Array.isArray(list) ? list : []))
+      .filter((entry) => entry && entry.active && typeof entry.login === "string" && entry.login.trim());
+    const signed = active.find((entry) => entry.state === "success");
     if (signed) return verdict("authenticated", { account: signed.login.trim(), host: signed.host });
-    const failed = accounts.find((entry) => entry.active) ?? accounts[0];
-    return verdict("unauthenticated", { host: failed?.host, detail: failed?.error?.trim() || null });
+    const failed = active[0];
+    const detail = failed?.error?.trim() || null;
+    if (failed && (failed.state === "timeout" || unreachable(detail))) {
+      return verdict("unknown", { host: failed.host, detail: detail ?? `${failed.host} did not answer in time` });
+    }
+    return verdict("unauthenticated", { host: failed?.host, detail });
   }
   // gh learned `--json` for auth status in 2.81; an older one is not signed out.
   if (/unknown flag: --json/.test(`${stdout}\n${stderr}`)) {
@@ -79,17 +99,37 @@ export function parseGlabAuth({ stdout = "", stderr = "", code = 0 } = {}) {
   const account = LOGGED_IN.exec(text)?.[1];
   if (account) return verdict("authenticated", { account, host: hosts[0]?.host });
   const said = hosts.length ? hosts[0].lines.join("\n") : text;
-  return verdict(code === 0 ? "unknown" : "unauthenticated", { host: hosts[0]?.host, detail: safeLine(said) });
+  const offline = hosts.length ? unreachable(said) : unreachable(text);
+  return verdict(code === 0 || offline ? "unknown" : "unauthenticated", { host: hosts[0]?.host, detail: safeLine(said) });
 }
 
-/** `tea login status --output json`: the default login, or the first, and whether tea found it valid. */
+/**
+ * `tea login status --output json`: the default login, or the first, and
+ * whether tea found it valid. tea says "false" alike for a token the server
+ * refused and a server it never reached, so an invalid login carries its
+ * `name` for a second question (`teaReachable`).
+ */
 export function parseTeaAuth({ stdout = "", stderr = "" } = {}) {
   const logins = parseJson(stdout);
   if (!Array.isArray(logins)) return verdict("unknown", { detail: safeLine(`${stdout}\n${stderr}`) });
   const login = logins.find((entry) => entry?.default === "true" || entry?.default === true) ?? logins[0];
   if (!login) return verdict("unauthenticated");
-  return verdict(login.valid === "true" || login.valid === true ? "authenticated" : "unauthenticated",
-    { account: login.user, host: hostOf(login.url) });
+  if (login.valid === "true" || login.valid === true) return verdict("authenticated", { account: login.user, host: hostOf(login.url) });
+  return { ...verdict("unauthenticated", { host: hostOf(login.url) }), login: String(login.name ?? "") || null };
+}
+
+/**
+ * `tea api --login <name> /user` for a login tea found invalid: a server that
+ * answered (with its refusal, exit 0) means signed out; one that was never
+ * reached ("request failed", exit 1) means unknown.
+ */
+export function teaReachable(signedOut, { stdout = "", stderr = "", code = 0 } = {}) {
+  const { login, ...answer } = signedOut;
+  const said = `${stderr}\n${stdout}`;
+  if (code !== 0 && unreachable(said)) return verdict("unknown", { host: answer.host, detail: safeLine(said) });
+  // The server's own message names no token, only that it refused one.
+  const message = parseJson(stdout)?.message;
+  return { ...answer, detail: typeof message === "string" && message.trim() ? message.trim().slice(0, 200) : safeLine(said) };
 }
 
 /** `az account show --query user.name -o tsv`: a user name, or az's own complaint. */
@@ -125,6 +165,32 @@ export function fjKeysPath(env, home) {
   return path.join(data, "forgejo-cli", "keys.json");
 }
 
+/**
+ * The files each CLI keeps its sign-ins in, where it would write them in this
+ * environment. Their modification times key the sign-in cache, so a sign-in
+ * made in a terminal shows at once; a token sign-in copies them first and puts
+ * them back when it fails.
+ */
+export function credentialFiles(entry, env, home) {
+  const config = env.XDG_CONFIG_HOME && path.isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(home, ".config");
+  switch (entry.auth) {
+    case "gh":
+      return [path.join(env.GH_CONFIG_DIR || path.join(config, "gh"), "hosts.yml")];
+    case "glab":
+      return [path.join(env.GLAB_CONFIG_DIR || path.join(config, "glab-cli"), "config.yml")];
+    case "tea":
+      return [path.join(config, "tea", "config.yml")];
+    case "fj":
+      return [fjKeysPath(env, home)];
+    case "az": {
+      const dir = env.AZURE_CONFIG_DIR || path.join(home, ".azure");
+      return [path.join(dir, "azureProfile.json"), path.join(dir, "msal_token_cache.json")];
+    }
+    default:
+      return [];
+  }
+}
+
 /** Where az keeps its extensions. */
 export function azExtensionDir(env, home) {
   return env.AZURE_EXTENSION_DIR || path.join(env.AZURE_CONFIG_DIR || path.join(home, ".azure"), "cliextensions");
@@ -154,13 +220,15 @@ export async function detectSourceControlAuth(ctx, entry, executable) {
   }
   const ask = ASK[entry.auth];
   if (!ask || !executable) return verdict("unknown");
-  const result = await ctx.run([executable, ...ask.args], {
-    env: { ...ctx.env, NO_COLOR: "1", GH_PROMPT_DISABLED: "1", GLAB_NO_PROMPT: "1" },
-    cwd: ctx.home,
-    timeoutMs: ctx.timeouts.probe,
-  });
+  const run = (args) => ctx.run([executable, ...args], { env: { ...ctx.env, ...NO_PROMPT }, cwd: ctx.home, timeoutMs: ctx.timeouts.probe });
+  const result = await run(ask.args);
   if (result.error && result.code === null) return verdict("unknown", { detail: String(result.error) });
-  return ask.parse({ stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.code });
+  const answer = ask.parse({ stdout: result.stdout ?? "", stderr: result.stderr ?? "", code: result.code });
+  if (!("login" in answer)) return answer;
+  if (!answer.login) return teaReachable(answer, {});
+  const asked = await run(["api", "--login", answer.login, "/user"]);
+  if (asked.error && asked.code === null) return verdict("unknown", { host: answer.host, detail: String(asked.error) });
+  return teaReachable(answer, { stdout: asked.stdout ?? "", stderr: asked.stderr ?? "", code: asked.code });
 }
 
 /** The az extensions an entry needs that are not installed. Read from disk: asking az costs a second each. */
@@ -209,10 +277,15 @@ export function parseToken(raw) {
 }
 
 /**
- * How one CLI signs in to `host` with a token: the steps to run, a check that
- * the host accepted it (where signing in does not already prove that), and
- * how to take it back when it did not. glab and fj store any token they are
- * given, so they are asked afterwards; gh and tea refuse a bad one themselves.
+ * How one CLI signs in to `host` with a token: the steps to run, and a check
+ * that the host accepted it where signing in does not already prove that.
+ * glab and fj store any token they are given, so they are asked afterwards;
+ * gh and tea refuse a bad one themselves. Neither fj nor tea replaces a
+ * sign-in it already has for the host (fj keeps the old key and says so with
+ * exit 0, tea refuses the name), so each first signs out of it: a step marked
+ * `optional` may fail without failing the sign-in. Taking a failed attempt
+ * back is not the plan's business: the manager restores the CLI's
+ * `credentialFiles`, so a working sign-in from before survives a bad token.
  */
 export function tokenSignIn(entry, host, token) {
   const url = `https://${host}`;
@@ -223,29 +296,32 @@ export function tokenSignIn(entry, host, token) {
           { args: ["auth", "login", "--hostname", host, "--with-token", "--git-protocol", "https", "--insecure-storage"], input: `${token}\n` },
           // So git push over HTTPS uses the same token. Signed in without it
           // is still signed in: a failure here is a warning, not a rollback.
-          { args: ["auth", "setup-git", "--hostname", host], optional: true },
+          { args: ["auth", "setup-git", "--hostname", host], optional: true, warn: true },
         ],
         verify: null,
-        undo: ["auth", "logout", "--hostname", host],
       };
     case "glab":
       return {
         steps: [{ args: ["auth", "login", "--hostname", host, "--stdin", "--git-protocol", "https", "--insecure-storage"], input: `${token}\n` }],
         verify: ["api", "user", "--hostname", host],
-        undo: ["auth", "logout", "--hostname", host],
       };
     case "fj":
       return {
-        steps: [{ args: ["--host", url, "auth", "add-token"], input: `${token}\n` }],
+        steps: [
+          { args: ["auth", "logout", host], optional: true },
+          { args: ["--host", url, "auth", "add-token"], input: `${token}\n` },
+        ],
         verify: ["--host", url, "whoami"],
-        undo: ["auth", "logout", host],
       };
     case "tea":
       return {
         // --git-credentials makes tea git's credential helper for this host.
-        steps: [{ args: ["login", "add", "--name", host, "--url", url, "--git-credentials"], env: { GITEA_SERVER_TOKEN: token } }],
+        steps: [
+          // Fails when there is no login of that name, which is fine.
+          { args: ["logout", host], optional: true },
+          { args: ["login", "add", "--name", host, "--url", url, "--git-credentials"], env: { GITEA_SERVER_TOKEN: token } },
+        ],
         verify: null,
-        undo: ["logout", host],
       };
     default:
       return null;
@@ -278,7 +354,6 @@ export function signOutArgs(entry, host) {
 export function failureLine(result, token) {
   const said = `${result.stderr ?? ""}\n${result.stdout ?? ""}`;
   const clean = token ? said.split(token).join("…") : said;
-  const line = clean.split(/\r?\n/).map((entry) => entry.replace(/^(?:[^A-Za-z0-9]+|x\s+)+/, "").trim())
-    .find((entry) => entry && !/^(Location|Try authenticating with):?/i.test(entry));
+  const line = unmarked(clean).find((entry) => entry && !/^(Location|Try authenticating with):?/i.test(entry));
   return line ?? (result.error ? String(result.error) : `exited with code ${result.code}`);
 }

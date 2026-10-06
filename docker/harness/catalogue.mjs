@@ -199,7 +199,9 @@ export const SOURCE_CONTROL = Object.freeze([
     provider: "GitHub",
     inImage: true,
     bin: "gh",
-    probe: ["gh", "--version"],
+    // By its path in the image: a newer gh added through mise comes first on
+    // PATH, and is an added tool, not this one.
+    probe: ["/usr/bin/gh", "--version"],
     versionPattern: "gh version (\\d+\\.\\d+\\.\\d+)",
     auth: "gh",
   },
